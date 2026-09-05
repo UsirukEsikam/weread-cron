@@ -1,0 +1,165 @@
+# V1 Protocol Validation Gaps
+
+## Context
+
+The V1 protocol implementation uses evidence from `wxread`, `weread.koplugin`, captured behavior, and independent protocol analysis.
+
+Some behaviors cannot be confirmed from reference source code alone.
+
+The items below are validation gaps, not confirmed implementation defects.
+
+They require evidence from a real WeRead account or current Web Reader behavior before their protocol semantics can be treated as established facts.
+
+
+## V1. Cookie-authenticated Shelf endpoint
+
+Current weread-cron behavior uses a Cookie-authenticated Web Shelf endpoint to support:
+
+- `weread-cron books`;
+- automatic book selection.
+
+The current `weread.koplugin` Shelf path uses the WeRead Skill/API Gateway with API-key authentication.
+
+That does not prove that the Cookie Web endpoint used by weread-cron is invalid.
+
+The current reference projects also do not independently establish the exact Cookie-only Shelf response contract used by weread-cron.
+
+Unknowns include:
+
+- endpoint availability;
+- authentication requirements;
+- response structure;
+- book ID and title fields;
+- completed-reading metadata;
+- content-type filtering fields.
+
+
+## V2. Completed books and reading-time accounting
+
+The automatic-book design permits a completed book as a fallback when no usable unfinished book is available.
+
+Reference implementation structure does not prevent a `progress=100%` book from entering a Reading Session.
+
+Source review cannot establish whether the current WeRead service still accepts Timed reports for such a book and counts them toward reading time.
+
+
+## V3. Real Login Session invalidation evidence
+
+Current code distinguishes an explicitly invalid Login Session from ordinary transport or server failures.
+
+Reference material shows possible error responses for login timeout or invalid credentials, but the complete current response set for the relevant Web Reader endpoints has not been established with this project.
+
+Unknowns include:
+
+- renewal response when the Cookie has expired;
+- relevant HTTP status codes;
+- JSON error-code fields;
+- whether Shelf, Reader, Progress, and Report endpoints expose the same invalid-login evidence;
+- which evidence is sufficiently specific to classify the Login Session as invalid.
+
+
+## V4. `rt` server semantics
+
+The V1 design deliberately uses interval-style `rt` semantics based on elapsed wall-clock time since the last accepted Timed report, with abnormal gaps excluded.
+
+Reference implementations do not provide one identical model:
+
+- `wxread` behavior is close to elapsed interval semantics;
+- `weread.koplugin` uses its own report cadence model;
+- prior official Web Reader analysis observed cumulative elapsed time in at least one implementation.
+
+The current server-side acceptance and accounting semantics are not established.
+
+The V1 implementation choice is therefore a compatibility choice that requires real-account validation.
+
+
+## V5. Reader Context refresh and Enter report
+
+weread-cron refreshes Reader Context after the configured internal TTL while keeping the current Reading Session.
+
+Current `weread.koplugin` behavior resets its entered-session state after a context refresh, causing another Enter report before later Timed reports.
+
+The server requirement is not established.
+
+A long Reading Session that crosses at least one Reader Context refresh is required to determine whether the current V1 behavior remains accepted.
+
+
+## V6. Report success boundary
+
+weread-cron accepts a report when:
+
+    succ indicates success
+    OR
+    synckey is present
+
+This matches the current `weread.koplugin` compatibility behavior.
+
+Current `wxread` behavior is more restrictive.
+
+It is not established whether the real service currently returns:
+
+- `succ` without `synckey`;
+- `synckey` without a successful `succ`;
+- either form as a valid Timed report response.
+
+This remains a compatibility boundary rather than a confirmed implementation error.
+
+
+## V7. `reader.token` lifetime and fallback behavior
+
+weread-cron obtains `reader.token` from the real Reader state and can use the known compatibility token according to the implemented protocol rules.
+
+The real service behavior still needs evidence for:
+
+- whether `reader.token` changes during long use;
+- whether it changes after renewal;
+- whether it changes between books;
+- whether the known fallback token is still accepted;
+- whether a Context refresh is sufficient after token rotation.
+
+
+## V8. Renewal `Set-Cookie` behavior
+
+The renewal request body is consistent with the current reference implementation.
+
+The real service response still needs evidence for:
+
+- which Cookies are returned;
+- Cookie deletion behavior;
+- expiry and Max-Age behavior;
+- domain and path attributes;
+- whether a failed renewal returns any meaningful `Set-Cookie`;
+- which Cookie attributes must survive persistence and restart.
+
+This evidence also determines how much Cookie Jar behavior the application actually needs.
+
+
+## V9. Simplified Cookie Jar behavior
+
+The current persisted Jar stores several Cookie attributes but sends the stored Cookie set with simplified matching behavior.
+
+The current core requests are concentrated on the WeRead Web domain, so source review does not establish that full RFC-style domain/path matching is required for V1.
+
+The real renewal and Web Reader Cookie behavior is needed to determine whether the current simplified behavior is sufficient.
+
+
+## V10. Reader state for a completely unread book
+
+A Shelf book that has never been opened can have a different Reader state from an actively read book.
+
+weread-cron currently requires enough Reader state to obtain the current chapter and position.
+
+Reference code contains additional chapter-information fallback behavior, but source review does not establish that the fallback is required for the current WeRead Reader page.
+
+The real `__INITIAL_STATE__` structure for a completely unread Shelf book remains to be observed.
+
+
+## V11. Abnormal Reading Session gap threshold
+
+V1 uses an internal threshold to distinguish a normal delayed Timed report from a broken Reading Session.
+
+A large gap is not reported as one large `rt`; the Reading Session is rebuilt instead.
+
+The current threshold is an implementation default.
+
+The service does not expose an established public threshold, so the chosen value remains an empirical V1 parameter.
