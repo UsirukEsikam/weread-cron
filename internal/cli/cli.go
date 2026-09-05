@@ -5,8 +5,9 @@
 //   - run / books 两个子命令
 //   - --help 与未知子命令/flag 输出清晰用法并以非零退出码结束
 //
-// 本包只做 executable 边界可观察的行为（用法/退出码/启动失败）；
-// run/books 在本票是路由占位，真实行为由后续票交付。
+// `weread-cron run`（ticket 03）经内聚的应用边界（internal/app）执行一次完整 Task；
+// 进程级行为（退出码、stdout 摘要、stderr）由本层负责。ticket 08 交付 run 的
+// 终态规则（success 拒绝、failed 重试）与并发互斥。
 package cli
 
 import (
@@ -16,9 +17,12 @@ import (
 	"log/slog"
 	"strings"
 
+	"weread-cron/internal/app"
 	"weread-cron/internal/config"
+	"weread-cron/internal/notify"
 	"weread-cron/internal/scheduler"
 	"weread-cron/internal/session"
+	"weread-cron/internal/task"
 )
 
 // 退出码（全部非零情形须在 stderr 指明原因）。
@@ -32,8 +36,27 @@ const (
 	ExitUsage = 2
 )
 
+// App 是 run 子命令依赖的应用边界（生产实现 = internal/app；测试注入 fake）。
+type App interface {
+	// RunTask 完整执行一次 Task。
+	RunTask(ctx context.Context) (task.Result, error)
+}
+
+// appFactory 按配置装配 App。
+type appFactory func(cfg *config.Config, logger *slog.Logger) (App, error)
+
+// prodApp 是生产装配（main 经 Run 使用）。
+func prodApp(cfg *config.Config, logger *slog.Logger) (App, error) {
+	return app.New(cfg, app.Deps{Logger: logger}), nil
+}
+
 // Run 执行整个 CLI 并返回退出码。args 不含程序名，environ 为完整环境变量列表。
 func Run(ctx context.Context, args []string, environ []string, stdout, stderr io.Writer) int {
+	return runWithApp(ctx, args, environ, stdout, stderr, prodApp)
+}
+
+// runWithApp 是 Run 的可注入版本（应用边界 seam：进程级行为在此层测试）。
+func runWithApp(ctx context.Context, args []string, environ []string, stdout, stderr io.Writer, makeApp appFactory) int {
 	cmd, code := parseArgs(args, stderr)
 	if code != ExitOK {
 		return code
@@ -61,15 +84,34 @@ func Run(ctx context.Context, args []string, environ []string, stdout, stderr io
 		}
 		return ExitOK
 	case cmdRun:
-		// 占位路由（ticket 08 交付真实 Task 执行）。
-		fmt.Fprintln(stderr, "weread-cron: run 尚未实现（ticket 08 交付 Task 执行）")
-		return ExitConfig
+		a, err := makeApp(cfg, logger)
+		if err != nil {
+			fmt.Fprintf(stderr, "weread-cron: 装配失败: %v\n", err)
+			return ExitConfig
+		}
+		res, err := a.RunTask(ctx)
+		if err != nil {
+			fmt.Fprintf(stderr, "weread-cron: Task 失败: %v\n", err)
+			return ExitConfig
+		}
+		printTaskSummary(stdout, res)
+		return ExitOK
 	case cmdBooks:
 		// 占位路由（ticket 09 交付书架查询）。
 		fmt.Fprintln(stderr, "weread-cron: books 尚未实现（ticket 09 交付书架查询）")
 		return ExitConfig
 	}
 	return ExitOK
+}
+
+// printTaskSummary 输出 run 的 stdout 摘要（关键信息：书名、计划/实际时长、上报次数）。
+func printTaskSummary(w io.Writer, res task.Result) {
+	fmt.Fprintln(w, "weread-cron: Task 成功")
+	fmt.Fprintf(w, "日期: %s\n", res.Date)
+	fmt.Fprintf(w, "书名: %s（bookId %s）\n", res.BookTitle, res.BookID)
+	fmt.Fprintf(w, "目标时长: %s\n", notify.FormatDuration(res.Planned))
+	fmt.Fprintf(w, "实际累计: %s\n", notify.FormatDuration(res.Actual))
+	fmt.Fprintf(w, "上报次数: %d\n", res.Reports)
 }
 
 // requireAuth 实现"首次启动快速失败"：无持久化 Login Session 且未配置初始 Cookie 即失败。

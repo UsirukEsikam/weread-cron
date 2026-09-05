@@ -275,6 +275,16 @@ func IsAccepted(body map[string]any) bool {
 	return ok && v != nil
 }
 
+// IsSucc 判定响应体的 succ 为 true/1/"1"——spec 决策 #5 中 renewal 的成功形态
+//（{"succ":1}）。与 IsAccepted 不同：不把 synckey 视为接受（那是 report 的判定）。
+func IsSucc(body map[string]any) bool {
+	if body == nil {
+		return false
+	}
+	v, ok := body["succ"]
+	return ok && succIsTrue(v)
+}
+
 func succIsTrue(v any) bool {
 	switch t := v.(type) {
 	case bool:

@@ -230,24 +230,27 @@ func TestSeamDaemonStartsAndStopsCleanly(t *testing.T) {
 	}
 }
 
-func TestSeamRunAndBooksPlaceholders(t *testing.T) {
-	for _, tc := range []struct {
-		name string
-		args []string
-		want string
-	}{
-		{"run 占位路由", []string{"run"}, "run 尚未实现"},
-		{"books 占位路由", []string{"books"}, "books 尚未实现"},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			code, _, stderr := runBin(t, tc.args, baseEnv(t))
-			if code != 1 {
-				t.Errorf("退出码 = %d，期望 1（占位应明确失败）", code)
-			}
-			if !strings.Contains(stderr, tc.want) {
-				t.Errorf("stderr 缺少 %q；实际:\n%s", tc.want, stderr)
-			}
-		})
+func TestSeamRunWithoutBooksFailsFast(t *testing.T) {
+	start := time.Now()
+	code, _, stderr := runBin(t, []string{"run"}, baseEnv(t))
+	if code != 1 {
+		t.Errorf("退出码 = %d，期望 1（候选未配置应明确失败）", code)
+	}
+	if !strings.Contains(stderr, "WEREAD_CRON_BOOKS") {
+		t.Errorf("stderr 应指明 WEREAD_CRON_BOOKS；实际:\n%s", stderr)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Errorf("候选未配置应快速失败，耗时 %v", elapsed)
+	}
+}
+
+func TestSeamBooksPlaceholder(t *testing.T) {
+	code, _, stderr := runBin(t, []string{"books"}, baseEnv(t))
+	if code != 1 {
+		t.Errorf("退出码 = %d，期望 1（占位应明确失败）", code)
+	}
+	if !strings.Contains(stderr, "books 尚未实现") {
+		t.Errorf("stderr 缺少占位提示；实际:\n%s", stderr)
 	}
 }
 

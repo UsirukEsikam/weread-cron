@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"context"
+	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"weread-cron/internal/config"
+	"weread-cron/internal/task"
 )
 
 // syncBuffer 是并发安全的输出缓冲，供 daemon 阻塞路径测试读取启动标记。
@@ -201,27 +204,80 @@ func TestDaemonStartsWithPersistedLoginSessionAndNoCookie(t *testing.T) {
 	}
 }
 
-func TestRunAndBooksPlaceholders(t *testing.T) {
+func TestRunWithoutBooksFailsFast(t *testing.T) {
 	env := testEnv(t, withCookie(t))
-	cases := []struct {
-		name string
-		args []string
-		want string
-	}{
-		{"run 占位", []string{"run"}, "run 尚未实现"},
-		{"books 占位", []string{"books"}, "books 尚未实现"},
+	var stdout, stderr syncBuffer
+	code := Run(context.Background(), []string{"run"}, env, &stdout, &stderr)
+	if code != ExitConfig {
+		t.Errorf("退出码 = %d，期望 %d（候选未配置应明确失败）", code, ExitConfig)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			var stdout, stderr syncBuffer
-			code := Run(context.Background(), tc.args, env, &stdout, &stderr)
-			if code != ExitConfig {
-				t.Errorf("退出码 = %d，期望 %d（占位应明确失败而非假装成功）", code, ExitConfig)
-			}
-			if !strings.Contains(stderr.String(), tc.want) {
-				t.Errorf("stderr 缺少 %q；实际:\n%s", tc.want, stderr.String())
-			}
+	if !strings.Contains(stderr.String(), config.EnvBooks) {
+		t.Errorf("stderr 应指明 WEREAD_CRON_BOOKS；实际:\n%s", stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "自动从 Shelf 选书") {
+		t.Errorf("stderr 应说明自动选书未实现；实际:\n%s", stderr.String())
+	}
+}
+
+func TestBooksPlaceholder(t *testing.T) {
+	env := testEnv(t, withCookie(t))
+	var stdout, stderr syncBuffer
+	code := Run(context.Background(), []string{"books"}, env, &stdout, &stderr)
+	if code != ExitConfig {
+		t.Errorf("退出码 = %d，期望 %d（占位应明确失败）", code, ExitConfig)
+	}
+	if !strings.Contains(stderr.String(), "books 尚未实现") {
+		t.Errorf("stderr 缺少占位提示；实际:\n%s", stderr.String())
+	}
+}
+
+// fakeApp 是 run 子命令的可注入 App（进程内行为测试：退出码/stdout/stderr）。
+type fakeApp struct {
+	res task.Result
+	err error
+}
+
+func (f *fakeApp) RunTask(ctx context.Context) (task.Result, error) { return f.res, f.err }
+
+func TestRunTaskSuccessPrintsSummary(t *testing.T) {
+	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
+	res := task.Result{
+		Date:      "2025-09-06",
+		BookID:    "695233",
+		BookTitle: "三体全集",
+		Planned:   time.Minute,
+		Actual:    90 * time.Second,
+		Reports:   3,
+	}
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) { return &fakeApp{res: res}, nil })
+	if code != ExitOK {
+		t.Errorf("退出码 = %d，期望 %d; stderr=%s", code, ExitOK, stderr.String())
+	}
+	out := stdout.String()
+	for _, want := range []string{"Task 成功", "三体全集", "695233", "1 分钟", "1 分钟 30 秒", "上报次数: 3"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("stdout 缺少 %q；实际:\n%s", want, out)
+		}
+	}
+}
+
+func TestRunTaskFailureExitsNonZero(t *testing.T) {
+	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{err: errors.New("timed report 失败")}, nil
 		})
+	if code != ExitConfig {
+		t.Errorf("退出码 = %d，期望 %d", code, ExitConfig)
+	}
+	if !strings.Contains(stderr.String(), "Task 失败") {
+		t.Errorf("stderr 缺少失败说明；实际:\n%s", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Errorf("失败时不应输出摘要；实际:\n%s", stdout.String())
 	}
 }
 
