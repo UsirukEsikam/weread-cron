@@ -1,0 +1,8 @@
+# build artifacts
+/weread-cron
+/weread-cron.exe
+/dist/
+/coverage.out
+
+# OS noise
+.DS_Store
