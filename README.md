@@ -68,7 +68,8 @@ Cookie 后重启即可自愈。
 
 - `/data` 是**必需**的持久卷，存放：
   - `login_session.json` — Login Session（完整 Cookie 集合，renewal 后原子更新）；
-  - `terminal_state.json` — Terminal State（当天 Task 结果：`success`/`failed`）。
+  - `terminal_state.json` — Terminal State（当天 Task 结果：`success`/`failed`）；
+  - `task.lock` — 跨进程 Task 互斥锁文件（flock；内容不使用，锁随进程退出自动释放）。
 - 容器重启自动从 `/data` 恢复 Login Session，无需重新提供 Cookie（用户故事 #7）；
   终态先落盘再通知，保证重建后不会重复执行当天任务（用户故事 #39）。
 - **卷丢失的后果**：Login Session 回退为无，重启时再次要求提供

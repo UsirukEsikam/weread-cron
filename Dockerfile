@@ -34,8 +34,9 @@ COPY --from=build /out/weread-cron /weread-cron
 ENV TZ=Asia/Shanghai \
     WEREAD_CRON_DATA_DIR=/data
 
-# /data 持久卷：Login Session（login_session.json）与 Terminal State
-# （terminal_state.json）。卷丢失后容器重启将要求重新提供 WEREAD_CRON_COOKIE。
+# /data 持久卷：Login Session（login_session.json）、Terminal State
+# （terminal_state.json）与跨进程 Task 互斥锁（task.lock，flock）。卷丢失后容器
+# 重启将要求重新提供 WEREAD_CRON_COOKIE。
 VOLUME /data
 
 ENTRYPOINT ["/weread-cron"]

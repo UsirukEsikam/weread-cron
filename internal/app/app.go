@@ -15,6 +15,7 @@ import (
 
 	"weread-cron/internal/clock"
 	"weread-cron/internal/config"
+	"weread-cron/internal/filelock"
 	"weread-cron/internal/notify"
 	"weread-cron/internal/readercontext"
 	"weread-cron/internal/report"
@@ -29,9 +30,13 @@ const DefaultHTTPTimeout = 30 * time.Second
 
 // 终态规则与并发守卫的拒绝错误（ticket 08；调用方用 errors.Is 判别）。
 var (
-	// ErrTaskRunning 是并发守卫（spec 决策 #11）：已有 Task 运行时第二个 Task
-	// （run 或 daemon 触发）被拒绝。
-	ErrTaskRunning = errors.New("已有 Task 正在运行，拒绝并发启动第二个 Task")
+	// ErrTaskRunning 是并发守卫的拒绝错误（spec 决策 #11；ticket 11/ADR-0008）：
+	// 同一 deployment（同一 /data）内已有 Task 运行时第二个 Task（run 或 daemon
+	// 触发）被拒绝。进程内守卫（runMu）与跨进程守卫（/data 锁文件 + flock）任一
+	// 被持有都返回本错误；非阻塞拒绝，不等待、不中断运行中的 Task。
+	// 错误值定义在 task 包（task.ErrTaskRunning，调度层判别共用），此处别名保持
+	// ticket 08 以来的判别身份（errors.Is 同一值）。
+	ErrTaskRunning = task.ErrTaskRunning
 	// ErrTerminalSuccess 是终态规则（spec 决策 #12）：当天已形成 success 终态时
 	// run 被拒绝（V1 无 force），避免同一任务被重复执行。
 	ErrTerminalSuccess = errors.New("当天已形成 success 终态，拒绝重复执行（V1 无 force）")
@@ -63,8 +68,10 @@ type Deps struct {
 type App struct {
 	cfg  *config.Config
 	deps Deps
-	// runMu 是进程内单 Task 互斥（spec 决策 #11）：同一进程内第二个 Task
-	// （run 或 daemon 触发）被拒绝。多实例防重不在 V1 范围，跨进程不互斥。
+	// runMu 是进程内单 Task 互斥（spec 决策 #11；ticket 11）：同一进程内第二个
+	// Task（run 或 daemon 触发）被拒绝。跨进程互斥由 /data 锁文件 + flock
+	// 承担（acquireTaskGuard；ADR-0008）——CLI 每次命令调用新建 App 实例，
+	// 各自持有独立 runMu，进程内守卫只覆盖同一 App 实例内的并发。
 	runMu sync.Mutex
 }
 
@@ -120,14 +127,17 @@ func notifyChannels(hc *http.Client, cfg *config.Config) []notify.Notifier {
 //
 // ticket 08 终态规则（spec 决策 #12）：当天无终态 → 执行并形成终态；当天 failed
 // → 允许重试，成功后结果更新为 success；当天 success → 拒绝（ErrTerminalSuccess）
-// 且不发起任何网络请求。并发守卫（spec 决策 #11）：多协程同时调用时，锁未获得方
-// 返回 ErrTaskRunning（运行中的 Task 未被中断）。
+// 且不发起任何网络请求。并发守卫（spec 决策 #11；ticket 11）：同一 deployment 内
+// 第二个 Task（多协程或跨进程 run/daemon）被拒绝返回 ErrTaskRunning——进程内
+// 守卫零 I/O 先行，跨进程守卫（/data 锁文件 + flock，非阻塞）随后；锁未获得方
+// 不等待、不中断运行中的 Task（运行中的 Task 未被中断）。
 func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 	// 并发守卫先于一切：运行中的 Task 不被第二个 Task 打断（TryLock 非阻塞拒绝）。
-	if !a.runMu.TryLock() {
-		return task.Result{}, ErrTaskRunning
+	unguard, err := a.acquireTaskGuard()
+	if err != nil {
+		return task.Result{}, err
 	}
-	defer a.runMu.Unlock()
+	defer unguard()
 
 	// 终态规则门控：success 终态是 run 的非法输入状态（V1 无 force）。
 	// 必须在锁内：避免两个并发 RunTask 同时通过门控后双双执行。
@@ -169,6 +179,34 @@ func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 	return runner.Run(ctx)
 }
 
+// acquireTaskGuard 获取并发守卫——两层互斥（ticket 11；ADR-0008）：
+//   - 进程内守卫 runMu（TryLock，零文件 I/O）：同一 App 实例内第二个调用立即拒绝；
+//   - 跨进程守卫（/data 下 task.lock + flock LOCK_EX|LOCK_NB）：同一 deployment
+//     内另一进程（daemon 与 run/books 是独立 OS 进程、独立 App）的调用被拒绝。
+//     锁由内核随持有进程退出/崩溃自动释放；不同 /data（不同 deployment）互不干扰。
+//
+// 任一守卫被持有 → ErrTaskRunning（非阻塞、不等待、不中断运行中的 Task）。跨进程
+// 守卫的非 ErrLocked 失败（目录不可写等）→ 返回明确错误（保守失败：无法保证互斥
+// 时不得执行 Task）。返回的释放函数先释放跨进程锁、再释放进程内锁（Task 已结束后
+// 进程内后续调用不会被尚未释放的跨进程锁误拒）。
+func (a *App) acquireTaskGuard() (func(), error) {
+	if !a.runMu.TryLock() {
+		return nil, ErrTaskRunning
+	}
+	lock, err := filelock.TryLock(a.cfg.DataDir)
+	if err != nil {
+		a.runMu.Unlock()
+		if errors.Is(err, filelock.ErrLocked) {
+			return nil, ErrTaskRunning
+		}
+		return nil, fmt.Errorf("获取跨进程 Task 锁失败: %w", err)
+	}
+	return func() {
+		lock.Close()
+		a.runMu.Unlock()
+	}, nil
+}
+
 // checkTerminalGate 实现终态规则：当天（cfg.TZ）已形成 success 终态 → 拒绝
 // （ErrTerminalSuccess）；failed 终态是 run 的合法输入（重试，成功后更新为
 // success）；昨日及更早的终态不约束今天（日期匹配的唯一定义在 terminal.IsToday）。
@@ -193,14 +231,16 @@ func (a *App) checkTerminalGate() error {
 // 失效时从初始 Cookie 重建一次并重试（与 Task 同姿态）。
 //
 // 边界（issue 验收）：不产生 Task、不读取或修改 Terminal State、不发送通知；
-// 并发守卫与 Task 共用 runMu（避免与运行中 Task 的会话写竞争，运行中返回
-// ErrTaskRunning）。renewal 重建仍失败时返回包装 weread.ErrLoginInvalid 的错误
-// （含更新初始 Cookie 的明确提示；CLI 负责进程级呈现）。
+// 并发守卫与 Task 共用（acquireTaskGuard：进程内 runMu + 跨进程 flock，避免与
+// 运行中 Task 的会话写竞争，运行中返回 ErrTaskRunning）。renewal 重建仍失败时
+// 返回包装 weread.ErrLoginInvalid 的错误（含更新初始 Cookie 的明确提示；CLI
+// 负责进程级呈现）。
 func (a *App) ListBooks(ctx context.Context) ([]weread.ShelfBook, error) {
-	if !a.runMu.TryLock() {
-		return nil, ErrTaskRunning
+	unguard, err := a.acquireTaskGuard()
+	if err != nil {
+		return nil, err
 	}
-	defer a.runMu.Unlock()
+	defer unguard()
 
 	sess, err := session.New(a.deps.Sessions, a.cfg.Cookie)
 	if err != nil {

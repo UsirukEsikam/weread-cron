@@ -80,7 +80,7 @@ Status: ready-for-agent
 8. **调度（ADR-0001/0002）**：`nextStart(now, window, lastTerminal, tz)` 纯决策函数：窗口只约束开始时间；存在终态 → 明天；无终态且窗口未过 → `[now, 窗口结束]` 随机；窗口已过 → 明天；不补跑；`start==end` 固定时刻。daemon 在任务实际启动前再次校验当天终态。
 9. **持久化（/data）**：Login Session 序列化（Cookie 属性完整保存）+ Terminal State `{last_task_date, last_task_result}`；均原子写（临时文件 + rename）；终态先落盘、再发通知。
 10. **通知内容**：成功 = 完成、计划时长、实际累计时长（本地汇总 `rt`）、report 次数、书名；失败 = 失败阶段、主要错误、已尝试恢复（refresh/renewal）；登录失效 = 明确提示更新初始 Cookie 的固定文案。通知发送失败不影响 Task 结果；渠道互不影响。
-11. **并发**：进程内单 Task 互斥（运行中拒绝第二个 Task，含 `run`）；多实例防重不在 V1 范围。
+11. **并发**：同一 deployment（同一 /data）内单 Task 互斥：daemon 与 run/books 跨进程互斥（/data 锁文件 + flock，锁随持有进程退出/崩溃自动释放，ADR-0008），进程内守卫零 I/O 先行；已有 Task 运行时第二个 Task（自动或手动）被拒绝（非阻塞、不中断运行中的 Task）。不同 deployment/多实例防重不在 V1 范围。
 12. **CLI 行为**：`run` 不受 Run Window 限制、复用正常 Task 逻辑与终态规则（无终态 → 执行并形成终态；failed → 可重试更新为 success；success → 拒绝，无 force）；`books` 只读查询（可 renewal 并持久化 Login Session，不碰终态、不产生 Task、不通知）。
 13. **内部默认值清单（不暴露配置）**：report 节奏 ~30s、异常间隔阈值（~90s）、重试次数、renewal 节流、Reader Context TTL 默认、UA、HTTP 超时、日志级别、通知重试。
 

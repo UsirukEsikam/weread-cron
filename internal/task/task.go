@@ -56,6 +56,15 @@ import (
 	"weread-cron/internal/weread"
 )
 
+// ErrTaskRunning 是并发守卫的拒绝错误（spec 决策 #11；ticket 11/ADR-0008）：同一
+// deployment（同一 /data）内已有 Task 运行时，第二个 Task（run 或 daemon 触发）
+// 或 books 查询被拒绝。非阻塞拒绝语义：不等待、不中断运行中的 Task。
+//
+// 定义在本包供调度层与应用边界共用（app 以别名导出，保持 ticket 08 以来的判别
+// 身份）：若仅定义在 app，scheduler 判别本错误会引入 scheduler → app 依赖，而
+// daemon 的集成测试（app 包内）又依赖 scheduler——形成测试编译环。
+var ErrTaskRunning = errors.New("已有 Task 正在运行，拒绝并发启动第二个 Task")
+
 // 内部默认值（spec 决策 #13：不暴露为配置）。
 const (
 	// DefaultRhythm 是 timed report 节奏（参考实现默认 ~30s）。

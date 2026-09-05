@@ -246,6 +246,33 @@ func TestDaemonRechecksTerminalBeforeStart(t *testing.T) {
 	}
 }
 
+// TestDaemonSkipsWhenAnotherProcessRunsTask：并发守卫拒绝（ticket 11）——到点执行
+// 时另一进程持有 Task 锁（手动 run 运行中）：非失败语义——日志为 Info 级拒绝原因、
+// 窗口内继续排定重试（不进入 Warn 的"执行失败"文案、不写终态、不取消）。
+func TestDaemonSkipsWhenAnotherProcessRunsTask(t *testing.T) {
+	cfg := daemonConfig(t, nil) // 窗口 [23:30, 23:59]
+	d, out, runner := newDaemon(cfg, at(2025, 9, 6, 23, 35), at(2025, 9, 6, 23, 59), nil, task.ErrTaskRunning, false)
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := startDaemon(t, d, ctx)
+
+	waitFor(t, out, "另一进程正在运行 Task，本次自动执行被拒绝（窗口内继续排定）")
+	waitFor(t, out, "已排定下次 Task 启动")
+	cancel()
+	if err := waitDone(); err != nil {
+		t.Errorf("取消后应返回 nil，got %v", err)
+	}
+	if got := out.String(); strings.Contains(got, "Task 执行失败") {
+		t.Errorf("并发拒绝不是 Task 失败，不得进入 Warn 文案:\n%s", got)
+	}
+	// 不写终态（同暂时性失败语义：窗口内可再次排定）。
+	if _, has, err := terminal.NewFileStore(cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("并发拒绝不应产生终态: has=%v err=%v", has, err)
+	}
+	if n := runner.count(); n < 1 {
+		t.Errorf("应至少尝试执行一次，实际 %d 次", n)
+	}
+}
+
 // TestDaemonReplansWithinWindowAfterTransientFailure：Task 暂时性失败（未写终态）→
 // 当天剩余窗口内重排、再次执行（用户故事 #17）；失败不形成终态。
 func TestDaemonReplansWithinWindowAfterTransientFailure(t *testing.T) {

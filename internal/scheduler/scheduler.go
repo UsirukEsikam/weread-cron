@@ -7,6 +7,7 @@ package scheduler
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -136,6 +137,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				d.log.Info("daemon 退出")
 				return nil
+			}
+			// 并发守卫拒绝（ticket 11/ADR-0008）：另一进程（手动 run/books 或其他
+			// daemon）持有同一 /data 的 Task 锁。这不是失败——本次自动执行被跳过，
+			// 循环重排（窗口未过则在剩余窗口内再随机一次；运行中的 Task 不受影响）。
+			if errors.Is(err, task.ErrTaskRunning) {
+				d.log.Info("另一进程正在运行 Task，本次自动执行被拒绝（窗口内继续排定）")
+				if err := sleepUntil(ctx, d.clk, d.clk.Now().Add(replanMinGap)); err != nil {
+					d.log.Info("daemon 退出")
+					return nil
+				}
+				continue
 			}
 			// 未形成终态（暂时性失败）→ 循环重排：窗口未过则在剩余窗口内再随机
 			// 一次（用户故事 #17）；窗口已过或已形成 failed 终态 → 排次日。
