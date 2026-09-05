@@ -1,0 +1,26 @@
+# weread-cron 部署示例（ticket 10）：
+#   - 镜像为 GHCR 多架构清单（linux/amd64 + linux/arm64），Apple Silicon /
+#     x86_64 Linux 自动拉取对应架构；
+#   - /data 持久卷存放 Login Session 与 Terminal State（丢失后需重新提供
+#     WEREAD_CRON_COOKIE，见 README「/data 卷要求」）；
+#   - 全部配置经环境变量（前缀 WEREAD_CRON_，ADR-0005），从 .env 读取。
+#
+# 使用：
+#   cp .env.example .env   # 至少填写 WEREAD_CRON_COOKIE
+#   docker compose up -d
+#
+# image 中的 OWNER 请替换为你的 GitHub 用户名/组织（发布工作流把镜像推送到
+# ghcr.io/<仓库 owner>/<仓库名>，与本行路径一致）。
+
+services:
+  weread-cron:
+    image: ghcr.io/OWNER/weread-cron:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # TZ 镜像内默认 Asia/Shanghai（二进制内嵌 tzdata）；此处展示 compose 级
+      # 覆盖入口（在 .env 里改 TZ 即可，例如 TZ=Asia/Shanghai）。
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      - ./data:/data

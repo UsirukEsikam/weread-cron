@@ -3,6 +3,8 @@ name: CI
 on:
   push:
   pull_request:
+  # 可复用入口：Release GHCR 工作流以本文件为 test 门禁（避免双份 test 定义）。
+  workflow_call:
 
 jobs:
   vet-and-test:

@@ -1,0 +1,51 @@
+# 镜像发布（ticket 10）：test 全绿 → buildx 构建 linux/amd64 + linux/arm64 →
+# 推送 GHCR。触发后：
+#   - main 分支推送 → latest（+ main 分支标签）
+#   - v* 版本 tag → 版本标签（如 v1.0.0）
+# 推送目标 ghcr.io/<仓库 owner>/<仓库名>（由 github.repository 推导，无需硬编码用户名）。
+
+name: Release GHCR
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  # test 门禁复用 ci.yml（同一份 test 定义，不双份维护）。
+  test:
+    uses: ./.github/workflows/ci.yml
+
+  image:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

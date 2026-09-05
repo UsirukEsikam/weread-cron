@@ -1,0 +1,12 @@
+# 构建上下文瘦身：Go 构建不需要这些内容。
+.git
+.scratch
+docs
+data
+.env
+Dockerfile
+.dockerignore
+docker-compose.yml
+*.md
+coverage.out
+weread-cron
