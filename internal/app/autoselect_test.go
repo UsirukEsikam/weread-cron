@@ -2,12 +2,16 @@
 // ——元数据过滤优先未读完 → 有界探测（失败换下一本）→ 未读完全部不可用回退已读完
 // 可用书 → 全部不可用 → failed 终态 + 失败通知；Shelf 抓取为暂时性失败（不写终态、
 // 不通知）；显式指定候选不因 progress=100% 被排除。
+//
+// ticket 13 范围：探测前对候选层随机化（注入 RNG 洗牌）——稳定 Shelf 下多日执行
+// 选中结果随机分布，而非固定第一本；分层语义与每层有界探测上限保持不变。
 package app
 
 import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"path/filepath"
 	"strings"
@@ -111,12 +115,18 @@ func TestRunAutoSelectFallsBackToFinishedWhenUnreadUnusable(t *testing.T) {
 	}
 }
 
-// TestRunAutoSelectProbeBoundPerTier 断言探测有界：未读完层超过 20 本全部不可用时
-// 只探测前 20 本（上限默认），随后回退已读完层（同样有界）——第 4 本已读完可用 →
-// 恰好 24 次 Reader 页抓取，第 21 本及以后的未读完书从未被探测。
+// TestRunAutoSelectProbeBoundPerTier 断言探测有界（ticket 13 随机化后语义保持）：
+// 未读完层 30 本全部不可用 → 只探测 20 本（洗牌后前 20，上限默认）即回退已读完层；
+// 已读完层 4 本中只有 720004 可用，seed 42 洗牌后它落在第 2 位 → 恰好 22 次 Reader
+// 页抓取（20 + 2）。探测顺序随种子变化（非固定列表序），但每层探测次数不超过上限、
+// 命中书仍是唯一可用的 720004。
 func TestRunAutoSelectProbeBoundPerTier(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.cfg.Books = nil
+		// 显式固定种子：本测试的精确探测数依赖洗牌结果（seed 42 下可用书
+		// 720004 在已读完层洗牌后落于第 2 位 → 已读完层 2 次探测）。不继承
+		// setup 的默认种子，避免上游 RNG 消耗变化时静默改变计数。
+		h.rng = rand.New(rand.NewSource(42))
 		var shelf []fakeShelfBook
 		fail := map[string]bool{}
 		// 30 本未读完，全部不可用（Reader 页 500）。
@@ -141,17 +151,25 @@ func TestRunAutoSelectProbeBoundPerTier(t *testing.T) {
 		t.Fatalf("有界探测 Task 失败: %v", err)
 	}
 	if res.BookID != "720004" {
-		t.Errorf("选中 = %s，期望回退到第 4 本已读完 720004", res.BookID)
+		t.Errorf("选中 = %s，期望唯一可用的已读完 720004", res.BookID)
 	}
-	// 未读完层恰好 20 次探测（有界），已读完层 4 次（3 失败 + 1 命中）→ 共 24 次。
-	if n := h.weread.count("/web/reader/"); n != 24 {
-		t.Errorf("Reader 页抓取数 = %d，期望 24（20 + 4，探测上限生效）", n)
+	// 未读完层恰好 20 次探测（有界上限：洗牌后前 20 本全部不可用），已读完层
+	// 2 次（seed 42 洗牌后 720004 在第 2 位；1 失败 + 1 命中）→ 共 22 次。
+	if n := h.weread.count("/web/reader/"); n != 22 {
+		t.Errorf("Reader 页抓取数 = %d，期望 22（20 + 2，探测上限生效）", n)
 	}
-	// 第 21 本未读完（710021）不在探测范围内。
+	unreadProbes := 0
+	unreadEnc := map[string]bool{}
+	for i := 1; i <= 30; i++ {
+		unreadEnc[shelfID(fmt.Sprintf("7100%02d", i))] = true
+	}
 	for _, r := range h.weread.snapshot() {
-		if r.Path == "/web/reader/"+shelfID("710021") {
-			t.Errorf("第 21 本未读完不应被探测（超出上限）")
+		if unreadEnc[strings.TrimPrefix(r.Path, "/web/reader/")] {
+			unreadProbes++
 		}
+	}
+	if unreadProbes != 20 {
+		t.Errorf("未读完层探测数 = %d，期望 20（每层上限；其余 10 本不被探测）", unreadProbes)
 	}
 }
 
@@ -301,6 +319,95 @@ func TestRunExplicitBookNotExcludedWhenProgress100(t *testing.T) {
 	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
 	if err != nil || !has || st.LastTaskResult != terminal.ResultSuccess {
 		t.Fatalf("终态 = %+v has=%v err=%v，期望 success", st, has, err)
+	}
+}
+
+// TestRunAutoSelectRandomizesCandidates 断言候选层的随机化（ticket 13）：稳定
+// Shelf 下，用不同 RNG 种子多次执行 Task（每轮独立种子 = 多日执行），选中结果在
+// 候选间分布，而非固定第一本（用户故事 #10 的随机化意图）。两个用例覆盖两层：
+// 未读完层（候选均可读）与已读完回退层（未读完全部不可用、已读完均可读）——
+// 分层语义保持（选中限定在对应层、优先层有可用书时回退层不被探测、每轮抓取数
+// 固定 = 有界探测 + 洗牌后第一本可用即命中）。
+func TestRunAutoSelectRandomizesCandidates(t *testing.T) {
+	cases := []struct {
+		name       string
+		shelf      []fakeShelfBook
+		readerFail map[string]bool
+		// wantPrefix 限定选中的 bookId 前缀（分层语义断言）。
+		wantPrefix string
+		// probesPerRun 是每轮 Reader 页抓取数（有界探测；优先层可用 ≥1 时回退层不探测）。
+		probesPerRun int
+		// neverProbed 是任何一轮都不应被探测的书（分层优先断言）。
+		neverProbed []string
+	}{
+		{
+			name: "未读完层随机化",
+			shelf: []fakeShelfBook{
+				{BookID: "601111", Title: "未读完A", FinishReading: false},
+				{BookID: "601222", Title: "未读完B", FinishReading: false},
+				{BookID: "601333", Title: "未读完C", FinishReading: false},
+				{BookID: "602999", Title: "已读完D", FinishReading: true},
+			},
+			wantPrefix:   "601",
+			probesPerRun: 1,
+			neverProbed:  []string{"602999"},
+		},
+		{
+			name: "已读完回退层随机化",
+			shelf: []fakeShelfBook{
+				{BookID: "701111", Title: "未读完A", FinishReading: false},
+				{BookID: "701222", Title: "未读完B", FinishReading: false},
+				{BookID: "702111", Title: "已读完A", FinishReading: true},
+				{BookID: "702222", Title: "已读完B", FinishReading: true},
+				{BookID: "702333", Title: "已读完C", FinishReading: true},
+			},
+			readerFail: map[string]bool{
+				shelfID("701111"): true,
+				shelfID("701222"): true,
+			},
+			wantPrefix:   "702",
+			probesPerRun: 3,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			selected := map[string]int{}
+			for _, seed := range []int64{11, 22, 33, 44, 55, 66, 77, 88} {
+				h := setup(t, func(h *testHarness) {
+					h.cfg.Books = nil // 未配置候选书 = 自动选书
+					h.rng = rand.New(rand.NewSource(seed))
+					h.weread.shelfBooks = tc.shelf
+					h.weread.readerFailByBook = tc.readerFail
+				})
+				res, err := h.runTask(context.Background())
+				if err != nil {
+					t.Fatalf("seed %d 自动选书 Task 失败: %v", seed, err)
+				}
+				selected[res.BookID]++
+				if !strings.HasPrefix(res.BookID, tc.wantPrefix) {
+					t.Errorf("seed %d 选中 = %s，期望 %s 前缀候选", seed, res.BookID, tc.wantPrefix)
+				}
+				// 有界探测 + 洗牌后第一本可用即命中：每轮抓取数固定。
+				if n := h.weread.count("/web/reader/"); n != tc.probesPerRun {
+					t.Errorf("seed %d Reader 页抓取数 = %d，期望 %d", seed, n, tc.probesPerRun)
+				}
+				for _, id := range tc.neverProbed {
+					for _, r := range h.weread.snapshot() {
+						if r.Path == "/web/reader/"+shelfID(id) {
+							t.Errorf("seed %d 书 %s 被探测（分层优先语义）", seed, id)
+						}
+					}
+				}
+			}
+			if len(selected) < 2 {
+				t.Errorf("[%s] 多日执行选中结果固定为 %v（期望随机分布，非固定第一本）", tc.name, selected)
+			}
+			for id := range selected {
+				if !strings.HasPrefix(id, tc.wantPrefix) {
+					t.Errorf("[%s] 选中 %s 超出 %s 前缀候选范围: %v", tc.name, id, tc.wantPrefix, selected)
+				}
+			}
+		})
 	}
 }
 

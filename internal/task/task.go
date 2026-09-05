@@ -18,6 +18,9 @@
 // 的书 → 仍不可用 → failed 终态 + 失败通知；`weread-cron books` 由应用边界交付
 // （internal/app 的 ListBooks），本包不涉及。显式指定候选书不因 progress=100% 被排除。
 // Shelf 端点与响应结构按验证清单 #1 的设计假设实现（未实测，冲突时按处理原则讨论）。
+// ticket 13 范围（本文件）：自动选书的候选随机化——探测前对未读完层与已读完回退层
+// 各自洗牌（注入 RNG），稳定 Shelf 下多日执行不再固定选中同一本（用户故事 #10 的
+// 随机化意图）；分层语义、每层有界探测上限、无可用书失败姿态均不变。
 // ticket 12 范围（本文件）：暂时性失败与最终失败的收敛边界（spec 决策 #7 的
 // 调和）——daemon 注入收敛截止时刻 FinalFailureAfter（窗口结束 - 最短重排间隔）：
 // 失败时刻晚于该时刻的暂时性失败收敛为 failed 终态 + 失败通知（当天不静默空过），
@@ -613,10 +616,13 @@ func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error) er
 //  1. 抓取 Shelf（需登录后访问，故在 renewal 之后）；
 //  2. 元数据过滤：未读完（finishReading != 1）优先、已读完作为回退层；
 //     无 bookId/title 的条目不可建 Reader Context，直接过滤；
-//  3. 有界探测：对候选依次抓取 Reader 页（Reader Context 验证可建）——每层
+//  3. 候选层随机化（ticket 13）：未读完层与已读完回退层各自用注入 RNG 洗牌——
+//     稳定 Shelf 响应下多日执行不再固定选中同一本（用户故事 #10 的随机化意图、
+//     决策 #4：RNG 是领域真实依赖）；分层语义（未读完优先/已读完回退）不变；
+//  4. 有界探测：对洗牌后候选依次抓取 Reader 页（Reader Context 验证可建）——每层
 //     不超过 DefaultMaxSelectionProbes 次，失败换下一本；选定的书命中 Reader
 //     缓存（随后 fetchReaderState 零额外请求，进入上报即用探测时的 Context）；
-//  4. 全部不可用 → failBookSelection（failed 终态 + 失败通知）。
+//  5. 全部不可用 → failBookSelection（failed 终态 + 失败通知）。
 //
 // 与任务级恢复链的姿态一致：Shelf 抓取失败（传输/HTTP/解析）按暂时性失败处理
 // （不写终态、不通知，窗口内当日可再次调度；ticket 12：窗口耗尽时经
@@ -642,6 +648,13 @@ func (r *Runner) selectFromShelf(ctx context.Context, taskDate string) (string, 
 		}
 	}
 
+	// 候选层随机化（ticket 13）：探测前对未读完层与已读完回退层各自洗牌（Fisher-
+	// Yates，就地）。层内全部候选参与随机，探测仍从洗牌后顺序取前 N 本——每层
+	// 有界探测上限（DefaultMaxSelectionProbes）与"第一本可用即命中"语义不变，
+	// 但稳定 Shelf 下多日执行的选中结果不再固定。
+	shuffleTier(unread, o.RNG)
+	shuffleTier(finished, o.RNG)
+
 	probe := func(tier []weread.ShelfBook) (string, bool) {
 		for i, b := range tier {
 			if i >= DefaultMaxSelectionProbes {
@@ -664,6 +677,14 @@ func (r *Runner) selectFromShelf(ctx context.Context, taskDate string) (string, 
 		return id, nil
 	}
 	return "", r.failBookSelection(ctx, len(shelf), len(unread), len(finished))
+}
+
+// shuffleTier 对候选层就地 Fisher-Yates 随机化（ticket 13）：使用注入 RNG（决策
+// #4：RNG 是领域真实依赖，随机化是产品特性）。少于 2 个元素时无操作。
+func shuffleTier(tier []weread.ShelfBook, rng *rand.Rand) {
+	rng.Shuffle(len(tier), func(i, j int) {
+		tier[i], tier[j] = tier[j], tier[i]
+	})
 }
 
 // failBookSelection 输出自动选书失败的失败结果：failed 终态先落盘、再发失败通知
