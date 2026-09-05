@@ -18,6 +18,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -25,6 +26,7 @@ import (
 
 	"weread-cron/internal/clock"
 	"weread-cron/internal/config"
+	"weread-cron/internal/report"
 	"weread-cron/internal/session"
 	"weread-cron/internal/task"
 	"weread-cron/internal/terminal"
@@ -38,8 +40,8 @@ const (
 	// reader token 来自 Reader 页 __INITIAL_STATE__（sg 用它重算）。
 	testReaderToken = "fake-reader-token-42"
 	// 页面携带的 psvts/pclts（e() 编码后的秒级时间戳；与真实页面形态一致）。
-	testPsvts = "4ee326507a65a465g015fae"
-	testPclts = "aab32e207a65a466g010615"
+	testPsvts   = "4ee326507a65a465g015fae"
+	testPclts   = "aab32e207a65a466g010615"
 	testSummary = "太空是无尽黑暗的，深邃而寒冷"
 )
 
@@ -63,17 +65,34 @@ type fakeWeread struct {
 	// lastReaderEncoded 是最近一次 Reader 页请求的编码 bookId（referer 断言用）。
 	lastReaderEncoded string
 
-	// reportRejected 为 true 时 /web/book/read 返回 {"errCode":-2014}（拒绝）；
+	// reportRejected 为 true 时 /web/book/read 一律返回 {"errCode":-2014}（拒绝）；
+	// timedRejectAll 为 true 时仅 timed report 一律拒绝（enter 接受）；
+	// timedRejects > 0 时拒绝接下来 N 笔 timed report（恢复链中途成功场景）；
+	// enterRejects > 0 时拒绝接下来 N 笔 enter report。
 	// renewNoCookies 为 true 时 renewal 不返回 Set-Cookie。
 	reportRejected bool
+	timedRejectAll bool
+	timedRejects   int
+	enterRejects   int
 	renewNoCookies bool
 
+	// rotateReaderState 为 true 时每次 Reader 页抓取返回不同的 token/psvts
+	//（第 N 次抓取 = fake-reader-token-N / fake-psvts-N），用于断言恢复链刷新后
+	// 上报 payload 使用的是新 Reader Context。
+	rotateReaderState bool
+	readerFetches     int
+
 	// renewReject > 0 时，前 N 次 renewal 返回 {"succ":0}（登录失效的明确证据形态）；
+	// renewRejectFrom > 0 时从第 N 次起全部拒绝；renewRejectOnceAt > 0 时仅拒绝第 N 次
+	//（恢复链场景：任务开始 renewal 必须成功、仅链中/重建后重试的选择性拒绝）；
 	// renewStatus 非零时 renewal 返回该 HTTP 状态（传输/服务端故障，非明确证据）；
 	// renewNoSucc 为 true 时 renewal 返回 200 但不含 succ 字段（如 errCode 错误体）。
-	renewReject int
-	renewStatus int
-	renewNoSucc bool
+	renewReject       int
+	renewRejectFrom   int
+	renewRejectOnceAt int
+	renewAttempts     int
+	renewStatus       int
+	renewNoSucc       bool
 
 	// blockTimed 非 nil 时，下一笔 timed report 请求到达后等待 channel 关闭才响应
 	//（用于注入"响应期间时钟跳变"模拟 suspend）。
@@ -132,9 +151,17 @@ func (f *fakeWeread) handleRenewal(w http.ResponseWriter, r *http.Request) {
 		f.t.Errorf("renewal Content-Type = %q", ct)
 	}
 	f.mu.Lock()
+	f.renewAttempts++
+	n := f.renewAttempts
 	reject := f.renewReject > 0
 	if reject {
 		f.renewReject--
+	}
+	if f.renewRejectFrom > 0 && n >= f.renewRejectFrom {
+		reject = true
+	}
+	if f.renewRejectOnceAt > 0 && n == f.renewRejectOnceAt {
+		reject = true
 	}
 	status := f.renewStatus
 	f.mu.Unlock()
@@ -172,7 +199,14 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	f.lastReaderEncoded = strings.TrimPrefix(r.URL.Path, "/web/reader/")
+	f.readerFetches++
+	n := f.readerFetches
+	rotate := f.rotateReaderState
 	f.mu.Unlock()
+	if rotate {
+		io.WriteString(w, readerPageHTMLWith(fmt.Sprintf("fake-reader-token-%d", n), fmt.Sprintf("fake-psvts-%d", n)))
+		return
+	}
 	io.WriteString(w, readerPageHTML())
 }
 
@@ -200,7 +234,21 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 	} else if ref := r.Header.Get("Referer"); ref != "http://"+r.Host+"/web/reader/"+lastReader {
 		f.t.Errorf("report Referer = %q，期望 reader 页 %q", ref, "http://"+r.Host+"/web/reader/"+lastReader)
 	}
-	if f.reportRejected {
+	f.mu.Lock()
+	reject := f.reportRejected
+	if isTimed {
+		if f.timedRejectAll {
+			reject = true
+		} else if f.timedRejects > 0 {
+			reject = true
+			f.timedRejects--
+		}
+	} else if f.enterRejects > 0 {
+		reject = true
+		f.enterRejects--
+	}
+	f.mu.Unlock()
+	if reject {
 		fmt.Fprint(w, `{"errCode":-2014,"errMsg":"err"}`)
 		return
 	}
@@ -217,14 +265,13 @@ func readAll(r *http.Request) []byte {
 	return b
 }
 
-// readerPageHTML 生成含 __INITIAL_STATE__ 的 Reader 页（与真实页面形态一致：
-// JSON 后跟 "); (function"，chapterOffset 为字符串演示 flexInt 兼容）。
-func readerPageHTML() string {
+// readerPageHTMLWith 用指定 token/psvts 生成 Reader 页（恢复链刷新断言用）。
+func readerPageHTMLWith(readerToken, psvts string) string {
 	state := map[string]any{
 		"reader": map[string]any{
-			"psvts": testPsvts,
+			"psvts": psvts,
 			"pclts": testPclts,
-			"token": testReaderToken,
+			"token": readerToken,
 			"bookInfo": map[string]any{
 				"bookId": testBookID,
 				"title":  testBookTitle,
@@ -254,6 +301,12 @@ func readerPageHTML() string {
 		`</body></html>`
 }
 
+// readerPageHTML 生成含 __INITIAL_STATE__ 的 Reader 页（与真实页面形态一致：
+// JSON 后跟 "); (function"，chapterOffset 为字符串演示 flexInt 兼容）。
+func readerPageHTML() string {
+	return readerPageHTMLWith(testReaderToken, testPsvts)
+}
+
 // notifyRecord 是 fake 通知端点记录的请求。
 type notifyRecord struct {
 	Path  string
@@ -264,10 +317,10 @@ type notifyRecord struct {
 
 // fakeNotify 扮演 Bark / 企业微信端点。
 type fakeNotify struct {
-	t      *testing.T
-	mu     sync.Mutex
-	status int // 返回的 HTTP 状态（默认 200）
-	Check  func() error
+	t       *testing.T
+	mu      sync.Mutex
+	status  int // 返回的 HTTP 状态（默认 200）
+	Check   func() error
 	records []notifyRecord
 }
 
@@ -801,18 +854,468 @@ func TestRunSessionEstablishedFromInitialCookie(t *testing.T) {
 	}
 }
 
-// TestRunReportRejectedFailsTask 断言服务器拒绝上报时 Task 失败（恢复链由 ticket 05
-// 交付；本票只保证明确失败、不产生成功终态）。
-func TestRunReportRejectedFailsTask(t *testing.T) {
+// requestKinds 把 fake 服务端请求记录压缩为可断言的序列（renewal/refresh/enter/timed）。
+func (h *testHarness) requestKinds() []string {
+	var kinds []string
+	for _, r := range h.weread.snapshot() {
+		switch {
+		case r.Path == "/web/login/renewal":
+			kinds = append(kinds, "renewal")
+		case strings.HasPrefix(r.Path, "/web/reader/"):
+			kinds = append(kinds, "refresh")
+		case r.Path == "/web/book/read":
+			if strings.Contains(string(r.Body), `"rt":`) {
+				kinds = append(kinds, "timed")
+			} else {
+				kinds = append(kinds, "enter")
+			}
+		}
+	}
+	return kinds
+}
+
+// assertRequestSequence 断言请求按序等于 want（ticket 05：恢复链顺序与次数有界）。
+func (h *testHarness) assertRequestSequence(want ...string) {
+	h.t.Helper()
+	got := h.requestKinds()
+	if !reflect.DeepEqual(got, want) {
+		h.t.Errorf("请求序列 = %v\n期望 = %v", got, want)
+	}
+}
+
+// --- ticket 05：有界恢复链与失败通知 ---
+
+// TestRunReportRejectedRecoveryChainExhausted 断言 timed report 被拒时按有序恢复链
+// refresh → retry → renewal → refresh → retry 恢复（顺序与次数有界），仍失败 →
+// failed 终态（先落盘再通知）+ 失败通知（失败阶段/主要错误/已尝试恢复动作）。
+func TestRunReportRejectedRecoveryChainExhausted(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.reportRejected = true
+		h.weread.timedRejectAll = true // enter 接受；timed 一律拒绝
+	})
+	// 通知端点收到失败通知时 failed 终态必须已落盘（spec 决策 #9/#10）。
+	h.bark.Check = func() error {
+		data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+		if err != nil {
+			return fmt.Errorf("通知时 failed 终态尚未落盘: %w", err)
+		}
+		var st terminal.State
+		if err := json.Unmarshal(data, &st); err != nil {
+			return err
+		}
+		if st.LastTaskResult != terminal.ResultFailed {
+			return fmt.Errorf("终态 = %+v，期望 failed", st)
+		}
+		return nil
+	}
+
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("恢复链耗尽时 Task 应失败")
+	}
+	if !errors.Is(err, report.ErrRejected) {
+		t.Errorf("错误应包装 report.ErrRejected，实际: %v", err)
+	}
+
+	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh →
+	//      retry(拒) → renewal → refresh → retry(拒)：恢复链 5 步、次数有界 ----
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "timed", "renewal", "refresh", "timed",
+	)
+	if n := h.weread.count("/web/reader/"); n != 3 {
+		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + 恢复链 2 次刷新）", n)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 2 {
+		t.Errorf("renewal 数 = %d，期望 2（任务开始 + 恢复链 1 次）", n)
+	}
+	if n := h.weread.count("/web/book/read"); n != 4 {
+		t.Errorf("report 数 = %d，期望 4（enter + 3 次 timed（含 2 次重试））", n)
+	}
+
+	// ---- failed 终态（阻止当天再次自动执行）----
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("failed 终态不存在: %v", err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}) {
+		t.Errorf("Terminal State = %+v", st)
+	}
+
+	// ---- 失败通知：Bark + 企业微信各 1 条，含失败阶段/主要错误/已尝试恢复动作；
+	//      无成功通知、无登录失效通知 ----
+	for name, nf := range map[string]*fakeNotify{"bark": h.bark, "wecom": h.wecom} {
+		recs := nf.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("%s 通知数 = %d，期望 1 条失败通知", name, len(recs))
+		}
+		msg, err := json.Marshal(recs[0].Body)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, want := range []string{
+			"微信读书阅读任务失败",
+			"失败阶段：timed report",
+			"主要错误",
+			"已尝试恢复：刷新 Reader Context → 重试上报 → renewal → 刷新 Reader Context → 重试上报",
+			"2025-09-06",
+		} {
+			if !strings.Contains(string(msg), want) {
+				t.Errorf("%s 失败通知缺少 %q；body=%s", name, want, msg)
+			}
+		}
+		if strings.Contains(string(msg), "完成") {
+			t.Errorf("%s 不得混入成功文案；body=%s", name, msg)
+		}
+	}
+}
+
+// TestRunRecoveryChainFirstRetrySucceeds 断言恢复链中途成功（refresh 后重试被接受）→
+// Task 继续并最终成功；刷新后的 payload 使用新 Reader Context（新 token/psvts）。
+func TestRunRecoveryChainFirstRetrySucceeds(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejects = 1 // 仅第 1 笔 timed 拒绝；重试即成功
+		h.weread.rotateReaderState = true
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("恢复链中途成功时 Task 应继续: %v", err)
+	}
+	if res.Reports != 2 || res.Actual != time.Minute {
+		t.Errorf("Result = reports:%d actual:%v，期望 2 次/1 分钟", res.Reports, res.Actual)
+	}
+
+	// ---- 线上按序：renewal → refresh(1) → enter → timed(拒) → refresh(2) →
+	//      timed(接受) → timed(接受)；无 renewal（重试即恢复）----
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "timed", "timed")
+	if n := h.weread.count("/web/login/renewal"); n != 1 {
+		t.Errorf("renewal 数 = %d，期望 1（仅任务开始）", n)
+	}
+
+	// ---- 刷新后的 payload 使用新 Reader Context：token=2 / psvts=2 ----
+	reports := h.reportRecords()
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		switch {
+		case i == 1: // 被拒的首笔（refresh 之前）
+			verifySG(t, p, "fake-reader-token-1")
+			if p["ps"] != "fake-psvts-1" {
+				t.Errorf("刷新前 payload[%d].ps = %s", i, p["ps"])
+			}
+		case i >= 2: // refresh 之后的接受/继续上报
+			verifySG(t, p, "fake-reader-token-2")
+			if p["ps"] != "fake-psvts-2" {
+				t.Errorf("刷新后 payload[%d].ps = %s，期望新 Context", i, p["ps"])
+			}
+		}
+	}
+
+	// ---- success 终态 + 成功通知；无失败通知 ----
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("success 终态不存在: %v", err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	if got := len(h.bark.snapshot()); got != 1 {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
+	}
+	if h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("通知 title = %v", h.bark.snapshot()[0].Body["title"])
+	}
+}
+
+// TestRunRecoveryChainViaRenewalSucceeds 断言恢复链走到 renewal 环节成功
+// （renewal → refresh → retry 被接受）→ Task 继续并最终成功；次数有界。
+func TestRunRecoveryChainViaRenewalSucceeds(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejects = 2 // timed#1 与 retry#1 拒绝；renewal 后 retry#2 接受
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("恢复链经 renewal 成功时 Task 应继续: %v", err)
+	}
+	if res.Reports != 2 || res.Actual != time.Minute {
+		t.Errorf("Result = reports:%d actual:%v", res.Reports, res.Actual)
+	}
+
+	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh →
+	//      retry(拒) → renewal → refresh → retry(接受) → timed(接受) ----
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "timed", "renewal", "refresh", "timed", "timed",
+	)
+	if n := h.weread.count("/web/reader/"); n != 3 {
+		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + 恢复链 2 次刷新）", n)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 2 {
+		t.Errorf("renewal 数 = %d，期望 2（任务开始 + 恢复链 1 次）", n)
+	}
+
+	// success 终态 + 成功通知；无失败通知。
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	if got := len(h.bark.snapshot()); got != 1 {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条", got)
+	}
+}
+
+// TestRunRecoveryChainNotifyChannelIndependence 断言失败通知的渠道独立性：Bark 端点
+// 故障（500）不影响企业微信渠道收到失败通知，也不影响 Task 结果（failed 终态落盘）。
+func TestRunRecoveryChainNotifyChannelIndependence(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true
+		h.bark.status = 500
 	})
 	_, err := h.runTask(context.Background())
 	if err == nil {
-		t.Fatal("服务器拒绝上报时 Task 应失败")
+		t.Fatal("恢复链耗尽时 Task 应失败")
 	}
-	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
-		t.Errorf("失败时不得写入 success 终态")
+
+	// 企业微信收到完整失败通知；Bark（故障渠道）的失败不阻断。
+	wecom := h.wecom.snapshot()
+	if len(wecom) != 1 {
+		t.Fatalf("企业微信应收到 1 条失败通知，实际 %d", len(wecom))
+	}
+	msg, _ := json.Marshal(wecom[0].Body)
+	for _, want := range []string{"失败阶段：timed report", "已尝试恢复"} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("企业微信失败通知缺少 %q；body=%s", want, msg)
+		}
+	}
+	// Task 结果不受通知渠道故障影响：failed 终态已落盘。
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("failed 终态不存在: %v", err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultFailed {
+		t.Errorf("Terminal State = %+v", st)
+	}
+}
+
+// TestRunRecoveryChainLoginInvalidGoesThroughT4 断言恢复链中 renewal 出现登录失效
+// 明确证据时走 ticket 04 判别与路径：从初始 Cookie 重建一次 → 仍失败 → failed 终态
+// + 登录失效通知（固定提示）；不混入普通失败文案（无失败通知）。
+func TestRunRecoveryChainLoginInvalidGoesThroughT4(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true
+		h.weread.renewRejectFrom = 2 // 任务开始 renewal 成功；恢复链中的 renewal 起出现 succ:0 证据
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("登录失效重建失败时 Task 应失败")
+	}
+	if !errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("错误应包装 weread.ErrLoginInvalid，实际: %v", err)
+	}
+
+	// ---- 线上按序：renewal(任务开始) → refresh → enter → timed(拒) → refresh →
+	//      retry(拒) → renewal(succ:0 证据) → renewal(重建后重试) ----
+	//      有界：1 次证据 + 1 次重建重试，不无限重试。
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "timed", "renewal", "renewal",
+	)
+	if n := h.weread.count("/web/login/renewal"); n != 3 {
+		t.Errorf("renewal 数 = %d，期望 3（任务开始 + 证据 + 重建后重试）", n)
+	}
+	// 证据 renewal 携带当前会话（任务开始 renewal 已并入新 Cookie）；
+	// 重建后的重试携带初始 Cookie 重建的会话（ticket 04 语义在恢复链内同样成立）。
+	var renewals []wereadRequest
+	for _, r := range h.weread.snapshot() {
+		if r.Path == "/web/login/renewal" {
+			renewals = append(renewals, r)
+		}
+	}
+	if len(renewals) < 3 {
+		t.Fatalf("renewal 记录数 = %d，期望 ≥3", len(renewals))
+	}
+	if c := renewals[1].Header.Get("Cookie"); !strings.Contains(c, "new123") {
+		t.Errorf("证据 renewal Cookie = %q，期望当读会话（含任务开始 renewal 并入的新 Cookie）", c)
+	}
+	if c := renewals[2].Header.Get("Cookie"); !strings.Contains(c, "wr_gid=123") || !strings.Contains(c, "wr_skey=abc") || strings.Contains(c, "new123") {
+		t.Errorf("重建后 renewal Cookie = %q，期望初始 Cookie 重建的会话", c)
+	}
+
+	// ---- failed 终态 + 登录失效通知（固定提示）；无普通失败通知、无成功通知 ----
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("failed 终态不存在: %v", err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultFailed {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	for name, nf := range map[string]*fakeNotify{"bark": h.bark, "wecom": h.wecom} {
+		recs := nf.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("%s 通知数 = %d，期望 1 条登录失效通知", name, len(recs))
+		}
+		msg, _ := json.Marshal(recs[0].Body)
+		for _, want := range []string{"微信读书登录已失效", "请更新初始 Cookie（WEREAD_CRON_COOKIE）"} {
+			if !strings.Contains(string(msg), want) {
+				t.Errorf("%s 登录失效通知缺少 %q；body=%s", name, want, msg)
+			}
+		}
+		// 不混入普通失败文案（spec 决策 #10；issue 验收 ✓）。
+		for _, forbid := range []string{"失败阶段", "已尝试恢复", "阅读任务失败"} {
+			if strings.Contains(string(msg), forbid) {
+				t.Errorf("%s 登录失效通知混入普通失败文案 %q；body=%s", name, forbid, msg)
+			}
+		}
+	}
+}
+
+// TestRunRecoveryChainLoginInvalidRebuildSucceedsContinues 断言恢复链中登录失效证据
+// 出现后从初始 Cookie 重建一次成功 → 恢复链继续（refresh → retry）→ Task 最终成功。
+func TestRunRecoveryChainLoginInvalidRebuildSucceedsContinues(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejects = 2      // timed#1 与 retry#1 拒绝
+		h.weread.renewRejectOnceAt = 2 // 仅恢复链中的那次 renewal 出现一次 succ:0 证据
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("重建成功后 Task 应继续完成: %v", err)
+	}
+	if res.Reports != 2 {
+		t.Errorf("Reports = %d，期望 2（任务完整执行）", res.Reports)
+	}
+
+	// ---- 线上按序：renewal(任务开始) → refresh → enter → timed(拒) → refresh →
+	//      retry(拒) → renewal(证据) → renewal(重建后重试) → refresh → retry(接受)
+	//      → timed(接受) ----
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "timed", "renewal", "renewal", "refresh", "timed", "timed",
+	)
+
+	// success 终态 + 成功通知；无登录失效通知、无失败通知。
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	if got := len(h.bark.snapshot()); got != 1 || h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
+	}
+}
+
+// TestRunEnterRejectedRecoveryChainSucceeds 断言 enter report 被拒同样走恢复链
+// （refresh → retry 接受）→ Task 继续并最终成功（用户故事 #26/#31）。
+func TestRunEnterRejectedRecoveryChainSucceeds(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.enterRejects = 1 // 仅首笔 enter 拒绝；refresh 后重试接受
+	})
+	if _, err := h.runTask(context.Background()); err != nil {
+		t.Fatalf("enter 恢复链成功后 Task 应继续: %v", err)
+	}
+
+	// ---- 线上按序：renewal → refresh → enter(拒) → refresh → enter(接受) →
+	//      timed → timed；无 renewal（重试即恢复）。----
+	h.assertRequestSequence("renewal", "refresh", "enter", "refresh", "enter", "timed", "timed")
+	if n := h.weread.count("/web/reader/"); n != 2 {
+		t.Errorf("Reader 页抓取数 = %d，期望 2（初始 + 恢复链 1 次刷新）", n)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 1 {
+		t.Errorf("renewal 数 = %d，期望 1（仅任务开始）", n)
+	}
+
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("Terminal State = %+v", st)
+	}
+}
+
+// TestRunEnterRejectedRecoveryChainExhausted 断言 enter report 被拒且恢复链耗尽 →
+// failed 终态 + 失败通知（失败阶段 = enter report）：恢复链对 enter 同样适用、有界。
+func TestRunEnterRejectedRecoveryChainExhausted(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.reportRejected = true // 所有 /web/book/read 一律拒绝（含 enter）
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("恢复链耗尽时 Task 应失败")
+	}
+	if !errors.Is(err, report.ErrRejected) {
+		t.Errorf("错误应包装 report.ErrRejected，实际: %v", err)
+	}
+
+	// ---- 线上按序：renewal → refresh → enter(拒) → refresh → retry(拒) →
+	//      renewal → refresh → retry(拒)：恢复链 5 步、次数有界 ----
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"refresh", "enter", "renewal", "refresh", "enter",
+	)
+	if n := h.weread.count("/web/reader/"); n != 3 {
+		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + 恢复链 2 次刷新）", n)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 2 {
+		t.Errorf("renewal 数 = %d，期望 2（任务开始 + 恢复链 1 次）", n)
+	}
+
+	// failed 终态 + 失败通知（失败阶段 = enter report）。
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("failed 终态不存在: %v", err)
+	}
+	var st terminal.State
+	if err := json.Unmarshal(data, &st); err != nil {
+		t.Fatal(err)
+	}
+	if st.LastTaskResult != terminal.ResultFailed {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	for name, nf := range map[string]*fakeNotify{"bark": h.bark, "wecom": h.wecom} {
+		recs := nf.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("%s 通知数 = %d，期望 1 条失败通知", name, len(recs))
+		}
+		msg, _ := json.Marshal(recs[0].Body)
+		if !strings.Contains(string(msg), "失败阶段：enter report") {
+			t.Errorf("%s 失败通知缺少失败阶段；body=%s", name, msg)
+		}
 	}
 }
 
@@ -955,7 +1458,7 @@ func TestRunLoginInvalidRebuildFailsWritesFailedTerminalAndNotifies(t *testing.T
 }
 
 // TestRunTransientRenewalFailureDoesNotTriggerRebuild 断言无明确证据的失败
-//（HTTP 非 200：传输/服务端故障）不触发重建、不写 failed 终态、不发登录失效通知。
+// （HTTP 非 200：传输/服务端故障）不触发重建、不写 failed 终态、不发登录失效通知。
 func TestRunTransientRenewalFailureDoesNotTriggerRebuild(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.renewStatus = 500
@@ -980,7 +1483,7 @@ func TestRunTransientRenewalFailureDoesNotTriggerRebuild(t *testing.T) {
 }
 
 // TestRunLoginInvalidRebuildWithoutInitialCookieFails 断言：无初始 Cookie 可重建时
-//（部署只配置了持久化会话且已失效），同样走 failed 终态 + 登录失效通知。
+// （部署只配置了持久化会话且已失效），同样走 failed 终态 + 登录失效通知。
 func TestRunLoginInvalidRebuildWithoutInitialCookieFails(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.cfg.Cookie = ""

@@ -13,6 +13,7 @@ import (
 	"weread-cron/internal/clock"
 	"weread-cron/internal/config"
 	"weread-cron/internal/notify"
+	"weread-cron/internal/readercontext"
 	"weread-cron/internal/report"
 	"weread-cron/internal/session"
 	"weread-cron/internal/task"
@@ -109,6 +110,7 @@ func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 		RNG:              a.deps.RNG,
 		Client:           client,
 		Sender:           report.NewSender(client),
+		Reader:           readercontext.NewProvider(client),
 		Terminal:         terminal.NewFileStore(a.cfg.DataDir),
 		Notify:           a.deps.Notify,
 		Books:            a.cfg.Books,

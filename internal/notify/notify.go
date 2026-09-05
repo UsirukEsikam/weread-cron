@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"time"
 )
 
@@ -39,12 +40,29 @@ type LoginInvalid struct {
 // LoginInvalidPrompt 是登录失效通知的固定提示文案（spec 决策 #10：明确提示更新初始 Cookie）。
 const LoginInvalidPrompt = "请更新初始 Cookie（WEREAD_CRON_COOKIE）后重试：重启服务或执行 weread-cron run。"
 
+// FailureTitle 是失败通知的标题（spec 决策 #10；与成功/登录失效通知文案区分）。
+const FailureTitle = "微信读书阅读任务失败"
+
+// Failure 是失败通知的内容（spec 决策 #10：失败阶段、主要错误、已尝试恢复动作）。
+type Failure struct {
+	// Date 是 Task 日期（cfg.TZ 下 YYYY-MM-DD）。
+	Date string
+	// Stage 是失败阶段（如 task 包的 StageTimedReport/StageEnterReport）。
+	Stage string
+	// Error 是主要错误（恢复链耗尽时的最终错误摘要）。
+	Error string
+	// Actions 是已尝试的恢复动作（按发生顺序；由 task 恢复链记录）。
+	Actions []string
+}
+
 // Notifier 发送一类通知；错误仅表示该渠道失败。
 type Notifier interface {
 	// NotifySuccess 发送成功通知。
 	NotifySuccess(ctx context.Context, s Success) error
 	// NotifyLoginInvalid 发送登录失效通知（固定文案：明确提示更新初始 Cookie）。
 	NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error
+	// NotifyFailure 发送失败通知（失败阶段、主要错误、已尝试恢复动作；登录失效通知不混入）。
+	NotifyFailure(ctx context.Context, f Failure) error
 }
 
 // HTTPClient 是通知渠道使用的 HTTP 客户端（超时等内部默认由装配层提供）。
@@ -84,6 +102,17 @@ func (m *Multi) NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error {
 	return errors.Join(errs...)
 }
 
+// NotifyFailure 逐个渠道发送并聚合错误（任一渠道失败不影响其他渠道）。
+func (m *Multi) NotifyFailure(ctx context.Context, f Failure) error {
+	var errs []error
+	for _, ch := range m.channels {
+		if err := ch.NotifyFailure(ctx, f); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // Bark 通过 Bark 服务推送（Bark 官方 API：POST 到设备 key URL，JSON body）。
 type Bark struct {
 	// URL 是配置的 Bark 地址（BARK URL，形如 https://api.day.app/<key>）。
@@ -106,6 +135,16 @@ func (b *Bark) NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error {
 	body := map[string]string{
 		"title": "微信读书登录已失效",
 		"body":  formatLoginInvalid(l),
+		"group": "weread-cron",
+	}
+	return postJSON(ctx, b.Client, b.URL, body)
+}
+
+// NotifyFailure 发送 Bark 失败通知（失败阶段/主要错误/已尝试恢复动作）。
+func (b *Bark) NotifyFailure(ctx context.Context, f Failure) error {
+	body := map[string]string{
+		"title": FailureTitle,
+		"body":  formatFailure(f),
 		"group": "weread-cron",
 	}
 	return postJSON(ctx, b.Client, b.URL, body)
@@ -140,6 +179,17 @@ func (w *WeCom) NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error {
 	return postJSON(ctx, w.Client, w.URL, body)
 }
 
+// NotifyFailure 发送企业微信文本消息（失败阶段/主要错误/已尝试恢复动作）。
+func (w *WeCom) NotifyFailure(ctx context.Context, f Failure) error {
+	body := map[string]any{
+		"msgtype": "text",
+		"text": map[string]string{
+			"content": formatFailure(f),
+		},
+	}
+	return postJSON(ctx, w.Client, w.URL, body)
+}
+
 // formatMessage 生成统一的成功通知文本。
 func formatMessage(s Success) string {
 	return fmt.Sprintf(
@@ -153,6 +203,15 @@ func formatLoginInvalid(l LoginInvalid) string {
 	msg := fmt.Sprintf("微信读书登录已失效：Task 未能完成（%s）\n%s", l.Date, LoginInvalidPrompt)
 	if l.Cause != "" {
 		msg += "\n原因：" + l.Cause
+	}
+	return msg
+}
+
+// formatFailure 生成失败通知文本：失败阶段、主要错误、已尝试恢复动作（spec 决策 #10）。
+func formatFailure(f Failure) string {
+	msg := fmt.Sprintf("微信读书阅读任务失败（%s）\n失败阶段：%s\n主要错误：%s", f.Date, f.Stage, f.Error)
+	if len(f.Actions) > 0 {
+		msg += "\n已尝试恢复：" + strings.Join(f.Actions, " → ")
 	}
 	return msg
 }

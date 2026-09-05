@@ -1,13 +1,15 @@
-// Package task 是 Task 编排层（spec 决策 #3/#6）：renew → 选书 → 读真实 Reading Progress
-// 与 Reader Context → enter report → 周期 timed report（rt 按 ADR-0004）→ 本地累计达标
-// → success 终态落盘 → 成功通知。
+// Package task 是 Task 编排层（spec 决策 #3/#6/#7）：renew → 选书 → 读真实 Reading
+// Progress 与 Reader Context → enter report → 周期 timed report（rt 按 ADR-0004）→
+// 本地累计达标 → 终态落盘 → 通知。
 //
 // ticket 03 范围：指定候选书（WEREAD_CRON_BOOKS）下的最小 happy path。
 // ticket 04 范围：renewal 凭明确证据（weread.ErrLoginInvalid，checklist #2）判定登录失效
 // → 从初始 Cookie 重建 Login Session 一次 → 重试；仍失败 → failed 终态 + 登录失效通知
 // （明确提示更新初始 Cookie，spec 决策 #7/#9/#10）。
-// 恢复链（refresh Context → renewal → 重试）与普通失败终态、失败通知由 ticket 05 交付；
-// Reader Context TTL 缓存与主动刷新由 ticket 06 交付；自动选书由 ticket 09 交付。
+// ticket 05 范围（本文件）：report 被拒时的有界恢复链（spec 决策 #7）——refresh Reader
+// Context → retry → renewal → refresh Reader Context → retry → 仍失败 → failed 终态 +
+// 失败通知（失败阶段、主要错误、已尝试恢复动作）。Reader Context TTL 缓存与主动刷新由
+// ticket 06 交付；自动选书由 ticket 09 交付。
 //
 // # rt 语义（ADR-0004）
 //
@@ -16,6 +18,18 @@
 // 网络延迟与失败重试自然并入下一次 rt（响应晚于下一节奏点时，直接按实测间隔上报）。
 // 间隔超过内部异常阈值（默认 90s）时，不把大间隔作为一次 rt 上报，而是重建
 // Reading Session（重新 enter report；Task 继续、同一本书、累计保留）。
+//
+// # 有界恢复链（spec 决策 #7）
+//
+// 只有服务器"明确拒绝"（report.ErrRejected：响应已完成但不被接受）才进入恢复链；
+// 传输错误、HTTP 非 200 等暂时性失败不进入（沿用 ticket 04 的判别原则）。
+// 恢复链按固定有界序列执行 5 步：refresh Reader Context → retry → renewal →
+// refresh Reader Context → retry。任何一步成功即视为恢复成功、Task 继续；
+// 最后一步重试仍被拒绝 → 恢复链耗尽 → failed 终态先落盘、再发失败通知。
+// 链中步骤的非拒绝失败（传输/HTTP/解析）按暂时性失败处理：不写终态、不发通知
+// （当日可再次调度）——与 ticket 04 对 renewal 暂时性失败的姿态一致；
+// renewal 的登录失效明确证据仍走 ticket 04 的判别与路径（重建一次 → 仍失败 →
+// 登录失效终态 + 登录失效通知，不混入普通失败文案）。
 package task
 
 import (
@@ -28,6 +42,7 @@ import (
 
 	"weread-cron/internal/clock"
 	"weread-cron/internal/notify"
+	"weread-cron/internal/readercontext"
 	"weread-cron/internal/report"
 	"weread-cron/internal/terminal"
 	"weread-cron/internal/weread"
@@ -41,6 +56,28 @@ const (
 	DefaultAnomalyThreshold = 90 * time.Second
 )
 
+// 失败阶段（notify.Failure.Stage；spec 决策 #10：失败通知含失败阶段）。
+const (
+	// StageEnterReport 是 enter report 失败的阶段。
+	StageEnterReport = "enter report"
+	// StageTimedReport 是 timed report 失败的阶段。
+	StageTimedReport = "timed report"
+)
+
+// 已尝试恢复动作（notify.Failure.Actions；spec 决策 #10：失败通知含已尝试恢复动作）。
+const (
+	// ActionRefreshContext 是"刷新 Reader Context"恢复动作。
+	ActionRefreshContext = "刷新 Reader Context"
+	// ActionRetryReport 是"重试上报"恢复动作。
+	ActionRetryReport = "重试上报"
+	// ActionRenewal 是"renewal"恢复动作。
+	ActionRenewal = "renewal"
+)
+
+// recoverySteps 是有界恢复链的固定步数（spec 决策 #7：refresh → retry → renewal →
+// refresh → retry；不无限重试）。
+const recoverySteps = 5
+
 // Options 是 Runner 的全部依赖（ADR-0006：clock/RNG/HTTP/notify/session store 注入；
 // 零值使用内部默认）。
 type Options struct {
@@ -51,9 +88,11 @@ type Options struct {
 	Client *weread.Client
 	// Sender 是 enter/timed 上报发送器。
 	Sender *report.Sender
+	// Reader 是 Reader Context 提供者（抓取/刷新；nil = 由 Client 组装）。
+	Reader *readercontext.Provider
 	// Terminal 是 Terminal State 持久化（临时 /data）。
 	Terminal terminal.Store
-	// Notify 是成功通知；nil 表示不通知（合法渠道组合，用户故事 #37）。
+	// Notify 是通知；nil 表示不通知（合法渠道组合，用户故事 #37）。
 	Notify notify.Notifier
 
 	// RebuildLoginSession 是登录失效重建入口（spec 决策 #7）：凭明确证据判定失效后，
@@ -68,10 +107,6 @@ type Options struct {
 	TargetMaxMinutes int
 	// TZ 决定 Task 日期等时间语义。
 	TZ *time.Location
-
-	// Rhythm / AnomalyThreshold 是内部节奏与异常阈值（0 = 内部默认）。
-	Rhythm           time.Duration
-	AnomalyThreshold time.Duration
 
 	Logger *slog.Logger
 }
@@ -104,11 +139,8 @@ func New(opts Options) *Runner {
 	if opts.RNG == nil {
 		opts.RNG = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
-	if opts.Rhythm == 0 {
-		opts.Rhythm = DefaultRhythm
-	}
-	if opts.AnomalyThreshold == 0 {
-		opts.AnomalyThreshold = DefaultAnomalyThreshold
+	if opts.Reader == nil {
+		opts.Reader = readercontext.NewProvider(opts.Client)
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -137,33 +169,26 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 
 	// 4. 读真实 Reading Progress 并建立 Reader Context（同一 Reader 页；CONTEXT.md）。
-	html, err := o.Client.ReaderPage(ctx, bookID)
+	initial, err := r.fetchReaderState(ctx, bookID)
 	if err != nil {
 		return Result{}, err
 	}
-	state, err := weread.ParseInitialState(html)
-	if err != nil {
-		return Result{}, err
-	}
-	progress, err := state.ReadingProgress(bookID)
-	if err != nil {
-		return Result{}, err
-	}
-	rc := state.ReaderContext()
-	bookTitle := state.BookTitle()
+	bookTitle := initial.Title
 	o.Logger.Info("Task 开始",
 		"book_id", bookID, "book_title", bookTitle,
-		"chapter_uid", progress.ChapterUID, "target", target.String())
+		"chapter_uid", initial.Progress.ChapterUID, "target", target.String())
 
-	// 5. enter report 建立 Reading Session（用户故事 #26）。
+	// 5. enter report 建立 Reading Session（用户故事 #26）；被拒时按有界恢复链恢复。
 	now := o.Clock.Now()
-	if err := o.Sender.Enter(ctx, bookID, progress, rc, now); err != nil {
+	enterResult, err := r.sendEnter(ctx, bookID, *initial, now)
+	if err != nil {
 		return Result{}, fmt.Errorf("enter report 失败: %w", err)
 	}
+	st, lastSent := enterResult.st, enterResult.at
 
 	// 6. 周期 timed report；rt 按 ADR-0004；本地累计达标即停止（用户故事 #27/#28）。
-	lastSent := now
-	next := now.Add(o.Rhythm)
+	//    被拒时按有界恢复链恢复（spec 决策 #7），恢复成功后 Task 继续。
+	next := lastSent.Add(DefaultRhythm)
 	var accumulated time.Duration
 	reports := 0
 	for accumulated < target {
@@ -171,31 +196,34 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			o.Clock.Sleep(d)
 		}
 		now = o.Clock.Now()
-		rtSec := int(now.Sub(lastSent) / time.Second)
-		if rtSec < 1 {
-			rtSec = 1
-		}
-		if time.Duration(rtSec)*time.Second > o.AnomalyThreshold {
+		rtSec := rtSeconds(now, lastSent)
+		if time.Duration(rtSec)*time.Second > DefaultAnomalyThreshold {
 			// 异常间隔（如主机 suspend）：不作为一次大 rt 上报，重建 Reading Session
-			//（重新 enter；Task 继续、累计保留，用户故事 #29）。
+			//（重新 enter；Task 继续、累计保留，用户故事 #29）。enter 同样走恢复链。
 			o.Logger.Warn("异常间隔，重建 Reading Session", "rt_sec", rtSec)
-			if err := o.Sender.Enter(ctx, bookID, progress, rc, now); err != nil {
+			enterResult, err := r.sendEnter(ctx, bookID, st, now)
+			if err != nil {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", err)
 			}
-			lastSent = now
-			next = now.Add(o.Rhythm)
+			st, lastSent = enterResult.st, enterResult.at
+			next = lastSent.Add(DefaultRhythm)
 			continue
 		}
-		tsMs := now.UnixMilli()
-		rn := o.RNG.Intn(1000)
-		if err := o.Sender.Timed(ctx, bookID, progress, rc, now, rtSec, tsMs, rn); err != nil {
+		// 每笔 timed report 的 rt = 距上次被成功接受上报的实际间隔（ADR-0004）；
+		// 恢复链重试重新计算（重试延迟自然并入下一次 rt，用户故事 #28）。
+		send := func(s readercontext.State, t time.Time) (int, error) {
+			rt := rtSeconds(t, lastSent)
+			return rt, o.Sender.Timed(ctx, bookID, s.Progress, s.Context, t, rt, t.UnixMilli(), o.RNG.Intn(1000))
+		}
+		newSt, rt, at, err := r.recoverSend(ctx, bookID, StageTimedReport, st, now, send)
+		if err != nil {
 			return Result{}, fmt.Errorf("timed report 失败: %w", err)
 		}
-		accumulated += time.Duration(rtSec) * time.Second
+		st, lastSent = newSt, at
+		accumulated += time.Duration(rt) * time.Second
 		reports++
-		o.Logger.Debug("timed report 接受", "rt_sec", rtSec, "accumulated", accumulated.String(), "reports", reports)
-		lastSent = now
-		next = now.Add(o.Rhythm)
+		o.Logger.Debug("timed report 接受", "rt_sec", rt, "accumulated", accumulated.String(), "reports", reports)
+		next = lastSent.Add(DefaultRhythm)
 	}
 
 	// 7. success 终态先落盘，再发成功通知（spec 决策 #9/#10；用户故事 #39）。
@@ -233,6 +261,128 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}, nil
 }
 
+// rtSeconds 返回 t 距 lastSent 的整秒间隔（ADR-0004：rt = 距上次被成功接受上报的
+// 实际墙钟间隔）；不足 1 秒按 1 秒（服务端不接受 0 时长上报）。
+func rtSeconds(t, lastSent time.Time) int {
+	s := int(t.Sub(lastSent) / time.Second)
+	if s < 1 {
+		s = 1
+	}
+	return s
+}
+
+// fetchReaderState 抓取并解析 Reader 页（Task 建立时使用）。
+func (r *Runner) fetchReaderState(ctx context.Context, bookID string) (*readercontext.State, error) {
+	return r.opts.Reader.Fetch(ctx, bookID)
+}
+
+// sendResult 是一次上报尝试的结果：被接受的 Reader 状态、被接受的 rt（enter 为 0）
+// 与发送时刻（恢复链重试时为重试时刻）。
+type sendResult struct {
+	st readercontext.State
+	rt int
+	at time.Time
+}
+
+// sendEnter 发送 enter report（不含计时字段）；被拒时按有界恢复链恢复，返回刷新后的状态。
+func (r *Runner) sendEnter(ctx context.Context, bookID string, st readercontext.State, now time.Time) (sendResult, error) {
+	send := func(s readercontext.State, t time.Time) (int, error) {
+		return 0, r.opts.Sender.Enter(ctx, bookID, s.Progress, s.Context, t)
+	}
+	newSt, rt, at, err := r.recoverSend(ctx, bookID, StageEnterReport, st, now, send)
+	if err != nil {
+		return sendResult{}, err
+	}
+	return sendResult{st: newSt, rt: rt, at: at}, nil
+}
+
+// reportSend 发送一笔上报并返回被接受的 rt（enter 恒为 0）；err 为 nil 代表被接受。
+// 恢复链的每次重试都重新调用（fresh Reader Context、fresh rt/ts/rn）。
+type reportSend func(st readercontext.State, now time.Time) (rtSec int, err error)
+
+// recoverSend 是上报发送 + 有界恢复链核心：
+//   - 首次尝试被接受 → 直接成功；
+//   - 首次尝试非"拒绝"（传输/HTTP/解析失败）→ 原样返回（恢复链只针对明确拒绝）；
+//   - 首次尝试被拒绝 → 按 spec 决策 #7 执行有界序列：refresh Reader Context → retry →
+//     renewal → refresh Reader Context → retry。任何一步成功即恢复；
+//     最后一步重试仍被拒绝 → failRecoveryExhausted（failed 终态 + 失败通知）；
+//     链中步骤的非拒绝失败按暂时性失败处理（不写终态、不发通知）；
+//     renewal 的登录失效明确证据经 r.renew 走 ticket 04 路径（登录失效终态 + 通知）。
+func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st readercontext.State, now time.Time, send reportSend) (readercontext.State, int, time.Time, error) {
+	o := r.opts
+
+	rt, err := send(st, now)
+	if err == nil {
+		return st, rt, now, nil
+	}
+	if !errors.Is(err, report.ErrRejected) {
+		return st, 0, now, err
+	}
+	o.Logger.Warn("上报被服务器拒绝，进入有界恢复链", "stage", stage, "err", err)
+
+	actions := []string{}
+	lastErr := err
+	current := st
+	for step := 0; step < recoverySteps; step++ {
+		switch step {
+		case 0, 3:
+			// 刷新 Reader Context（强制重新抓取 Reader 页；ticket 06 前的 Refresh 原语）。
+			actions = append(actions, ActionRefreshContext)
+			newSt, ferr := r.opts.Reader.Refresh(ctx, bookID)
+			if ferr != nil {
+				return current, 0, now, fmt.Errorf("%s 恢复链终止（刷新 Reader Context 失败，按暂时性失败处理）: %w", stage, ferr)
+			}
+			current = *newSt
+		case 1, 4:
+			// 重试上报：rt/ts/rn 重算（重试延迟并入 rt，ADR-0004 / 用户故事 #28）。
+			actions = append(actions, ActionRetryReport)
+			t := o.Clock.Now()
+			rt, err := send(current, t)
+			if err == nil {
+				return current, rt, t, nil
+			}
+			lastErr = err
+			if !errors.Is(err, report.ErrRejected) {
+				return current, 0, now, fmt.Errorf("%s 恢复链终止（重试失败，按暂时性失败处理）: %w", stage, err)
+			}
+			if step == recoverySteps-1 {
+				return current, 0, now, r.failRecoveryExhausted(ctx, stage, lastErr, actions)
+			}
+		case 2:
+			// renewal：ticket 04 语义内嵌（明确证据 → 从初始 Cookie 重建一次 → 重试；
+			// 仍失败 → 登录失效终态 + 登录失效通知，错误在此返回不进入普通失败路径）。
+			actions = append(actions, ActionRenewal)
+			if rerr := r.renew(ctx); rerr != nil {
+				return current, 0, now, fmt.Errorf("%s 恢复链终止（renewal 失败）: %w", stage, rerr)
+			}
+		}
+	}
+	// 不可达：recoverySteps 内的最后一次 retry 已返回。
+	return current, 0, now, fmt.Errorf("%s 恢复链耗尽: %w", stage, lastErr)
+}
+
+// failRecoveryExhausted 输出恢复链耗尽的失败结果：failed 终态先落盘、再发失败通知
+// （spec 决策 #9/#10：失败阶段、主要错误、已尝试恢复动作；通知失败不影响 Task 结果）。
+// 返回的错误供调用方报告，包装最终拒绝错误（errors.Is(err, report.ErrRejected)）。
+func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause error, actions []string) error {
+	o := r.opts
+	date := o.Clock.Now().In(o.TZ).Format("2006-01-02")
+	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
+		o.Logger.Warn("恢复链耗尽时写入 failed 终态失败", "err", err)
+	}
+	if o.Notify != nil {
+		if err := o.Notify.NotifyFailure(ctx, notify.Failure{
+			Date:    date,
+			Stage:   stage,
+			Error:   cause.Error(),
+			Actions: actions,
+		}); err != nil {
+			o.Logger.Warn("失败通知发送失败（不影响 Task 结果）", "err", err)
+		}
+	}
+	return fmt.Errorf("%s 被服务器拒绝且恢复链耗尽: %w", stage, cause)
+}
+
 // renew 执行 Task 开始时的 renewal；凭明确证据（weread.ErrLoginInvalid：renewal
 // HTTP 200 + succ != 1，checklist #2 当前假设）判定登录失效时，从初始 Cookie 重建
 // Login Session 一次并重试（spec 决策 #7；用户故事 #33）：
@@ -242,6 +392,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 //
 // 无明确证据的失败（传输错误、HTTP 非 200、响应解析失败）不重建、不写终态——
 // 暂时性失败，当日可再次调度（用户故事 #17；判别特征见 client.go 的 ErrLoginInvalid）。
+// 恢复链的 renewal 步骤复用本方法（有界恢复链 ≠ 无限重试：重建机会仍只消耗一次）。
 func (r *Runner) renew(ctx context.Context) error {
 	o := r.opts
 	err := o.Client.Renewal(ctx)
