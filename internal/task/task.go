@@ -8,8 +8,12 @@
 // （明确提示更新初始 Cookie，spec 决策 #7/#9/#10）。
 // ticket 05 范围（本文件）：report 被拒时的有界恢复链（spec 决策 #7）——refresh Reader
 // Context → retry → renewal → refresh Reader Context → retry → 仍失败 → failed 终态 +
-// 失败通知（失败阶段、主要错误、已尝试恢复动作）。Reader Context TTL 缓存与主动刷新由
-// ticket 06 交付；自动选书由 ticket 09 交付。
+// 失败通知（失败阶段、主要错误、已尝试恢复动作）。
+// ticket 06 范围：Reader Context TTL 到期（参考默认 ≈15 分钟）时主动重新抓取 Reader
+// 页刷新 Context（Reading Session 继续：无 enter、rt 基准不变）；异常墙钟间隔超过
+// 内部阈值（DefaultAnomalyThreshold）时不形成大 rt 上报，而是重建 Reading Session
+// （重新 enter；Task 继续、同一本书、累计保留）。TTL 与阈值均为内部默认（spec 决策 #13）。
+// 自动选书由 ticket 09 交付。
 //
 // # rt 语义（ADR-0004）
 //
@@ -140,7 +144,9 @@ func New(opts Options) *Runner {
 		opts.RNG = rand.New(rand.NewSource(time.Now().UnixNano()))
 	}
 	if opts.Reader == nil {
-		opts.Reader = readercontext.NewProvider(opts.Client)
+		opts.Reader = readercontext.NewProvider(opts.Client, readercontext.Options{
+			Clock: opts.Clock,
+		})
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -196,10 +202,28 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			o.Clock.Sleep(d)
 		}
 		now = o.Clock.Now()
+
+		// Reader Context TTL 主动刷新（spec 决策 #5/#6；用户故事 #30）：每笔 timed
+		// report 前经 Fetch 取 Context——TTL（readercontext.DefaultContextTTL，参考
+		// 默认 ≈15 分钟）内命中缓存零网络请求；到期时重新抓取 Reader 页刷新
+		// （新 token/psvts）。刷新不重置 rt 基准：Reading Session 继续，无 enter、
+		// 不中断（用户故事 #27/#30）。
+		// 刷新失败按暂时性处理（ticket 05 对链中 refresh 失败的先例）：沿用现有
+		// Context 继续，下次周期再试；若服务器因此拒绝上报，恢复链会先 refresh 再
+		// retry（已覆盖该情形）。
+		fresh, err := r.opts.Reader.Fetch(ctx, bookID)
+		if err != nil {
+			o.Logger.Warn("Reader Context 刷新失败（沿用现有 Context，按暂时性处理）", "err", err)
+		} else {
+			st = *fresh
+		}
+
 		rtSec := rtSeconds(now, lastSent)
 		if time.Duration(rtSec)*time.Second > DefaultAnomalyThreshold {
 			// 异常间隔（如主机 suspend）：不作为一次大 rt 上报，重建 Reading Session
-			//（重新 enter；Task 继续、累计保留，用户故事 #29）。enter 同样走恢复链。
+			//（重新 enter；Task 继续、累计保留，用户故事 #29；ADR-0004）。enter 使用
+			// 上方 Fetch 给出的 Context（跳变越过 TTL 时即为刚重抓的新 Context；
+			// 未越 TTL 时命中缓存，无需额外请求），同样走恢复链。
 			o.Logger.Warn("异常间隔，重建 Reading Session", "rt_sec", rtSec)
 			enterResult, err := r.sendEnter(ctx, bookID, st, now)
 			if err != nil {

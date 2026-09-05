@@ -110,7 +110,7 @@ func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 		RNG:              a.deps.RNG,
 		Client:           client,
 		Sender:           report.NewSender(client),
-		Reader:           readercontext.NewProvider(client),
+		Reader:           readercontext.NewProvider(client, readercontext.Options{Clock: a.deps.Clock}),
 		Terminal:         terminal.NewFileStore(a.cfg.DataDir),
 		Notify:           a.deps.Notify,
 		Books:            a.cfg.Books,

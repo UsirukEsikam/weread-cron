@@ -82,6 +82,10 @@ type fakeWeread struct {
 	rotateReaderState bool
 	readerFetches     int
 
+	// readerFailAt > 0 时第 N 次 Reader 页抓取返回 HTTP 500（TTL 主动刷新失败的暂时性
+	// 场景；后续抓取恢复正常）。
+	readerFailAt int
+
 	// renewReject > 0 时，前 N 次 renewal 返回 {"succ":0}（登录失效的明确证据形态）；
 	// renewRejectFrom > 0 时从第 N 次起全部拒绝；renewRejectOnceAt > 0 时仅拒绝第 N 次
 	//（恢复链场景：任务开始 renewal 必须成功、仅链中/重建后重试的选择性拒绝）；
@@ -202,7 +206,12 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	f.readerFetches++
 	n := f.readerFetches
 	rotate := f.rotateReaderState
+	fail := f.readerFailAt > 0 && n == f.readerFailAt
 	f.mu.Unlock()
+	if fail {
+		http.Error(w, "reader page unavailable", http.StatusInternalServerError)
+		return
+	}
 	if rotate {
 		io.WriteString(w, readerPageHTMLWith(fmt.Sprintf("fake-reader-token-%d", n), fmt.Sprintf("fake-psvts-%d", n)))
 		return
@@ -743,17 +752,19 @@ func TestRunTargetDurationDeterministic(t *testing.T) {
 }
 
 // TestRunAbnormalIntervalRebuildsSession 断言异常间隔（>90s）不作为大 rt 上报而是
-// 重建 Reading Session（重新 enter；Task 继续、累计保留）。
+// 重建 Reading Session（重新 enter；Task 继续、累计保留、同一本书）。
 func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 	h := setup(t, nil)
 	h.weread.blockTimed = make(chan struct{})
 	h.weread.blockTimedTriggered = make(chan struct{}, 1)
 
 	ctx := context.Background()
-	done := make(chan error, 1)
+	done := make(chan struct{})
+	var res task.Result
+	var runErr error
 	go func() {
-		_, err := h.app.RunTask(ctx)
-		done <- err
+		res, runErr = h.app.RunTask(ctx)
+		close(done)
 	}()
 
 	// 等待第一笔 timed report 到达并被挂起。
@@ -767,9 +778,9 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 	close(h.weread.blockTimed)
 
 	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("RunTask 失败: %v", err)
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("RunTask 失败: %v", runErr)
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("RunTask 未在 30s 内完成")
@@ -795,7 +806,18 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 		t.Errorf("timed 数 = %d，期望 2（累计满 60s 停止）", timedCount)
 	}
 
-	// 累计保留且达标：Actual = 60s（不含 120s 间隙）。
+	// 重建后同一本书、Task 已累计时长保留：Result 只统计被接受的 rt（不含 120s 缺口）。
+	if res.BookID != testBookID {
+		t.Errorf("BookID = %s，期望重建后仍是同一本书 %s", res.BookID, testBookID)
+	}
+	if res.Actual != time.Minute {
+		t.Errorf("Actual = %v，期望 1 分钟（缺口不计入）", res.Actual)
+	}
+	if res.Reports != 2 {
+		t.Errorf("Reports = %d，期望 2", res.Reports)
+	}
+
+	// 累计保留且达标：success 终态。
 	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
 	if err != nil {
 		t.Fatal(err)
@@ -804,6 +826,207 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 	json.Unmarshal(data, &st)
 	if st.LastTaskResult != terminal.ResultSuccess {
 		t.Errorf("Terminal State = %+v", st)
+	}
+}
+
+// runTTLScenario 运行 20 分钟目标 Task（40 笔 timed report，跨越 DefaultContextTTL
+// 边界）并断言公共骨架：Reports=40、41 笔 report（1 enter + 40 timed）、enter 恰 1 笔
+// （无 enter 重复）、所有 rt=30（TTL 刷新不重置 rt 基准）。返回 report 记录供各测试
+// 断言各自的 Context 切换边界。
+func runTTLScenario(t *testing.T, h *testHarness) []wereadRequest {
+	t.Helper()
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("RunTask 失败: %v", err)
+	}
+	if res.Reports != 40 {
+		t.Fatalf("Reports = %d，期望 40（20 分钟 × 30s 节奏）", res.Reports)
+	}
+	reports := h.reportRecords()
+	if len(reports) != 41 {
+		t.Fatalf("report 数 = %d，期望 41（1 enter + 40 timed）", len(reports))
+	}
+	enterCount := 0
+	for _, rec := range reports {
+		if _, ok := payloadFromWire(t, rec.Body)["rt"]; !ok {
+			enterCount++
+		}
+	}
+	if enterCount != 1 {
+		t.Errorf("enter 数 = %d，期望 1（TTL 刷新不重建 Reading Session）", enterCount)
+	}
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		if p["rt"] != "30" {
+			t.Errorf("timed[%d].rt = %s，期望 30", i, p["rt"])
+		}
+	}
+	return reports
+}
+
+// TestRunContextTTLExpiryRefreshesWithoutEnter 断言 Reader Context TTL（参考默认
+// ≈15 分钟 = 900s；30s 节奏下第 30 笔 timed report 前到期）到期时主动重新抓取 Reader
+// 页（新 token/psvts）刷新 Context；后续 timed report 继续——无 enter 重复、rt 不受
+// 影响（用户故事 #30；spec 决策 #5/#6；验证清单 #7/#8 口径）。
+func TestRunContextTTLExpiryRefreshesWithoutEnter(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.rotateReaderState = true // 第 N 次抓取 = token-N/psvts-N，断言刷新生效
+		h.cfg.ReadMinutesMin = 20
+		h.cfg.ReadMinutesMax = 20
+	})
+
+	// ---- Reader 页恰好被抓取 2 次：Task 建立 + TTL 到期主动刷新；
+	//      TTL 内的周期上报命中缓存，不产生额外请求。 ----
+	reports := runTTLScenario(t, h)
+	if n := h.weread.count("/web/reader/"); n != 2 {
+		t.Errorf("Reader 页抓取数 = %d，期望 2（初始 + TTL 到期主动刷新）", n)
+	}
+
+	// ---- Context 切换边界：TTL = 900s、节奏 30s → 第 30 笔 timed（索引 30）起使用
+	//      TTL 刷新后的 Context（psvts-2/token-2）；此前（索引 1..29）为初始 Context
+	//      （psvts-1/token-1）。 ----
+	enter := payloadFromWire(t, reports[0].Body)
+	if enter["ps"] != "fake-psvts-1" {
+		t.Errorf("enter.ps = %s，期望初始 Context（psvts-1）", enter["ps"])
+	}
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		switch {
+		case i <= 29:
+			verifySG(t, p, "fake-reader-token-1")
+			if p["ps"] != "fake-psvts-1" {
+				t.Errorf("timed[%d].ps = %s，期望初始 Context（psvts-1）", i, p["ps"])
+			}
+		default:
+			verifySG(t, p, "fake-reader-token-2")
+			if p["ps"] != "fake-psvts-2" {
+				t.Errorf("timed[%d].ps = %s，期望 TTL 刷新后的 Context（psvts-2）", i, p["ps"])
+			}
+		}
+	}
+}
+
+// TestRunContextTTLRefreshFailureContinuesWithExistingContext 断言 TTL 主动刷新失败
+// （暂时性：HTTP 500）时 Task 不中断：沿用现有 Context 继续上报，下次周期重试刷新并
+// 成功；Reading Session 无 enter 重建（ticket 05 对链中 refresh 暂时性失败的同一姿态）。
+func TestRunContextTTLRefreshFailureContinuesWithExistingContext(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.rotateReaderState = true
+		h.weread.readerFailAt = 2 // 第 2 次抓取（TTL 到期那次）失败；第 3 次恢复
+		h.cfg.ReadMinutesMin = 20
+		h.cfg.ReadMinutesMax = 20
+	})
+	reports := runTTLScenario(t, h)
+
+	// ---- 抓取 3 次：初始成功、TTL 到期失败、下次周期重试成功。 ----
+	if n := h.weread.count("/web/reader/"); n != 3 {
+		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + TTL 失败 + 重试成功）", n)
+	}
+
+	// ---- 失败周期（索引 30，t=900s 的 TTL 到期那次）沿用旧 Context（psvts-1）；
+	//      之后（索引 31..40）使用重试成功的 Context（psvts-3/token-3）。 ----
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		switch {
+		case i <= 30:
+			verifySG(t, p, "fake-reader-token-1")
+			if p["ps"] != "fake-psvts-1" {
+				t.Errorf("timed[%d].ps = %s，期望沿用现有 Context（psvts-1）", i, p["ps"])
+			}
+		default:
+			verifySG(t, p, "fake-reader-token-3")
+			if p["ps"] != "fake-psvts-3" {
+				t.Errorf("timed[%d].ps = %s，期望重试刷新后的 Context（psvts-3）", i, p["ps"])
+			}
+		}
+	}
+}
+
+// TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext 断言时钟跳变同时越过异常
+// 阈值（90s）与 Context TTL（900s）时：先主动重抓 Reader 页（新 token/psvts），再
+// 重建 Reading Session——重建的 enter 使用刚重抓的新 Context（task.go 中"跳变越过
+// TTL 时即为刚重抓的新 Context"路径的验证）。
+func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.rotateReaderState = true
+	})
+	h.weread.blockTimed = make(chan struct{})
+	h.weread.blockTimedTriggered = make(chan struct{}, 1)
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var res task.Result
+	var runErr error
+	go func() {
+		res, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 等待第一笔 timed report 到达并被挂起。
+	select {
+	case <-h.weread.blockTimedTriggered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed report 未在 10s 内到达")
+	}
+	// 模拟挂起噪声：响应期间时钟跳变 1200s（越过异常阈值与 Context TTL）。
+	h.clk.Advance(1200 * time.Second)
+	close(h.weread.blockTimed)
+
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("RunTask 失败: %v", runErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("RunTask 未在 30s 内完成")
+	}
+
+	// ---- 线上顺序：enter → timed(挂起前) → 跳变越过 TTL 时主动重抓 Reader 页 →
+	//      enter(重建 Reading Session，使用重抓后的新 Context) → timed。 ----
+	reports := h.reportRecords()
+	if len(reports) != 4 {
+		t.Fatalf("report 数 = %d，期望 4（2 enter + 2 timed）", len(reports))
+	}
+	if n := h.weread.count("/web/reader/"); n != 2 {
+		t.Errorf("Reader 页抓取数 = %d，期望 2（初始 + 跳变越过 TTL 的主动重抓）", n)
+	}
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		if p["rt"] != "30" {
+			t.Errorf("timed[%d].rt = %s，期望 30（缺口不上报）", i, p["rt"])
+		}
+		if i == 1 {
+			verifySG(t, p, "fake-reader-token-1")
+		} else {
+			verifySG(t, p, "fake-reader-token-2")
+			if p["ps"] != "fake-psvts-2" {
+				t.Errorf("timed[%d].ps = %s，期望重建后的新 Context", i, p["ps"])
+			}
+		}
+	}
+	// enter：初始（索引 0）用初始 Context；重建（索引 2）用重抓后的新 Context。
+	if ps := payloadFromWire(t, reports[2].Body)["ps"]; ps != "fake-psvts-2" {
+		t.Errorf("重建 enter.ps = %s，期望重抓后的新 Context（psvts-2）", ps)
+	}
+
+	// ---- 重建后同一本书、Task 已累计时长保留（缺口不计入）、达标 success。 ----
+	if res.BookID != testBookID {
+		t.Errorf("BookID = %s，期望重建后仍是同一本书 %s", res.BookID, testBookID)
+	}
+	if res.Actual != time.Minute || res.Reports != 2 {
+		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次（缺口不计入）", res.Actual, res.Reports)
 	}
 }
 
