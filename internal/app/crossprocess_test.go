@@ -75,7 +75,7 @@ func helperProcessMain() int {
 	var err error
 	switch os.Getenv("WR_TEST_MODE") {
 	case "run":
-		_, err = a.RunTask(ctx)
+		_, err = a.RunTask(ctx, time.Time{})
 	case "books":
 		_, err = a.ListBooks(ctx)
 	default:
@@ -200,7 +200,7 @@ func TestCrossProcessRejectsSecondTaskAndBooks(t *testing.T) {
 
 	// 进程 2（父测试进程）：同一 /data、独立 App → 非阻塞拒绝。
 	before := len(h.weread.snapshot())
-	_, err := h.app.RunTask(context.Background())
+	_, err := h.app.RunTask(context.Background(), time.Time{})
 	if !errors.Is(err, ErrTaskRunning) {
 		t.Errorf("跨进程并发 RunTask = %v，期望 ErrTaskRunning", err)
 	}
@@ -230,7 +230,7 @@ func TestCrossProcessRejectsSecondTaskAndBooks(t *testing.T) {
 
 	// 锁已释放（正常退出路径）：父进程 RunTask 不再返回 ErrTaskRunning——走到
 	// 终态门控被 ErrTerminalSuccess 拒绝，严格证明锁已随子进程退出自动释放。
-	_, err = h.app.RunTask(context.Background())
+	_, err = h.app.RunTask(context.Background(), time.Time{})
 	if !errors.Is(err, ErrTerminalSuccess) {
 		t.Errorf("子进程退出后 RunTask = %v，期望 ErrTerminalSuccess（若锁未释放则为 ErrTaskRunning）", err)
 	}
@@ -253,7 +253,7 @@ func TestCrossProcessCrashReleasesLock(t *testing.T) {
 	waitTimedBlocked(t, h, 1)
 
 	// 崩溃前锁确实被持有（父进程被非阻塞拒绝）。
-	if _, err := h.app.RunTask(context.Background()); !errors.Is(err, ErrTaskRunning) {
+	if _, err := h.app.RunTask(context.Background(), time.Time{}); !errors.Is(err, ErrTaskRunning) {
 		t.Errorf("崩溃前并发 RunTask = %v，期望 ErrTaskRunning", err)
 	}
 
@@ -270,7 +270,7 @@ func TestCrossProcessCrashReleasesLock(t *testing.T) {
 
 	// 锁已自动释放：父进程完整执行 Task（无终态 → 不落入终态门控）。
 	before := len(h.weread.snapshot())
-	res, err := h.app.RunTask(context.Background())
+	res, err := h.app.RunTask(context.Background(), time.Time{})
 	if err != nil {
 		t.Fatalf("崩溃后 RunTask 失败: %v", err)
 	}

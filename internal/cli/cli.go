@@ -23,6 +23,7 @@ import (
 	"io"
 	"log/slog"
 	"strings"
+	"time"
 
 	"weread-cron/internal/app"
 	"weread-cron/internal/config"
@@ -50,8 +51,9 @@ const (
 
 // App 是 run/books 子命令依赖的应用边界（生产实现 = internal/app；测试注入 fake）。
 type App interface {
-	// RunTask 完整执行一次 Task。
-	RunTask(ctx context.Context) (task.Result, error)
+	// RunTask 完整执行一次 Task。finalFailureAfter 是暂时性失败的收敛截止时刻
+	// （ticket 12）：手动 run 不受窗口约束，传零值 = 不收敛（失败由 CLI 呈现）。
+	RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Result, error)
 	// ListBooks 列出当前 Shelf 的 bookId 与 title（纯查询：不产生 Task、
 	// 不读写终态、不通知；内部执行 renewal 并可持久化 Login Session）。
 	ListBooks(ctx context.Context) ([]weread.ShelfBook, error)
@@ -109,7 +111,9 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 			fmt.Fprintf(stderr, "weread-cron: 装配失败: %v\n", err)
 			return ExitConfig
 		}
-		res, err := a.RunTask(ctx)
+		// Run Window 只约束自动调度（spec 决策 #12）；手动 run 无收敛截止时刻
+		// （ticket 12：零值 = 不收敛，失败由本层以非零退出码呈现）。
+		res, err := a.RunTask(ctx, time.Time{})
 		switch {
 		case errors.Is(err, app.ErrTerminalSuccess):
 			// ticket 08：success 终态 → 拒绝。验收口径：原因输出到 stdout，

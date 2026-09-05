@@ -32,8 +32,11 @@ const sleepChunk = 2 * time.Second
 
 // TaskRunner 执行一次 Task（生产 = internal/app.App；测试注入 fake；ADR-0006）。
 // daemon 只负责"到点执行"，Task 内部的终态落盘/通知由 Task 自身完成（spec 决策 #9）。
+// finalFailureAfter 是暂时性失败的收敛截止时刻（ticket 12）：失败时刻晚于该时刻
+// 且未形成终态时，Task 把最后一次暂时性失败收敛为 failed 终态 + 失败通知（窗口内
+// 已无法再重排，当天不静默空过）；零值 = 不收敛（手动 run 等不受窗口约束的调用）。
 type TaskRunner interface {
-	RunTask(ctx context.Context) (task.Result, error)
+	RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Result, error)
 }
 
 // Deps 是 daemon 的注入点（ADR-0006）；零值字段使用生产默认。
@@ -132,7 +135,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		d.log.Info("已到启动时刻，执行 Task",
 			"at", d.clk.Now().In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
-		if _, err := d.task.RunTask(ctx); err != nil {
+		// 收敛截止时刻（ticket 12）：当天窗口结束前 replanMinGap。失败发生在此之后
+		// 时，最短重排间隔（睡 replanMinGap 后重排）会越过窗口结束点、下次调度必然
+		// 落在次日——本次失败是当天最后一次尝试，Task 将其收敛为 failed 终态 +
+		// 失败通知（当天不静默空过）。
+		deadline := d.finalFailureDeadline(d.clk.Now())
+		if _, err := d.task.RunTask(ctx, deadline); err != nil {
 			// Task 失败但被取消：正常退出。
 			if ctx.Err() != nil {
 				d.log.Info("daemon 退出")
@@ -161,6 +169,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		d.log.Info("Task 完成，排定次日")
 	}
+}
+
+// finalFailureDeadline 计算暂时性失败的收敛截止时刻（ticket 12）：当天窗口结束前
+// replanMinGap 的时刻。窗口只约束开始时刻（ADR-0001），失败时刻晚于该时刻时，
+// daemon 的最短重排间隔会越过窗口结束（replanMinGap 睡眠后 nextStart 必然排次日）
+// ——该失败即当日最后一次尝试；此前失败的仍可窗口内重排（用户故事 #17）。
+func (d *Daemon) finalFailureDeadline(now time.Time) time.Time {
+	t := now.In(d.cfg.TZ)
+	day := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, d.cfg.TZ)
+	end := day.Add(time.Duration(d.cfg.WindowEnd) * time.Minute)
+	return end.Add(-replanMinGap)
 }
 
 // schedule 读取 Terminal State 并计算下次启动；同时输出决策依据日志

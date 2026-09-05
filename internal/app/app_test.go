@@ -70,11 +70,15 @@ type fakeWeread struct {
 	// timedRejects > 0 时拒绝接下来 N 笔 timed report（恢复链中途成功场景）；
 	// enterRejects > 0 时拒绝接下来 N 笔 enter report。
 	// renewNoCookies 为 true 时 renewal 不返回 Set-Cookie。
+	// timedFailCount > 0 时前 N 笔 timed report 返回 HTTP 500（传输级暂时性故障
+	// 注入，ticket 12：单次失败会话继续 / 连续失败预算场景）。注意与 timedRejects
+	// 的区分：后者是服务器明确拒绝（errCode 信封），前者是 HTTP 级故障。
 	reportRejected bool
 	timedRejectAll bool
 	timedRejects   int
 	enterRejects   int
 	renewNoCookies bool
+	timedFailCount int
 
 	// rotateReaderState 为 true 时每次 Reader 页抓取返回不同的 token/psvts
 	//（第 N 次抓取 = fake-reader-token-N / fake-psvts-N），用于断言恢复链刷新后
@@ -84,7 +88,10 @@ type fakeWeread struct {
 
 	// readerFailAt > 0 时第 N 次 Reader 页抓取返回 HTTP 500（TTL 主动刷新失败的暂时性
 	// 场景；后续抓取恢复正常）。
-	readerFailAt int
+	// readerFailFrom > 0 时第 N 次起全部返回 HTTP 500（恢复链连番暂时性终止的场景，
+	// ticket 12）。
+	readerFailAt   int
+	readerFailFrom int
 
 	// renewReject > 0 时，前 N 次 renewal 返回 {"succ":0}（登录失效的明确证据形态）；
 	// renewRejectFrom > 0 时从第 N 次起全部拒绝；renewRejectOnceAt > 0 时仅拒绝第 N 次
@@ -233,6 +240,9 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	n := f.readerFetches
 	rotate := f.rotateReaderState
 	fail := f.readerFailAt > 0 && n == f.readerFailAt
+	if f.readerFailFrom > 0 && n >= f.readerFailFrom {
+		fail = true
+	}
 	enc := f.lastReaderEncoded
 	perBookFail := f.readerFailByBook[enc]
 	perBookNoState := f.readerNoStateByBook[enc]
@@ -340,18 +350,26 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	reject := f.reportRejected
+	timedFail := false
 	if isTimed {
 		if f.timedRejectAll {
 			reject = true
 		} else if f.timedRejects > 0 {
 			reject = true
 			f.timedRejects--
+		} else if f.timedFailCount > 0 {
+			timedFail = true
+			f.timedFailCount--
 		}
 	} else if f.enterRejects > 0 {
 		reject = true
 		f.enterRejects--
 	}
 	f.mu.Unlock()
+	if timedFail {
+		http.Error(w, "timed report unavailable", http.StatusInternalServerError)
+		return
+	}
 	if reject {
 		fmt.Fprint(w, `{"errCode":-2014,"errMsg":"err"}`)
 		return
@@ -535,7 +553,7 @@ func (h *testHarness) runTask(ctx context.Context) (task.Result, error) {
 	}
 	ch := make(chan outcome, 1)
 	go func() {
-		res, err := h.app.RunTask(ctx)
+		res, err := h.app.RunTask(ctx, time.Time{})
 		ch <- outcome{res, err}
 	}()
 	select {
@@ -870,7 +888,7 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 	var res task.Result
 	var runErr error
 	go func() {
-		res, runErr = h.app.RunTask(ctx)
+		res, runErr = h.app.RunTask(ctx, time.Time{})
 		close(done)
 	}()
 
@@ -1074,7 +1092,7 @@ func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
 	var res task.Result
 	var runErr error
 	go func() {
-		res, runErr = h.app.RunTask(ctx)
+		res, runErr = h.app.RunTask(ctx, time.Time{})
 		close(done)
 	}()
 
@@ -1134,6 +1152,281 @@ func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
 	}
 	if res.Actual != time.Minute || res.Reports != 2 {
 		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次（缺口不计入）", res.Actual, res.Reports)
+	}
+}
+
+// --- ticket 12：timed report 暂时性失败容错与窗口末收敛 ---
+
+// TestRunTimedReportTransientFailureContinuesSession 断言单笔 timed report 传输级
+// 失败（HTTP 500）不再终止整个 Task（ticket 12 验收 3）：跳过该节奏点、Reading
+// Session 继续；被跳过的间隔自然并入下一次被接受上报的 rt（ADR-0004）——Target 1
+// 分钟：首笔 timed（500）失败，第二笔 timed 成功且 rt=60（真实间隔），Task 正常
+// 完成（success 终态 + 成功通知）。
+func TestRunTimedReportTransientFailureContinuesSession(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedFailCount = 1 // 仅首笔 timed report 返回 HTTP 500
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("单笔 timed report 传输级失败不应终止 Task: %v", err)
+	}
+	if res.Reports != 1 || res.Actual != time.Minute {
+		t.Errorf("Result = reports:%d actual:%v，期望 1 次/1 分钟（rt=60 并入被跳过的间隔）", res.Reports, res.Actual)
+	}
+
+	// ---- 线上按序：renewal → refresh → enter → timed(500) → timed(rt=60 接受) ----
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "timed")
+	reports := h.reportRecords()
+	if len(reports) != 3 {
+		t.Fatalf("report 数 = %d，期望 3（1 enter + 2 timed）", len(reports))
+	}
+	if p := payloadFromWire(t, reports[2].Body); p["rt"] != "60" {
+		t.Errorf("恢复后 timed.rt = %s，期望 60（两个节奏间隔并入一次上报）", p["rt"])
+	}
+
+	// success 终态 + 成功通知（仅 1 条，无失败通知）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultSuccess {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 success", st, has, err)
+	}
+	if got := len(h.bark.snapshot()); got != 1 || h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
+	}
+}
+
+// TestRunTimedReportConsecutiveFailuresFailTransient 断言连续暂时性失败达到预算
+// （DefaultMaxConsecutiveReportFailures = 3）时本 Task 判定暂时性失败（ticket 12）：
+// 不写终态、不通知（窗口内当日可再次调度）；错误为普通错误（非 ErrRejected）。
+func TestRunTimedReportConsecutiveFailuresFailTransient(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedFailCount = 100 // timed report 一律 HTTP 500：预算内耗尽
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
+	}
+	if errors.Is(err, report.ErrRejected) {
+		t.Errorf("传输级失败不得归类为服务器拒绝: %v", err)
+	}
+	if !strings.Contains(err.Error(), "连续 3 次暂时性失败") {
+		t.Errorf("错误应说明连续失败预算；实际: %v", err)
+	}
+	// 请求数有界：enter + 恰好 3 笔 timed（预算），之后立即停止、不无限重试。
+	if n := h.weread.count("/web/book/read"); n != 4 {
+		t.Errorf("report 数 = %d，期望 4（enter + 3 timed）", n)
+	}
+	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
+		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("不得发送任何通知，实际 %d 条", got)
+	}
+}
+
+// TestRunTimedReportFailuresConvergeAtWindowEnd 断言窗口末尾（收敛截止时刻已过）的
+// 暂时性失败收敛为 failed 终态并发失败通知（ticket 12 验收 1/4）：失败阶段 =
+// timed report、主要错误 = 连续失败原因、日期 = 当天。
+func TestRunTimedReportFailuresConvergeAtWindowEnd(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedFailCount = 100
+	})
+	// 收敛的失败通知请求到达时，failed 终态必须已落盘（spec 决策 #9/#10）。
+	h.bark.Check = func() error {
+		data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+		if err != nil {
+			return fmt.Errorf("通知时 failed 终态尚未落盘: %w", err)
+		}
+		var st terminal.State
+		if err := json.Unmarshal(data, &st); err != nil {
+			return err
+		}
+		if st.LastTaskResult != terminal.ResultFailed {
+			return fmt.Errorf("终态 = %+v，期望 failed", st)
+		}
+		return nil
+	}
+	// 收敛截止时刻 = 09:59（早于假时钟 10:00）：窗口内已无法再重排，本次失败即当日
+	// 最后一次尝试 → 收敛（与真实 daemon 注入"窗口结束 - 最短重排间隔"同构）。
+	deadline := time.Date(2025, 9, 6, 9, 59, 0, 0, testTZ)
+	_, err := h.app.RunTask(context.Background(), deadline)
+	if err == nil {
+		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
+	}
+
+	// failed 终态已落盘（收敛；先落盘再通知）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}) {
+		t.Errorf("Terminal State = %+v，期望 2025-09-06/failed", st)
+	}
+
+	// 失败通知（Bark + 企业微信各 1 条）：失败阶段/主要错误/当天日期；无成功文案。
+	for name, nf := range map[string]*fakeNotify{"bark": h.bark, "wecom": h.wecom} {
+		recs := nf.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("%s 通知数 = %d，期望 1 条失败通知", name, len(recs))
+		}
+		msg, _ := json.Marshal(recs[0].Body)
+		for _, want := range []string{
+			"微信读书阅读任务失败",
+			"失败阶段：timed report",
+			"主要错误",
+			"连续 3 次暂时性失败",
+			"2025-09-06",
+		} {
+			if !strings.Contains(string(msg), want) {
+				t.Errorf("%s 失败通知缺少 %q；body=%s", name, want, msg)
+			}
+		}
+		if strings.Contains(string(msg), "完成") {
+			t.Errorf("%s 不得混入成功文案；body=%s", name, msg)
+		}
+	}
+}
+
+// TestRunConvergedChainTerminationIncludesActions 断言窗口末收敛的失败通知包含
+// 已尝试恢复动作（ticket 12 验收 4）：恢复链中某步传输级失败导致链终止时，错误
+// 载体 chainStop 携带的动作序列进入通知的 notify.Failure.Actions——每周期首试被拒
+// → 链中刷新连番 HTTP 500（transport 级）→ 连续 3 次链终止达预算 → 收敛，通知含
+// "已尝试恢复：刷新 Reader Context"。
+func TestRunConvergedChainTerminationIncludesActions(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true // 每笔 timed 首试被拒 → 进入恢复链
+		h.weread.readerFailFrom = 2    // 恢复链的刷新（第 2 次 Reader 页抓取起）一律 500
+	})
+	deadline := time.Date(2025, 9, 6, 9, 59, 0, 0, testTZ)
+	_, err := h.app.RunTask(context.Background(), deadline)
+	if err == nil {
+		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
+	}
+
+	// 线上：每周期 = timed(拒) + refresh(500)；3 周期后预算耗尽。
+	// Reader 页：初始 1 + 每周期刷新 1 = 4；report：enter 1 + 每周期首试 3 = 4。
+	if n := h.weread.count("/web/reader/"); n != 4 {
+		t.Errorf("Reader 页抓取数 = %d，期望 4（初始 + 3 次恢复链刷新）", n)
+	}
+	if n := h.weread.count("/web/book/read"); n != 4 {
+		t.Errorf("report 数 = %d，期望 4（enter + 3 笔被拒 timed）", n)
+	}
+
+	// failed 终态 + 失败通知：失败阶段/主要错误/已尝试恢复动作/窗口日。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed", st, has, err)
+	}
+	recs := h.bark.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("Bark 通知数 = %d，期望 1 条失败通知", len(recs))
+	}
+	msg, _ := json.Marshal(recs[0].Body)
+	for _, want := range []string{
+		"微信读书阅读任务失败",
+		"失败阶段：timed report",
+		"已尝试恢复：刷新 Reader Context",
+		"2025-09-06",
+	} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
+		}
+	}
+}
+
+// TestRunConvergenceAcrossMidnightUsesTaskStartDate 断言窗口末尾 Task 越过午夜后的
+// 收敛仍归属 Task 开始日（ticket 12；用户故事 #11 允许越过窗口结束点）：失败时刻
+// 已是次日，但 failed 终态与失败通知的日期用窗口日——窗口日不静默空过、次日的
+// 自动执行不被误抑制。
+func TestRunConvergenceAcrossMidnightUsesTaskStartDate(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedFailCount = 100
+		// Task 开始 23:59:55（窗口日 09-06）；3 笔 timed 失败后预算耗尽于 00:01:25
+		//（次日）。
+		h.clk = clock.NewFake(time.Date(2025, 9, 6, 23, 59, 55, 0, testTZ))
+	})
+	deadline := time.Date(2025, 9, 6, 23, 58, 0, 0, testTZ)
+	_, err := h.app.RunTask(context.Background(), deadline)
+	if err == nil {
+		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
+	}
+
+	// failed 终态归属窗口日（09-06），而非失败时刻的次日。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}) {
+		t.Errorf("Terminal State = %+v，期望 2025-09-06/failed（窗口日）", st)
+	}
+	recs := h.bark.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("Bark 通知数 = %d，期望 1 条失败通知", len(recs))
+	}
+	msg, _ := json.Marshal(recs[0].Body)
+	if !strings.Contains(string(msg), "2025-09-06") {
+		t.Errorf("失败通知日期应为窗口日 2025-09-06；body=%s", msg)
+	}
+	if strings.Contains(string(msg), "2025-09-07") {
+		t.Errorf("失败通知不得用失败时刻的次日日期；body=%s", msg)
+	}
+}
+
+// TestRunTransientFailureConvergesAfterDeadline 断言窗口末尾的 renewal 传输级失败
+// 同样收敛（ticket 12）：failed 终态 + 失败通知（失败阶段 = renewal、主要错误 =
+// 登录 renewal 失败）；与登录失效路径区分（无登录失效文案、错误不包装
+// ErrLoginInvalid）。
+func TestRunTransientFailureConvergesAfterDeadline(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewStatus = 500
+	})
+	deadline := time.Date(2025, 9, 6, 9, 59, 0, 0, testTZ)
+	_, err := h.app.RunTask(context.Background(), deadline)
+	if err == nil {
+		t.Fatal("renewal HTTP 500 时 Task 应失败")
+	}
+	if errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("非明确证据不得归类为登录失效: %v", err)
+	}
+
+	// failed 终态 + 失败通知（阶段 = renewal）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed", st, has, err)
+	}
+	recs := h.bark.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("Bark 通知数 = %d，期望 1 条失败通知", len(recs))
+	}
+	msg, _ := json.Marshal(recs[0].Body)
+	for _, want := range []string{
+		"微信读书阅读任务失败",
+		"失败阶段：renewal",
+		"主要错误",
+		"登录 renewal 失败",
+		"2025-09-06",
+	} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
+		}
+	}
+}
+
+// TestRunTransientFailureBeforeDeadlineStaysTransient 断言收敛截止时刻未到（窗口内
+// 仍可重排）时暂时性失败维持原语义（ticket 12 验收 2 回归）：不写终态、不通知。
+func TestRunTransientFailureBeforeDeadlineStaysTransient(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewStatus = 500
+	})
+	deadline := time.Date(2025, 9, 6, 11, 0, 0, 0, testTZ) // 11:00 > 假时钟 10:00：仍可重排
+	_, err := h.app.RunTask(context.Background(), deadline)
+	if err == nil {
+		t.Fatal("renewal HTTP 500 时 Task 应失败")
+	}
+	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
+		t.Errorf("截止时刻未到的暂时性失败不得写终态（窗口内可再次调度）")
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("不得发送任何通知，实际 %d 条", got)
 	}
 }
 
@@ -2046,7 +2339,7 @@ func TestRunConcurrentSecondTaskRejected(t *testing.T) {
 	done := make(chan struct{})
 	var firstErr error
 	go func() {
-		_, firstErr = h.app.RunTask(ctx)
+		_, firstErr = h.app.RunTask(ctx, time.Time{})
 		close(done)
 	}()
 
@@ -2058,7 +2351,7 @@ func TestRunConcurrentSecondTaskRejected(t *testing.T) {
 	}
 
 	// 第二个 RunTask：锁被持有 → 非阻塞拒绝（不等待第一个完成）。
-	_, err := h.app.RunTask(ctx)
+	_, err := h.app.RunTask(ctx, time.Time{})
 	if err == nil {
 		t.Fatal("运行中应拒绝第二个 Task")
 	}
@@ -2092,7 +2385,7 @@ func TestRunConcurrentSecondTaskRejected(t *testing.T) {
 	}
 
 	// 第三个调用：锁已释放但终态已形成 → 终态规则拒绝。
-	_, err = h.app.RunTask(ctx)
+	_, err = h.app.RunTask(ctx, time.Time{})
 	if !errors.Is(err, ErrTerminalSuccess) {
 		t.Errorf("首个 Task 完成后的调用应落入终态规则（ErrTerminalSuccess），实际: %v", err)
 	}

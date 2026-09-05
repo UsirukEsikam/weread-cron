@@ -341,7 +341,7 @@ type fakeApp struct {
 	booksErr error
 }
 
-func (f *fakeApp) RunTask(ctx context.Context) (task.Result, error) {
+func (f *fakeApp) RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Result, error) {
 	f.calls++
 	return f.res, f.err
 }

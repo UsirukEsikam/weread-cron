@@ -53,27 +53,35 @@ func waitFor(t *testing.T, buf *syncBuffer, want string) {
 // recordingRunner 记录被调用次数（测试注入 fake TaskRunner）。语义与真实 Task 一致：
 // 成功（err == nil）时写入当天 success 终态（spec 决策 #9：终态落盘是 Task 的职责）；
 // err != nil 且 failTerminal 时写入当天 failed 终态（恢复链耗尽的语义）；
-// err != nil 且 !failTerminal 时是暂时性失败（不写终态）。
+// err != nil 且 !failTerminal 时是暂时性失败——与真实 Task 同姿态：失败时刻晚于
+// finalFailureAfter（ticket 12 收敛截止时刻）时收敛为 failed 终态，否则不写终态
+// （窗口内可再次调度）。ErrTaskRunning（并发拒绝）不是失败：Task 未运行，当天
+// 结果由运行中的 Task 负责，永不收敛。
 type recordingRunner struct {
-	mu           sync.Mutex
-	calls        int
-	err          error
-	failTerminal bool
-	term         terminal.Store
-	tz           *time.Location
-	clk          clock.Clock
+	mu                sync.Mutex
+	calls             int
+	err               error
+	failTerminal      bool
+	finalFailureAfter time.Time // 最近一次调用的收敛截止时刻（断言用）
+	term              terminal.Store
+	tz                *time.Location
+	clk               clock.Clock
 }
 
-func (r *recordingRunner) RunTask(ctx context.Context) (task.Result, error) {
+func (r *recordingRunner) RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Result, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.calls++
+	r.finalFailureAfter = finalFailureAfter
 	if r.err != nil {
-		if r.failTerminal && r.term != nil {
-			_ = r.term.Save(terminal.State{
-				LastTaskDate:   r.clk.Now().In(r.tz).Format(terminal.DayLayout),
-				LastTaskResult: terminal.ResultFailed,
-			})
+		if r.failTerminal {
+			r.saveFailed()
+		} else if !errors.Is(r.err, task.ErrTaskRunning) &&
+			!finalFailureAfter.IsZero() && r.clk.Now().After(finalFailureAfter) {
+			// ticket 12：窗口末尾的暂时性失败收敛为 failed 终态（真实 Task 的
+			// finalizeTransient 语义）。ErrTaskRunning 除外：Task 未运行，当天结果
+			// 由运行中的那个 Task 负责。
+			r.saveFailed()
 		}
 		return task.Result{}, r.err
 	}
@@ -88,10 +96,28 @@ func (r *recordingRunner) RunTask(ctx context.Context) (task.Result, error) {
 	return task.Result{}, nil
 }
 
+// saveFailed 写入当天 failed 终态（tick：与真实 Task 的收敛出口同一落盘形态）。
+func (r *recordingRunner) saveFailed() {
+	if r.term == nil {
+		return
+	}
+	_ = r.term.Save(terminal.State{
+		LastTaskDate:   r.clk.Now().In(r.tz).Format(terminal.DayLayout),
+		LastTaskResult: terminal.ResultFailed,
+	})
+}
+
 func (r *recordingRunner) count() int {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	return r.calls
+}
+
+// lastDeadline 返回最近一次调用的收敛截止时刻（ticket 12 断言用）。
+func (r *recordingRunner) lastDeadline() time.Time {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.finalFailureAfter
 }
 
 // daemonConfig 构造 daemon 测试配置（TZ=testLoc；窗口等经 mutate 覆盖）。
@@ -274,11 +300,12 @@ func TestDaemonSkipsWhenAnotherProcessRunsTask(t *testing.T) {
 }
 
 // TestDaemonReplansWithinWindowAfterTransientFailure：Task 暂时性失败（未写终态）→
-// 当天剩余窗口内重排、再次执行（用户故事 #17）；失败不形成终态。
+// 当天剩余窗口内重排、再次执行（用户故事 #17）；失败不形成终态。时钟钉在收敛
+// 截止时刻（23:58 = 窗口结束 23:59 - 最短重排间隔 1 分钟）之前——此后的调度等待
+// 取消，任何已发生的失败都仍在可重排区间（ticket 12：收敛只发生在截止时刻之后）。
 func TestDaemonReplansWithinWindowAfterTransientFailure(t *testing.T) {
 	cfg := daemonConfig(t, nil) // 窗口 [23:30, 23:59]
-	// 时钟钉在窗口结束：重排后至多推进到 end，之后 daemon 卡住等待取消。
-	d, out, runner := newDaemon(cfg, at(2025, 9, 6, 23, 30), at(2025, 9, 6, 23, 59), nil, errors.New("网络暂时不可用"), false)
+	d, out, runner := newDaemon(cfg, at(2025, 9, 6, 23, 30), at(2025, 9, 6, 23, 57), nil, errors.New("网络暂时不可用"), false)
 	ctx, cancel := context.WithCancel(context.Background())
 	waitDone := startDaemon(t, d, ctx)
 
@@ -291,9 +318,48 @@ func TestDaemonReplansWithinWindowAfterTransientFailure(t *testing.T) {
 	if n := runner.count(); n < 1 {
 		t.Errorf("至少应尝试执行一次，实际 %d 次", n)
 	}
-	// 暂时性失败不产生终态（daemon 不写终态；Task 内部规则）。
+	// 暂时性失败不产生终态（daemon 不写终态；Task 内部规则）：全部失败时刻都在
+	// 收敛截止时刻之前，Task 按暂时性处理（窗口内可再次调度）。
 	if _, has, err := terminal.NewFileStore(cfg.DataDir).Load(); err != nil || has {
 		t.Fatalf("暂时性失败不应产生终态: has=%v err=%v", has, err)
+	}
+}
+
+// TestDaemonConvergesTransientFailureAtWindowEnd：窗口末尾的暂时性失败最终形成
+// failed 终态（ticket 12 验收 1）——daemon 注入收敛截止时刻（窗口结束 23:59 - 1 分钟
+// = 23:58）；时钟钉在次日（00:30）时，窗口内最后一次重排执行的失败必然发生在截止
+// 时刻之后 → Task 收敛为 failed 终态 → daemon 排定次日（当天不再静默空过）。
+// 时钟上限在次日而非当天窗口结束：收敛后的最短重排睡眠需要越过 23:59 才能到达
+// 下次调度（钉在 23:59 会让 daemon 卡在睡眠里、观察不到收敛后的调度决策）。
+func TestDaemonConvergesTransientFailureAtWindowEnd(t *testing.T) {
+	cfg := daemonConfig(t, nil) // 窗口 [23:30, 23:59]
+	d, out, runner := newDaemon(cfg, at(2025, 9, 6, 23, 30), at(2025, 9, 7, 0, 30), nil, errors.New("网络暂时不可用"), false)
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := startDaemon(t, d, ctx)
+
+	waitFor(t, out, "Task 执行失败")
+	// 收敛后：当天已有 failed 终态 → 不再自动重跑，排定次日。
+	waitFor(t, out, "当天已有终态，跳过今日自动执行")
+	waitFor(t, out, "2025-09-07")
+	cancel()
+	if err := waitDone(); err != nil {
+		t.Errorf("取消后应返回 nil，got %v", err)
+	}
+
+	// 收敛截止时刻注入正确：窗口结束 - 最短重排间隔（23:58）。
+	if want := at(2025, 9, 6, 23, 58); !runner.lastDeadline().Equal(want) {
+		t.Errorf("收敛截止时刻 = %v，期望 %v", runner.lastDeadline(), want)
+	}
+	// failed 终态已落盘（Task 收敛；daemon 不改写）。
+	st, has, err := terminal.NewFileStore(cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st.LastTaskResult != terminal.ResultFailed || st.LastTaskDate != "2025-09-06" {
+		t.Errorf("终态 = %+v，期望 2025-09-06/failed", st)
+	}
+	if n := runner.count(); n < 2 {
+		t.Errorf("窗口内应至少重排并再次执行（重排语义保留），实际 %d 次", n)
 	}
 }
 
