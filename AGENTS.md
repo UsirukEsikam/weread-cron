@@ -1,3 +1,7 @@
+## Development environment
+
+Development uses pi agent. Use the tools provided by pi. Do not invoke or delegate work to other coding agents or agent CLIs.
+
 ## Agent skills
 
 ### Issue tracker
