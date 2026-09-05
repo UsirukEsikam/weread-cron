@@ -2,7 +2,8 @@
 // 从初始 Cookie header 建立、renewal 返回的 Set-Cookie 并入、序列化/恢复与原子持久化。
 //
 // tick 03 范围：初始 Cookie 建立 Login Session、renewal 新 Cookie 并入会话并落盘。
-// 失效判别与从初始 Cookie 重建（ticket 04）不在本包。
+// tick 04 范围：凭明确证据判定登录失效后从初始 Cookie 重建（Rebuild）。
+// 失效判别本身在 weread 客户端（ErrLoginInvalid），本包只提供"重建"原语。
 package session
 
 import (
@@ -252,6 +253,23 @@ func (s *Session) MergeAndSaveCookies(cookies []*http.Cookie) error {
 		return fmt.Errorf("持久化更新后的 Login Session 失败: %w", err)
 	}
 	return nil
+}
+
+// Rebuild 用初始 Cookie 重建 Login Session（spec 决策 #7：判定登录失效后从初始
+// Cookie 重建一次）：覆盖持久化会话（原会话已失效）并原子落盘。
+// 初始 Cookie 为空时失败（无重建种子——部署时可能只配置了持久化会话）。
+func Rebuild(store Store, initialCookie string) (*Session, error) {
+	if strings.TrimSpace(initialCookie) == "" {
+		return nil, errors.New("初始 Cookie 未配置，无法从初始 Cookie 重建 Login Session")
+	}
+	jar, err := NewJarFromHeader(initialCookie)
+	if err != nil {
+		return nil, fmt.Errorf("解析初始 Cookie 失败: %w", err)
+	}
+	if err := store.SaveJar(jar); err != nil {
+		return nil, fmt.Errorf("持久化重建的 Login Session 失败: %w", err)
+	}
+	return &Session{jar: jar, store: store}, nil
 }
 
 // FileStore 将 Login Session 存储在 DataDir 下。

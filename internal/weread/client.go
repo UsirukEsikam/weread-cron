@@ -16,6 +16,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -34,6 +35,17 @@ var numericFields = map[string]bool{
 	"ci": true, "co": true, "pr": true, "ct": true,
 	"rt": true, "ts": true, "rn": true,
 }
+
+// ErrLoginInvalid 标记"凭明确证据判定登录失效"（spec 决策 #7；checklist #2）。
+// 当前实现的判别特征（与清单假设一致，不做额外推断）：
+//   - 明确证据：renewal 请求完成（HTTP 200）且响应为合法 JSON、succ 存在且不为 true/1——
+//     服务器明确拒绝了 renewal（登录失效的判别特征之一）；
+//   - 非证据：传输失败、HTTP 非 200、响应解析失败、响应体不含 succ 字段——普通/暂时性
+//     失败，当日可再调度，不触发从初始 Cookie 重建。
+//
+// 清单 #2 的其余判别特征（其他 HTTP 状态/响应体形态）未经实测，不在此实现；
+// 若实测与假设冲突，按验证清单处理原则在受影响 ticket 提出讨论。
+var ErrLoginInvalid = errors.New("登录已失效")
 
 // Client 是微信读书 HTTP 客户端。
 type Client struct {
@@ -67,6 +79,9 @@ func (c *Client) ReaderURL(bookID string) string {
 
 // Renewal 在 Task 开始时刷新登录：POST /web/login/renewal（spec 决策 #5）。
 // 响应 Set-Cookie 经 MergeCookies 并入会话（持久化由 session 层负责）。
+// 明确失败（HTTP 200 + 合法 JSON + succ 存在且不为 true/1）返回包装 ErrLoginInvalid
+// 的错误（登录失效的明确证据，checklist #2）；传输/非 200/解析失败/响应不含 succ
+// 字段不归为证据（暂时性失败）。
 func (c *Client) Renewal(ctx context.Context) error {
 	body := []byte(`{"rq":"%2Fweb%2Fbook%2Fread","ql":false}`)
 	resp, err := c.do(ctx, http.MethodPost, c.BaseURL+"/web/login/renewal", c.BaseURL, body)
@@ -77,8 +92,13 @@ func (c *Client) Renewal(ctx context.Context) error {
 	if err := json.Unmarshal(resp, &decoded); err != nil {
 		return fmt.Errorf("renewal 响应解析失败: %w", err)
 	}
+	if v, ok := decoded["succ"]; ok && !succIsTrue(v) {
+		return fmt.Errorf("%w（renewal 未被接受）: %s", ErrLoginInvalid, truncate(string(resp), 200))
+	}
 	if !IsSucc(decoded) {
-		return fmt.Errorf("renewal 未被接受（succ != 1）: %s", truncate(string(resp), 200))
+		// 响应不含 succ=1：不是"明确拒绝"的证据形态（如 errCode 错误体/空体），
+		// 按暂时性失败处理（checklist #2 其余特征待实测，不静默加入判别集）。
+		return fmt.Errorf("renewal 响应无法确认为成功（succ 缺失）: %s", truncate(string(resp), 200))
 	}
 	return nil
 }

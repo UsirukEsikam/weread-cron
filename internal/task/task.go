@@ -3,7 +3,10 @@
 // → success 终态落盘 → 成功通知。
 //
 // ticket 03 范围：指定候选书（WEREAD_CRON_BOOKS）下的最小 happy path。
-// 恢复链（refresh Context → renewal → 重试）与失败终态、失败通知由 ticket 05 交付；
+// ticket 04 范围：renewal 凭明确证据（weread.ErrLoginInvalid，checklist #2）判定登录失效
+// → 从初始 Cookie 重建 Login Session 一次 → 重试；仍失败 → failed 终态 + 登录失效通知
+// （明确提示更新初始 Cookie，spec 决策 #7/#9/#10）。
+// 恢复链（refresh Context → renewal → 重试）与普通失败终态、失败通知由 ticket 05 交付；
 // Reader Context TTL 缓存与主动刷新由 ticket 06 交付；自动选书由 ticket 09 交付。
 //
 // # rt 语义（ADR-0004）
@@ -52,6 +55,11 @@ type Options struct {
 	Terminal terminal.Store
 	// Notify 是成功通知；nil 表示不通知（合法渠道组合，用户故事 #37）。
 	Notify notify.Notifier
+
+	// RebuildLoginSession 是登录失效重建入口（spec 决策 #7）：凭明确证据判定失效后，
+	// 从初始 Cookie 重建 Login Session（覆盖持久化会话）并让客户端使用新会话。
+	// 由 App 装配层提供；nil 表示无重建能力（防御：证据出现时按重建失败处理）。
+	RebuildLoginSession func() error
 
 	// Books 是候选 bookId（cfg.Books）；空 = 自动选书（ticket 09，当前直接报错）。
 	Books []string
@@ -123,8 +131,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	target := time.Duration(o.TargetMinMinutes+o.RNG.Intn(o.TargetMaxMinutes-o.TargetMinMinutes+1)) * time.Minute
 
 	// 3. Task 开始时即 renewal（spec 决策 #6；新 Cookie 经客户端回调并入会话并持久化）。
-	if err := o.Client.Renewal(ctx); err != nil {
-		return Result{}, fmt.Errorf("登录 renewal 失败: %w", err)
+	//    ticket 04：明确证据判定登录失效时从初始 Cookie 重建一次并重试。
+	if err := r.renew(ctx); err != nil {
+		return Result{}, err
 	}
 
 	// 4. 读真实 Reading Progress 并建立 Reader Context（同一 Reader 页；CONTEXT.md）。
@@ -222,6 +231,57 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		Actual:    accumulated,
 		Reports:   reports,
 	}, nil
+}
+
+// renew 执行 Task 开始时的 renewal；凭明确证据（weread.ErrLoginInvalid：renewal
+// HTTP 200 + succ != 1，checklist #2 当前假设）判定登录失效时，从初始 Cookie 重建
+// Login Session 一次并重试（spec 决策 #7；用户故事 #33）：
+//   - 重建 + 重试成功 → 返回 nil，Task 继续（当天不放弃）；
+//   - 重建失败或重试仍失败 → failed 终态先落盘、再发登录失效通知（用户故事 #34），
+//     返回包装 ErrLoginInvalid 的错误（含更新初始 Cookie 的明确提示）。
+//
+// 无明确证据的失败（传输错误、HTTP 非 200、响应解析失败）不重建、不写终态——
+// 暂时性失败，当日可再次调度（用户故事 #17；判别特征见 client.go 的 ErrLoginInvalid）。
+func (r *Runner) renew(ctx context.Context) error {
+	o := r.opts
+	err := o.Client.Renewal(ctx)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, weread.ErrLoginInvalid) {
+		return fmt.Errorf("登录 renewal 失败: %w", err)
+	}
+
+	o.Logger.Warn("检测到登录失效（renewal 明确拒绝），从初始 Cookie 重建 Login Session", "err", err)
+	if o.RebuildLoginSession == nil {
+		return r.failLoginInvalid(ctx, err, errors.New("未配置从初始 Cookie 重建 Login Session 的入口"))
+	}
+	if rerr := o.RebuildLoginSession(); rerr != nil {
+		return r.failLoginInvalid(ctx, err, rerr)
+	}
+	if err2 := o.Client.Renewal(ctx); err2 != nil {
+		// 已消耗唯一一次重建机会；重试失败（无论是否再次证据）即重建失败。
+		return r.failLoginInvalid(ctx, err, err2)
+	}
+	return nil
+}
+
+// failLoginInvalid 输出登录失效的失败结果：failed 终态先落盘、再发送登录失效通知
+// （spec 决策 #7/#9/#10；通知失败不影响结果——用户故事 #38）。返回的错误供调用方
+// 报告，包装 weread.ErrLoginInvalid 并含更新初始 Cookie 的明确提示。
+func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error) error {
+	o := r.opts
+	date := o.Clock.Now().In(o.TZ).Format("2006-01-02")
+	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
+		o.Logger.Warn("登录失效时写入 failed 终态失败", "err", err)
+	}
+	if o.Notify != nil {
+		if err := o.Notify.NotifyLoginInvalid(ctx, notify.LoginInvalid{Date: date, Cause: cause.Error()}); err != nil {
+			o.Logger.Warn("登录失效通知发送失败（不影响 Task 结果）", "err", err)
+		}
+	}
+	return fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 后 renewal 仍失败。证据: %v；重建: %v。%s",
+		weread.ErrLoginInvalid, evidence, cause, notify.LoginInvalidPrompt)
 }
 
 // pickBook 从候选书随机取一本；空候选 = 自动选书（ticket 09 交付，当前明确报错）。

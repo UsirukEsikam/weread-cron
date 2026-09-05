@@ -28,10 +28,23 @@ type Success struct {
 	Reports int
 }
 
+// LoginInvalid 是登录失效通知的内容（spec 决策 #10：固定文案明确提示更新初始 Cookie）。
+type LoginInvalid struct {
+	// Date 是 Task 日期（cfg.TZ 下 YYYY-MM-DD）。
+	Date string
+	// Cause 是重建失败的原因摘要（固定文案之外的附加信息，可空）。
+	Cause string
+}
+
+// LoginInvalidPrompt 是登录失效通知的固定提示文案（spec 决策 #10：明确提示更新初始 Cookie）。
+const LoginInvalidPrompt = "请更新初始 Cookie（WEREAD_CRON_COOKIE）后重试：重启服务或执行 weread-cron run。"
+
 // Notifier 发送一类通知；错误仅表示该渠道失败。
 type Notifier interface {
 	// NotifySuccess 发送成功通知。
 	NotifySuccess(ctx context.Context, s Success) error
+	// NotifyLoginInvalid 发送登录失效通知（固定文案：明确提示更新初始 Cookie）。
+	NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error
 }
 
 // HTTPClient 是通知渠道使用的 HTTP 客户端（超时等内部默认由装配层提供）。
@@ -60,6 +73,17 @@ func (m *Multi) NotifySuccess(ctx context.Context, s Success) error {
 	return errors.Join(errs...)
 }
 
+// NotifyLoginInvalid 逐个渠道发送并聚合错误（任一渠道失败不影响其他渠道）。
+func (m *Multi) NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error {
+	var errs []error
+	for _, ch := range m.channels {
+		if err := ch.NotifyLoginInvalid(ctx, l); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // Bark 通过 Bark 服务推送（Bark 官方 API：POST 到设备 key URL，JSON body）。
 type Bark struct {
 	// URL 是配置的 Bark 地址（BARK URL，形如 https://api.day.app/<key>）。
@@ -72,6 +96,16 @@ func (b *Bark) NotifySuccess(ctx context.Context, s Success) error {
 	body := map[string]string{
 		"title": "微信读书阅读任务完成",
 		"body":  formatMessage(s),
+		"group": "weread-cron",
+	}
+	return postJSON(ctx, b.Client, b.URL, body)
+}
+
+// NotifyLoginInvalid 发送 Bark 登录失效通知（固定文案 + 原因摘要）。
+func (b *Bark) NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error {
+	body := map[string]string{
+		"title": "微信读书登录已失效",
+		"body":  formatLoginInvalid(l),
 		"group": "weread-cron",
 	}
 	return postJSON(ctx, b.Client, b.URL, body)
@@ -95,12 +129,32 @@ func (w *WeCom) NotifySuccess(ctx context.Context, s Success) error {
 	return postJSON(ctx, w.Client, w.URL, body)
 }
 
+// NotifyLoginInvalid 发送企业微信文本消息（固定文案 + 原因摘要）。
+func (w *WeCom) NotifyLoginInvalid(ctx context.Context, l LoginInvalid) error {
+	body := map[string]any{
+		"msgtype": "text",
+		"text": map[string]string{
+			"content": formatLoginInvalid(l),
+		},
+	}
+	return postJSON(ctx, w.Client, w.URL, body)
+}
+
 // formatMessage 生成统一的成功通知文本。
 func formatMessage(s Success) string {
 	return fmt.Sprintf(
 		"微信读书阅读任务完成（%s）\n书名：%s（%s）\n计划时长：%s\n实际累计：%s\n上报次数：%d",
 		s.Date, s.BookTitle, s.BookID,
 		FormatDuration(s.Planned), FormatDuration(s.Actual), s.Reports)
+}
+
+// formatLoginInvalid 生成登录失效通知文本：固定文案 + 可选原因（spec 决策 #10）。
+func formatLoginInvalid(l LoginInvalid) string {
+	msg := fmt.Sprintf("微信读书登录已失效：Task 未能完成（%s）\n%s", l.Date, LoginInvalidPrompt)
+	if l.Cause != "" {
+		msg += "\n原因：" + l.Cause
+	}
+	return msg
 }
 
 // FormatDuration 输出中文时长（如 "40 分钟"、"40 分钟 30 秒"、"30 秒"）。

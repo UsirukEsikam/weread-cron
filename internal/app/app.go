@@ -92,14 +92,17 @@ func notifyChannels(hc *http.Client, cfg *config.Config) []notify.Notifier {
 }
 
 // RunTask 完整执行一次 Task（Login Session 建立/恢复 → weread 客户端 → 编排）。
+// 登录失效重建（ticket 04）：客户端回调读取可变会话句柄 current，重建时由
+// session.Rebuild 替换为新会话（初始 Cookie 重建并覆盖持久化会话）。
 func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 	sess, err := session.New(a.deps.Sessions, a.cfg.Cookie)
 	if err != nil {
 		return task.Result{}, err
 	}
+	current := sess
 	client := weread.NewClient(a.deps.WereadBaseURL, a.deps.HTTPClient, a.deps.UserAgent,
-		sess.CookieHeader,
-		func(cookies []*http.Cookie) error { return sess.MergeAndSaveCookies(cookies) })
+		func() string { return current.CookieHeader() },
+		func(cookies []*http.Cookie) error { return current.MergeAndSaveCookies(cookies) })
 
 	runner := task.New(task.Options{
 		Clock:            a.deps.Clock,
@@ -112,7 +115,15 @@ func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 		TargetMinMinutes: a.cfg.ReadMinutesMin,
 		TargetMaxMinutes: a.cfg.ReadMinutesMax,
 		TZ:               a.cfg.TZ,
-		Logger:           a.deps.Logger,
+		RebuildLoginSession: func() error {
+			ns, err := session.Rebuild(a.deps.Sessions, a.cfg.Cookie)
+			if err != nil {
+				return err
+			}
+			current = ns
+			return nil
+		},
+		Logger: a.deps.Logger,
 	})
 	return runner.Run(ctx)
 }

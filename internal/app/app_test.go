@@ -9,6 +9,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -67,6 +68,13 @@ type fakeWeread struct {
 	reportRejected bool
 	renewNoCookies bool
 
+	// renewReject > 0 时，前 N 次 renewal 返回 {"succ":0}（登录失效的明确证据形态）；
+	// renewStatus 非零时 renewal 返回该 HTTP 状态（传输/服务端故障，非明确证据）；
+	// renewNoSucc 为 true 时 renewal 返回 200 但不含 succ 字段（如 errCode 错误体）。
+	renewReject int
+	renewStatus int
+	renewNoSucc bool
+
 	// blockTimed 非 nil 时，下一笔 timed report 请求到达后等待 channel 关闭才响应
 	//（用于注入"响应期间时钟跳变"模拟 suspend）。
 	blockTimed          chan struct{}
@@ -122,6 +130,26 @@ func (f *fakeWeread) handleRenewal(w http.ResponseWriter, r *http.Request) {
 	}
 	if ct := r.Header.Get("Content-Type"); ct != "application/json;charset=UTF-8" {
 		f.t.Errorf("renewal Content-Type = %q", ct)
+	}
+	f.mu.Lock()
+	reject := f.renewReject > 0
+	if reject {
+		f.renewReject--
+	}
+	status := f.renewStatus
+	f.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		fmt.Fprint(w, `{"errCode":500,"errMsg":"boom"}`)
+		return
+	}
+	if reject {
+		fmt.Fprint(w, `{"succ":0,"errMsg":"login expired"}`)
+		return
+	}
+	if f.renewNoSucc {
+		fmt.Fprint(w, `{"errCode":-2012,"errMsg":"error"}`)
+		return
 	}
 	if f.renewNoCookies {
 		fmt.Fprint(w, `{"succ":1}`)
@@ -785,5 +813,263 @@ func TestRunReportRejectedFailsTask(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
 		t.Errorf("失败时不得写入 success 终态")
+	}
+}
+
+// seedSession 预置持久化 Login Session（模拟上次运行留下、已失效的会话）。
+func seedSession(t *testing.T, dir string, cookies ...*http.Cookie) {
+	t.Helper()
+	j := session.NewJar()
+	j.MergeSetCookies(cookies)
+	if err := session.NewFileStore(dir).SaveJar(j); err != nil {
+		t.Fatalf("预置 Login Session 失败: %v", err)
+	}
+}
+
+// TestRunLoginInvalidRebuildsFromInitialCookieAndContinues 断言：凭明确证据（renewal
+// succ!=1）判定登录失效后，从初始 Cookie 重建 Login Session 一次并重试；重建成功
+// 则当天 Task 继续（用户故事 #33）。
+func TestRunLoginInvalidRebuildsFromInitialCookieAndContinues(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		// 预置失效的持久化会话（恢复后仍是旧 Cookie），首笔 renewal 拒绝。
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+		h.weread.renewReject = 1
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("重建成功时 Task 应继续完成: %v", err)
+	}
+	if res.Reports != 2 {
+		t.Errorf("Reports = %d，期望 2（任务完整执行）", res.Reports)
+	}
+
+	// 两笔 renewal：首笔（恢复的旧会话）被拒；重建后重试携带初始 Cookie。
+	var renewals []wereadRequest
+	for _, r := range h.weread.snapshot() {
+		if r.Path == "/web/login/renewal" {
+			renewals = append(renewals, r)
+		}
+	}
+	if len(renewals) != 2 {
+		t.Fatalf("renewal 数 = %d，期望 2（1 次证据 + 重建后 1 次重试）", len(renewals))
+	}
+	if c := renewals[0].Header.Get("Cookie"); !strings.Contains(c, "wr_gid=OLDSTALE") {
+		t.Errorf("首笔 renewal Cookie = %q，期望恢复的旧会话", c)
+	}
+	if c := renewals[1].Header.Get("Cookie"); !strings.Contains(c, "wr_gid=123") || !strings.Contains(c, "wr_skey=abc") || strings.Contains(c, "OLDSTALE") {
+		t.Errorf("重建后 renewal Cookie = %q，期望初始 Cookie 重建的会话", c)
+	}
+
+	// 当天 Task 继续：success 终态 + 成功通知，无登录失效通知。
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("Terminal State 不存在: %v", err)
+	}
+	var st terminal.State
+	json.Unmarshal(data, &st)
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultSuccess}) {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	if got := len(h.bark.snapshot()); got != 1 || h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
+	}
+	// 重建后的 renewal 新 Cookie 仍并入会话并落盘。
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sessData), `"value": "new123"`) || !strings.Contains(string(sessData), `"value": "newabc"`) {
+		t.Errorf("重建后 Login Session 未并入 renewal 新 Cookie:\n%s", sessData)
+	}
+}
+
+// TestRunLoginInvalidRebuildFailsWritesFailedTerminalAndNotifies 断言：重建仍失败 →
+// failed 终态（先落盘再通知）+ 登录失效通知（固定文案提示更新初始 Cookie）。
+func TestRunLoginInvalidRebuildFailsWritesFailedTerminalAndNotifies(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewReject = 5
+	})
+	// 通知端点收到登录失效通知时，failed 终态必须已落盘（spec 决策 #9/#10）。
+	h.bark.Check = func() error {
+		data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+		if err != nil {
+			return fmt.Errorf("通知时 failed 终态尚未落盘: %w", err)
+		}
+		var st terminal.State
+		if err := json.Unmarshal(data, &st); err != nil {
+			return err
+		}
+		if st.LastTaskResult != terminal.ResultFailed {
+			return fmt.Errorf("终态 = %+v，期望 failed", st)
+		}
+		return nil
+	}
+
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("重建仍失败时 Task 应失败")
+	}
+	if !errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("错误应包装 weread.ErrLoginInvalid，实际: %v", err)
+	}
+
+	// 有界：重建一次 + 重试一次，不无限重试。
+	if n := h.weread.count("/web/login/renewal"); n != 2 {
+		t.Errorf("renewal 数 = %d，期望 2（证据 + 重建后重试）", n)
+	}
+
+	// failed 终态（阻止当天再次自动执行，用户故事 #41 可手动 `run` 重试）。
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("failed 终态不存在: %v", err)
+	}
+	var st terminal.State
+	json.Unmarshal(data, &st)
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}) {
+		t.Errorf("Terminal State = %+v", st)
+	}
+
+	// 登录失效通知（Bark + 企业微信各 1 条，固定文案提示更新初始 Cookie），无成功通知。
+	for name, nf := range map[string]*fakeNotify{"bark": h.bark, "wecom": h.wecom} {
+		recs := nf.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("%s 通知数 = %d，期望 1 条登录失效通知", name, len(recs))
+		}
+		if recs[0].Body["title"] != nil && recs[0].Body["title"] != "微信读书登录已失效" {
+			t.Errorf("%s title = %v", name, recs[0].Body["title"])
+		}
+		msg, _ := json.Marshal(recs[0].Body)
+		for _, want := range []string{
+			"微信读书登录已失效",
+			"请更新初始 Cookie（WEREAD_CRON_COOKIE）",
+			"2025-09-06",
+		} {
+			if !strings.Contains(string(msg), want) {
+				t.Errorf("%s 登录失效通知缺少 %q；body=%s", name, want, msg)
+			}
+		}
+	}
+	if strings.Contains(string(h.bark.snapshot()[0].Body["title"].(string)), "完成") {
+		t.Errorf("不得发送成功通知")
+	}
+}
+
+// TestRunTransientRenewalFailureDoesNotTriggerRebuild 断言无明确证据的失败
+//（HTTP 非 200：传输/服务端故障）不触发重建、不写 failed 终态、不发登录失效通知。
+func TestRunTransientRenewalFailureDoesNotTriggerRebuild(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewStatus = 500
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("renewal HTTP 500 时 Task 应失败")
+	}
+	if errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("非明确证据不得归类为登录失效: %v", err)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 1 {
+		t.Errorf("renewal 数 = %d，期望 1（无证据不重建、不重试）", n)
+	}
+	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
+		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("不得发送任何通知，实际 %d 条", got)
+	}
+}
+
+// TestRunLoginInvalidRebuildWithoutInitialCookieFails 断言：无初始 Cookie 可重建时
+//（部署只配置了持久化会话且已失效），同样走 failed 终态 + 登录失效通知。
+func TestRunLoginInvalidRebuildWithoutInitialCookieFails(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.Cookie = ""
+		h.weread.renewReject = 5
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("重建失败时 Task 应失败")
+	}
+	if !errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("错误应包装 weread.ErrLoginInvalid，实际: %v", err)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 1 {
+		t.Errorf("renewal 数 = %d，期望 1（无初始 Cookie 直接失败，不重试）", n)
+	}
+	data, err := os.ReadFile(filepath.Join(h.cfg.DataDir, terminal.FileName))
+	if err != nil {
+		t.Fatalf("failed 终态不存在: %v", err)
+	}
+	var st terminal.State
+	json.Unmarshal(data, &st)
+	if st.LastTaskResult != terminal.ResultFailed {
+		t.Errorf("Terminal State = %+v", st)
+	}
+	if got := len(h.bark.snapshot()); got != 1 {
+		t.Errorf("应发送 1 条登录失效通知，实际 %d", got)
+	}
+}
+
+// TestRunRenewalNoSuccIsNotLoginInvalid 断言 200 响应不含 succ 字段（如 errCode
+// 错误体）不是"明确拒绝"的证据形态：不重建、不写终态、不发登录失效通知。
+func TestRunRenewalNoSuccIsNotLoginInvalid(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewNoSucc = true
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("renewal 响应不含 succ 时 Task 应失败")
+	}
+	if errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("不含 succ 的响应不得归类为登录失效证据: %v", err)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 1 {
+		t.Errorf("renewal 数 = %d，期望 1（无证据不重建、不重试）", n)
+	}
+	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
+		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("不得发送任何通知，实际 %d 条", got)
+	}
+}
+
+// TestRunRestartRestoresRenewedSession 断言跨进程重启（新 App + 同一 /data）：
+// 恢复的是上次运行 renewal 后落盘的最新会话，而非初始 Cookie（用户故事 #7/#9）。
+func TestRunRestartRestoresRenewedSession(t *testing.T) {
+	h := setup(t, nil)
+	if _, err := h.runTask(context.Background()); err != nil {
+		t.Fatalf("首次运行失败: %v", err)
+	}
+	firstRequests := len(h.weread.snapshot())
+
+	// 重启：同一 /data、初始 Cookie 已更换（模拟运维更新 env）；
+	// 复用同一 fake 服务端以便观察重启后首笔请求携带的 Cookie。
+	h2 := setup(t, func(h2 *testHarness) {
+		h2.cfg.DataDir = h.cfg.DataDir
+		h2.cfg.Cookie = "wr_gid=replaceme"
+		h2.weread = h.weread
+	})
+	if _, err := h2.runTask(context.Background()); err != nil {
+		t.Fatalf("重启后运行失败: %v", err)
+	}
+
+	// 重启后首笔 renewal 携带的是落盘的会话（new123），而非新初始 Cookie。
+	reqs := h.weread.snapshot()
+	if firstRequests >= len(reqs) {
+		t.Fatalf("重启后无新请求")
+	}
+	if c := reqs[firstRequests].Header.Get("Cookie"); !strings.Contains(c, "wr_gid=new123") || strings.Contains(c, "replaceme") {
+		t.Errorf("重启后 renewal Cookie = %q，期望恢复 new123 而非初始 Cookie", c)
+	}
+	// 落盘会话未被替换：login_session.json 仍含 renewal 后的新 Cookie。
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(sessData), "replaceme") || !strings.Contains(string(sessData), `"value": "new123"`) {
+		t.Errorf("Login Session 文件应含 new123 且不含 replaceme:\n%s", sessData)
 	}
 }

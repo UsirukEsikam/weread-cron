@@ -199,3 +199,57 @@ func TestMergeAndSave(t *testing.T) {
 		t.Errorf("内存会话 = %q", s.CookieHeader())
 	}
 }
+
+// TestRebuildOverwritesPersistedSession 断言 Rebuild 用初始 Cookie 覆盖持久化会话
+// （失效重建，spec 决策 #7）并原子落盘；重建结果可直接用于请求。
+func TestRebuildOverwritesPersistedSession(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	persisted := NewJar()
+	persisted.MergeSetCookies([]*http.Cookie{{Name: "wr_gid", Value: "stale"}})
+	if err := store.SaveJar(persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := Rebuild(store, "wr_skey=abc; wr_gid=123")
+	if err != nil {
+		t.Fatalf("Rebuild 失败: %v", err)
+	}
+	if s.CookieHeader() != "wr_gid=123; wr_skey=abc" {
+		t.Errorf("重建会话 CookieHeader = %q", s.CookieHeader())
+	}
+	// 磁盘已被覆盖（旧 Cookie 消失）、无残留临时文件。
+	loaded, err := store.LoadJar()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := loaded.CookieHeader(); got != "wr_gid=123; wr_skey=abc" {
+		t.Errorf("磁盘会话 = %q，期望初始 Cookie 重建后的值", got)
+	}
+	if leftovers, _ := filepath.Glob(filepath.Join(dir, ".tmp-*")); len(leftovers) > 0 {
+		t.Errorf("残留临时文件: %v", leftovers)
+	}
+}
+
+// TestRebuildWithoutInitialCookieFails 断言无初始 Cookie 时无法重建且不破坏已有会话。
+func TestRebuildWithoutInitialCookieFails(t *testing.T) {
+	dir := t.TempDir()
+	store := NewFileStore(dir)
+	persisted := NewJar()
+	persisted.MergeSetCookies([]*http.Cookie{{Name: "wr_gid", Value: "stale"}})
+	if err := store.SaveJar(persisted); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := Rebuild(store, ""); err == nil {
+		t.Fatal("无初始 Cookie 时 Rebuild 应报错")
+	}
+	// 既有会话未被破坏。
+	loaded, err := store.LoadJar()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.CookieHeader() != "wr_gid=stale" {
+		t.Errorf("失败后磁盘会话被破坏: %q", loaded.CookieHeader())
+	}
+}
