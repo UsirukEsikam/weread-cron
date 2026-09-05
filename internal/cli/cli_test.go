@@ -67,9 +67,11 @@ func withCookie(t *testing.T) string {
 	return config.EnvCookie + "=wr_skey=abc; wr_gid=123"
 }
 
+// writeLoginSessionFile 写入一个可恢复的 Login Session 文件（含一个 Cookie）。
 func writeLoginSessionFile(t *testing.T, dir string) {
 	t.Helper()
-	if err := os.WriteFile(filepath.Join(dir, "login_session.json"), []byte("{}"), 0o600); err != nil {
+	data := `{"cookies":[{"name":"wr_skey","value":"abc"}]}`
+	if err := os.WriteFile(filepath.Join(dir, "login_session.json"), []byte(data), 0o600); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -177,6 +179,26 @@ func TestMissingCookieFastFail(t *testing.T) {
 	}
 }
 
+// TestDaemonStartupFailsOnEmptySessionFile：持久化 Login Session 为空（损坏）→
+// daemon 启动失败（ticket 07：恢复 Login Session 是调度循环第 1 步；exit code + stderr）。
+func TestDaemonStartupFailsOnEmptySessionFile(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "login_session.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := testEnv(t, withCookie(t), config.EnvDataDir+"="+dir)
+	var stdout, stderr syncBuffer
+	code := Run(context.Background(), nil, env, &stdout, &stderr)
+	if code != ExitConfig {
+		t.Errorf("退出码 = %d，期望 %d", code, ExitConfig)
+	}
+	if !strings.Contains(stderr.String(), "恢复 Login Session") {
+		t.Errorf("stderr 应指明 Login Session 恢复失败；实际:\n%s", stderr.String())
+	}
+}
+
+// TestDaemonStartsWithPersistedLoginSessionAndNoCookie：有可恢复的持久化 Login
+// Session（无需初始 Cookie）→ daemon 正常启动，取消后以退出码 0 结束。
 func TestDaemonStartsWithPersistedLoginSessionAndNoCookie(t *testing.T) {
 	dir := t.TempDir()
 	writeLoginSessionFile(t, dir)

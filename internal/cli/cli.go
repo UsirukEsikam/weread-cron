@@ -78,7 +78,12 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 
 	switch cmd {
 	case cmdDaemon:
-		if err := scheduler.Run(ctx, cfg, logger); err != nil {
+		a, err := makeApp(cfg, logger)
+		if err != nil {
+			fmt.Fprintf(stderr, "weread-cron: 装配失败: %v\n", err)
+			return ExitConfig
+		}
+		if err := scheduler.New(cfg, scheduler.Deps{Task: a, Logger: logger}).Run(ctx); err != nil {
 			fmt.Fprintf(stderr, "weread-cron: daemon 异常退出: %v\n", err)
 			return ExitConfig
 		}
