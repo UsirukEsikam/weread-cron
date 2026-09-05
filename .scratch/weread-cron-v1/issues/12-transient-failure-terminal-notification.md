@@ -5,7 +5,7 @@
 **Finding:** F2 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** bug
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 自动 Task 的最终失败（窗口内无法再重排）必须形成 failed 终态并发失败通知；timed report 的传输级失败不再无条件立即终止整个 Task。
 
@@ -29,11 +29,11 @@
 
 ## Acceptance criteria
 
-- [ ] 窗口末尾发生的暂时性失败最终形成 failed 终态并发送失败通知（当天不再静默空过）
-- [ ] 窗口内有剩余时间时，暂时性失败仍按现有语义重排（回归）
-- [ ] timed report 单次传输失败不再立即终止整个 Task（恢复/继续，或按失败收敛，视修复方案）
-- [ ] 失败通知包含失败阶段、主要错误、已尝试恢复动作
-- [ ] failed 终态落盘后 `weread-cron run` 可手动重试（现有行为回归）
+- [x] 窗口末尾发生的暂时性失败最终形成 failed 终态并发送失败通知（当天不再静默空过）
+- [x] 窗口内有剩余时间时，暂时性失败仍按现有语义重排（回归）
+- [x] timed report 单次传输失败不再立即终止整个 Task（恢复/继续，或按失败收敛，视修复方案）
+- [x] 失败通知包含失败阶段、主要错误、已尝试恢复动作
+- [x] failed 终态落盘后 `weread-cron run` 可手动重试（现有行为回归）
 
 ## Out of scope
 
@@ -48,3 +48,22 @@ Review 输入 F2 已对当前代码确认：
 - Task 编排层所有暂时性失败路径直接返回错误（不写终态、不通知）；仅三处写终态 + 通知：恢复链耗尽、登录失效、自动选书无可用书。
 - daemon 收到 Task 错误 → 日志 + 最短重排间隔后重排；`NextStart` 窗口已过 → 排次日。窗口耗尽时当天无终态、无通知。
 - timed report 循环中恢复链返回非"明确拒绝"错误时立即返回并终止整个 Task。
+
+## Answer
+
+实现「暂时性失败收敛边界 + timed report 传输级失败容错」（spec 决策 #7 的收敛调和；F2）。
+
+1. **收敛边界（daemon 与 Task 的交互面）**：`scheduler.TaskRunner` 增加 `finalFailureAfter time.Time` 参数（手动 run 传零值 = 不收敛，用户在场由 CLI 呈现）。daemon 每次自动执行时注入 `finalFailureDeadline` = 当天窗口结束 − `replanMinGap`（1 分钟）：失败时刻晚于该时刻时，最短重排间隔睡眠后 `NextStart` 必然排次日——该失败即当日最后一次尝试。收敛语义判据是**失败时刻而非启动时刻**（启动早但失败晚的 Task 同样收敛）。
+2. **Task 侧收敛出口（internal/task）**：一切未形成终态的失败统一经 `finalizeTransient(ctx, stage, cause, taskDate)`——截止时刻已过且未形成终态 → failed 终态先落盘、再发失败通知（阶段/主要错误/已尝试动作，spec 决策 #9/#10）；之前原样返回（窗口内重排，用户故事 #17 不变）。已收敛错误（`report.ErrRejected` 恢复链耗尽 / `weread.ErrLoginInvalid`）经 errors.Is 判别不重复收敛。覆盖全部暂时性路径：renewal、Shelf 抓取、Reader Context、enter（初始与异常重建）、timed report 预算耗尽、恢复链中继传输失败。
+3. **timed report 容错（ticket 验收 3）**：单次传输级失败（非拒绝）跳过本节奏点、Reading Session 继续——被跳过的间隔自然并入下一次被接受上报的 rt（ADR-0004）；连续失败达 `DefaultMaxConsecutiveReportFailures = 3` 预算才判定 Task 暂时性失败（不因一次抖动丢失整个 Task，也不无限跳过）。异常间隔重建成功后连续失败计数清零（成功 enter 即传输恢复）。
+4. **失败通知的已尝试动作（ticket 验收 4）**：恢复链因传输失败终止时，错误载体 `chainStop` 携带已尝试动作序列（refresh/retry/renewal 按发生顺序），`finalizeTransient` 经 errors.As 提取进 `notify.Failure.Actions`——收敛通知如实报告已尝试恢复；纯传输失败（无恢复动作可言）不虚报。
+5. **日期语义（评审 P2 修复）**：收敛的终态与通知日期用 Task 开始日（窗口日）——窗口末尾 Task 可越过午夜（用户故事 #11），失败时刻的日期可能是次日；用开始日避免窗口日静默空过且次日自动执行被误抑制（`TestRunConvergenceAcrossMidnightUsesTaskStartDate`）。成功路径与既有失败出口（恢复链耗尽/登录失效/自动选书）的完成时刻日期语义不变（ticket 范围外）。
+6. **调度层零改动**：daemon 既有失败后处理（睡 replanMinGap → schedule）天然支持收敛后的终态：有终态 → 排次日。并发守卫拒绝（ErrTaskRunning）不是失败、不收敛（当天结果由运行中的那个 Task 负责）。
+
+### 测试覆盖
+
+- daemon seam（internal/scheduler）：`TestDaemonConvergesTransientFailureAtWindowEnd`（窗口末尾暂时性失败 → failed 终态 → 排次日；截止时刻注入值断言）、`TestDaemonReplansWithinWindowAfterTransientFailure` 回归（截止时刻前的失败不写终态、窗口内重排）。
+- 应用 seam（internal/app）：单次 timed 传输失败会话继续（rt=60 并入）、连续 3 次失败预算终止（无终态无通知）、窗口末收敛（timed report / renewal 两阶段，终态先落盘再通知、无成功文案）、截止时刻前不收敛回归、恢复链终止收敛通知含已尝试动作、跨午夜收敛归属窗口日。
+- 终态规则回归：failed 终态下 `run` 手动重试由既有 `TestRunRetriesAfterTodayFailedTerminal` 保持。
+
+**Commit:** bbdf868
