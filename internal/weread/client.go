@@ -1,15 +1,17 @@
-// 微信读书 HTTP 客户端（ticket 03）：renewal、Reader 页抓取、enter/timed report 发送。
+// 微信读书 HTTP 客户端（ticket 03/09）：renewal、Shelf 抓取、Reader 页抓取、
+// enter/timed report 发送。
 // 本层不持有状态：Cookie header 与 Set-Cookie 合并经注入回调接入 Login Session
-//（ADR-0006：HTTP endpoints 与 session store 在应用边界注入；fake server 即测试 seam）。
+// （ADR-0006：HTTP endpoints 与 session store 在应用边界注入；fake server 即测试 seam）。
 //
 // 请求形态按 weread.koplugin 的 client.lua 实现：
 //   - renewal：POST /web/login/renewal，body {"rq":"%2Fweb%2Fbook%2Fread","ql":false}，
 //     成功判定 succ==1（spec 决策 #5）；响应 Set-Cookie 交由调用方并入会话；
+//   - Shelf：GET /web/shelf/sync，纯 Cookie 鉴权；响应解析见 shelf.go（checklist #1）；
 //   - Reader 页：GET /web/reader/{_e(bookId)}，HTML 中解析 __INITIAL_STATE__；
 //   - report：POST /web/book/read，payload 为 JSON，enter/timed 字段集与签名由
 //     protocol.go 构造；ci/co/pr/ct/rt/ts/rn 在线上为数字（见 protocol.go 注释）。
 //
-// 未实测项（checklist #5/#6/#9）遵循 protocol.go 的标注，不在本层改写语义。
+// 未实测项（checklist #1/#5/#6/#9）遵循 protocol.go 与 shelf.go 的标注，不在本层改写语义。
 package weread
 
 import (

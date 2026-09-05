@@ -13,7 +13,11 @@
 // 页刷新 Context（Reading Session 继续：无 enter、rt 基准不变）；异常墙钟间隔超过
 // 内部阈值（DefaultAnomalyThreshold）时不形成大 rt 上报，而是重建 Reading Session
 // （重新 enter；Task 继续、同一本书、累计保留）。TTL 与阈值均为内部默认（spec 决策 #13）。
-// 自动选书由 ticket 09 交付。
+// ticket 09 范围（本文件）：未配置候选书时自动从 Shelf 选书——Shelf 元数据过滤
+// （优先未读完）→ 有界探测 Reader Context（验证可建）→ 全部不可用回退已读完但可用
+// 的书 → 仍不可用 → failed 终态 + 失败通知；`weread-cron books` 由应用边界交付
+// （internal/app 的 ListBooks），本包不涉及。显式指定候选书不因 progress=100% 被排除。
+// Shelf 端点与响应结构按验证清单 #1 的设计假设实现（未实测，冲突时按处理原则讨论）。
 //
 // # rt 语义（ADR-0004）
 //
@@ -58,6 +62,8 @@ const (
 	DefaultRhythm = 30 * time.Second
 	// DefaultAnomalyThreshold 是异常间隔阈值：超过则重建 Reading Session（ADR-0004）。
 	DefaultAnomalyThreshold = 90 * time.Second
+	// DefaultMaxSelectionProbes 是自动选书的有界探测上限（每个候选层：未读完 / 已读完）。
+	DefaultMaxSelectionProbes = 20
 )
 
 // 失败阶段（notify.Failure.Stage；spec 决策 #10：失败通知含失败阶段）。
@@ -66,6 +72,8 @@ const (
 	StageEnterReport = "enter report"
 	// StageTimedReport 是 timed report 失败的阶段。
 	StageTimedReport = "timed report"
+	// StageBookSelection 是自动选书失败的阶段（书架无可建立 Reader Context 的书）。
+	StageBookSelection = "自动选书"
 )
 
 // 已尝试恢复动作（notify.Failure.Actions；spec 决策 #10：失败通知含已尝试恢复动作）。
@@ -76,6 +84,10 @@ const (
 	ActionRetryReport = "重试上报"
 	// ActionRenewal 是"renewal"恢复动作。
 	ActionRenewal = "renewal"
+	// ActionShelfFilter 是"Shelf 元数据过滤"选书动作。
+	ActionShelfFilter = "Shelf 元数据过滤"
+	// ActionProbeReaderContext 是"Reader Context 有界探测"选书动作。
+	ActionProbeReaderContext = "Reader Context 有界探测"
 )
 
 // recoverySteps 是有界恢复链的固定步数（spec 决策 #7：refresh → retry → renewal →
@@ -104,7 +116,7 @@ type Options struct {
 	// 由 App 装配层提供；nil 表示无重建能力（防御：证据出现时按重建失败处理）。
 	RebuildLoginSession func() error
 
-	// Books 是候选 bookId（cfg.Books）；空 = 自动选书（ticket 09，当前直接报错）。
+	// Books 是候选 bookId（cfg.Books）；空 = 自动从 Shelf 选书（ticket 09）。
 	Books []string
 	// TargetMinMinutes/TargetMaxMinutes 是 Target Duration 随机范围（分钟）。
 	TargetMinMinutes int
@@ -158,11 +170,12 @@ func New(opts Options) *Runner {
 func (r *Runner) Run(ctx context.Context) (Result, error) {
 	o := r.opts
 
-	// 1. 选书：指定候选随机取一（用户故事 #18；自动选书 = ticket 09）。
-	//    本地决策先行：候选未配置时立即失败，不发起任何网络请求。
-	bookID, err := pickBook(o.RNG, o.Books)
-	if err != nil {
-		return Result{}, err
+	// 1. 选书：指定候选随机取一（用户故事 #18）；未指定 = 自动从 Shelf 选书（用户故事
+	//    #19–#23，ticket 09）——自动选书需要登录后访问 Shelf，故放在 renewal 之后。
+	autoSelect := len(o.Books) == 0
+	var bookID string
+	if !autoSelect {
+		bookID = o.Books[o.RNG.Intn(len(o.Books))]
 	}
 
 	// 2. Target Duration：每次 Task 只生成一次（用户故事 #16；seeded RNG 下确定性）。
@@ -174,7 +187,17 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		return Result{}, err
 	}
 
-	// 4. 读真实 Reading Progress 并建立 Reader Context（同一 Reader 页；CONTEXT.md）。
+	// 4. 自动选书（Shelf 元数据过滤 → 有界探测 Reader Context → 回退已读完可用书）。
+	if autoSelect {
+		var err error
+		bookID, err = r.selectFromShelf(ctx)
+		if err != nil {
+			return Result{}, err
+		}
+	}
+
+	// 5. 读真实 Reading Progress 并建立 Reader Context（同一 Reader 页；CONTEXT.md）。
+	//    （自动选书时选定书已在探测中抓取，命中 TTL 缓存即零额外请求。）
 	initial, err := r.fetchReaderState(ctx, bookID)
 	if err != nil {
 		return Result{}, err
@@ -184,7 +207,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		"book_id", bookID, "book_title", bookTitle,
 		"chapter_uid", initial.Progress.ChapterUID, "target", target.String())
 
-	// 5. enter report 建立 Reading Session（用户故事 #26）；被拒时按有界恢复链恢复。
+	// 6. enter report 建立 Reading Session（用户故事 #26）；被拒时按有界恢复链恢复。
 	now := o.Clock.Now()
 	enterResult, err := r.sendEnter(ctx, bookID, *initial, now)
 	if err != nil {
@@ -192,7 +215,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 	st, lastSent := enterResult.st, enterResult.at
 
-	// 6. 周期 timed report；rt 按 ADR-0004；本地累计达标即停止（用户故事 #27/#28）。
+	// 7. 周期 timed report；rt 按 ADR-0004；本地累计达标即停止（用户故事 #27/#28）。
 	//    被拒时按有界恢复链恢复（spec 决策 #7），恢复成功后 Task 继续。
 	next := lastSent.Add(DefaultRhythm)
 	var accumulated time.Duration
@@ -250,7 +273,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		next = lastSent.Add(DefaultRhythm)
 	}
 
-	// 7. success 终态先落盘，再发成功通知（spec 决策 #9/#10；用户故事 #39）。
+	// 8. success 终态先落盘，再发成功通知（spec 决策 #9/#10；用户故事 #39）。
 	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
 	if err := o.Terminal.Save(terminal.State{
 		LastTaskDate:   date,
@@ -459,10 +482,81 @@ func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error) er
 		weread.ErrLoginInvalid, evidence, cause, notify.LoginInvalidPrompt)
 }
 
-// pickBook 从候选书随机取一本；空候选 = 自动选书（ticket 09 交付，当前明确报错）。
-func pickBook(rng *rand.Rand, books []string) (string, error) {
-	if len(books) == 0 {
-		return "", errors.New("WEREAD_CRON_BOOKS 未配置：自动从 Shelf 选书由 ticket 09 交付")
+// selectFromShelf 自动从 Shelf 选书（spec 决策 #6；用户故事 #19–#23）：
+//  1. 抓取 Shelf（需登录后访问，故在 renewal 之后）；
+//  2. 元数据过滤：未读完（finishReading != 1）优先、已读完作为回退层；
+//     无 bookId/title 的条目不可建 Reader Context，直接过滤；
+//  3. 有界探测：对候选依次抓取 Reader 页（Reader Context 验证可建）——每层
+//     不超过 DefaultMaxSelectionProbes 次，失败换下一本；选定的书命中 Reader
+//     缓存（随后 fetchReaderState 零额外请求，进入上报即用探测时的 Context）；
+//  4. 全部不可用 → failBookSelection（failed 终态 + 失败通知）。
+//
+// 与任务级恢复链的姿态一致：Shelf 抓取失败（传输/HTTP/解析）按暂时性失败处理
+// （不写终态、不通知，当日可再次调度）；只有"Shelf 有数据但无可用书"才是本 Task
+// 的失败（终态 + 失败通知——书可用性的数据问题，重跑大概率依旧失败）。
+func (r *Runner) selectFromShelf(ctx context.Context) (string, error) {
+	o := r.opts
+	shelf, err := o.Client.Shelf(ctx)
+	if err != nil {
+		return "", fmt.Errorf("抓取 Shelf 失败: %w", err)
 	}
-	return books[rng.Intn(len(books))], nil
+
+	var unread, finished []weread.ShelfBook
+	for _, b := range shelf {
+		if b.BookID == "" || b.Title == "" {
+			continue // 无效条目（无 bookId/title）不可建 Reader Context
+		}
+		if b.FinishReading {
+			finished = append(finished, b)
+		} else {
+			unread = append(unread, b)
+		}
+	}
+
+	probe := func(tier []weread.ShelfBook) (string, bool) {
+		for i, b := range tier {
+			if i >= DefaultMaxSelectionProbes {
+				return "", false
+			}
+			if _, err := o.Reader.Fetch(ctx, b.BookID); err != nil {
+				o.Logger.Info("候选书探测不可用，换下一本", "book_id", b.BookID, "err", err)
+				continue
+			}
+			o.Logger.Info("自动选书命中", "book_id", b.BookID, "book_title", b.Title)
+			return b.BookID, true
+		}
+		return "", false
+	}
+
+	if id, ok := probe(unread); ok {
+		return id, nil
+	}
+	if id, ok := probe(finished); ok {
+		return id, nil
+	}
+	return "", r.failBookSelection(ctx, len(shelf), len(unread), len(finished))
+}
+
+// failBookSelection 输出自动选书失败的失败结果：failed 终态先落盘、再发失败通知
+// （spec 决策 #9/#10：失败阶段、主要错误、已尝试动作；通知失败不影响 Task 结果）。
+// 返回的错误供调用方报告（最终由 CLI 以非零退出码呈现）。
+func (r *Runner) failBookSelection(ctx context.Context, shelfCount, unreadCount, finishedCount int) error {
+	o := r.opts
+	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
+	detail := fmt.Sprintf("书架 %d 本（未读完 %d 本、已读完 %d 本）均无法建立 Reader Context（探测上限 %d）",
+		shelfCount, unreadCount, finishedCount, DefaultMaxSelectionProbes)
+	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
+		o.Logger.Warn("自动选书失败时写入 failed 终态失败", "err", err)
+	}
+	if o.Notify != nil {
+		if err := o.Notify.NotifyFailure(ctx, notify.Failure{
+			Date:    date,
+			Stage:   StageBookSelection,
+			Error:   detail,
+			Actions: []string{ActionShelfFilter, ActionProbeReaderContext},
+		}); err != nil {
+			o.Logger.Warn("失败通知发送失败（不影响 Task 结果）", "err", err)
+		}
+	}
+	return fmt.Errorf("自动选书失败：%s", detail)
 }

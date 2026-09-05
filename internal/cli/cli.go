@@ -9,8 +9,11 @@
 // 进程级行为（退出码、stdout 摘要、stderr）由本层负责。ticket 08 交付 run 的
 // 终态规则（success 拒绝、failed 重试）与并发守卫的进程级呈现：success 拒绝原因
 // 按 issue 验收口径输出到 stdout（约定退出码 ExitRunRejected）；其余非零情形
-// （含运行中拒绝）按“全部非零情形须在 stderr 指明原因”的约定输出到 stderr。
-// 无 force 选项：`run --force` 落入“不接受额外参数”的用法错误。
+// （含运行中拒绝）按"全部非零情形须在 stderr 指明原因"的约定输出到 stderr。
+// 无 force 选项：`run --force` 落入"不接受额外参数"的用法错误。
+// `weread-cron books`（ticket 09）经同一应用边界列出 Shelf 的 bookId 与 title
+// （每行一条，制表符分隔）；会话失效时在 stderr 报错并提示更新初始 Cookie
+// （不静默；ExitConfig）；Task 运行中被并发守卫拒绝（ExitRunRejected）。
 package cli
 
 import (
@@ -27,6 +30,7 @@ import (
 	"weread-cron/internal/scheduler"
 	"weread-cron/internal/session"
 	"weread-cron/internal/task"
+	"weread-cron/internal/weread"
 )
 
 // 退出码（全部非零情形须指示原因）。
@@ -44,10 +48,13 @@ const (
 	ExitRunRejected = 3
 )
 
-// App 是 run 子命令依赖的应用边界（生产实现 = internal/app；测试注入 fake）。
+// App 是 run/books 子命令依赖的应用边界（生产实现 = internal/app；测试注入 fake）。
 type App interface {
 	// RunTask 完整执行一次 Task。
 	RunTask(ctx context.Context) (task.Result, error)
+	// ListBooks 列出当前 Shelf 的 bookId 与 title（纯查询：不产生 Task、
+	// 不读写终态、不通知；内部执行 renewal 并可持久化 Login Session）。
+	ListBooks(ctx context.Context) ([]weread.ShelfBook, error)
 }
 
 // appFactory 按配置装配 App。
@@ -119,9 +126,31 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 		printTaskSummary(stdout, res)
 		return ExitOK
 	case cmdBooks:
-		// 占位路由（ticket 09 交付书架查询）。
-		fmt.Fprintln(stderr, "weread-cron: books 尚未实现（ticket 09 交付书架查询）")
-		return ExitConfig
+		// ticket 09：纯查询——列出 Shelf 的 bookId 与 title（会话恢复/初始化与
+		// renewal 在应用边界内完成；不产生 Task、不碰终态、不发通知）。
+		a, err := makeApp(cfg, logger)
+		if err != nil {
+			fmt.Fprintf(stderr, "weread-cron: 装配失败: %v\n", err)
+			return ExitConfig
+		}
+		books, err := a.ListBooks(ctx)
+		switch {
+		case errors.Is(err, weread.ErrLoginInvalid):
+			// issue 验收：会话失效时报错并提示更新初始 Cookie（不静默）。
+			fmt.Fprintf(stderr, "weread-cron: 登录已失效，books 查询失败: %v\n%s\n", err, notify.LoginInvalidPrompt)
+			return ExitConfig
+		case errors.Is(err, app.ErrTaskRunning):
+			fmt.Fprintln(stderr, "weread-cron: 已有 Task 正在运行，拒绝并发执行 books 查询")
+			return ExitRunRejected
+		case err != nil:
+			fmt.Fprintf(stderr, "weread-cron: books 查询失败: %v\n", err)
+			return ExitConfig
+		}
+		for _, b := range books {
+			// 每行一条：bookId 与 title 以制表符分隔（脚本可直接 cut 取用）。
+			fmt.Fprintf(stdout, "%s\t%s\n", b.BookID, b.Title)
+		}
+		return ExitOK
 	}
 	return ExitOK
 }

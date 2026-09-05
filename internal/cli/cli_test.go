@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -15,6 +16,7 @@ import (
 	"weread-cron/internal/app"
 	"weread-cron/internal/config"
 	"weread-cron/internal/task"
+	"weread-cron/internal/weread"
 )
 
 // syncBuffer 是并发安全的输出缓冲，供 daemon 阻塞路径测试读取启动标记。
@@ -228,44 +230,124 @@ func TestDaemonStartsWithPersistedLoginSessionAndNoCookie(t *testing.T) {
 	}
 }
 
-func TestRunWithoutBooksFailsFast(t *testing.T) {
+// TestRunWithoutBooksNoLongerFailsFast：ticket 09 起未配置候选书是合法输入
+// （自动从 Shelf 选书），不再于 CLI 层快速失败；自动选书行为（含全部候选不可用 →
+// Task 失败）由应用 seam 覆盖（internal/app/autoselect_test.go）。
+func TestRunWithoutBooksNoLongerFailsFast(t *testing.T) {
 	env := testEnv(t, withCookie(t))
 	var stdout, stderr syncBuffer
-	code := Run(context.Background(), []string{"run"}, env, &stdout, &stderr)
-	if code != ExitConfig {
-		t.Errorf("退出码 = %d，期望 %d（候选未配置应明确失败）", code, ExitConfig)
-	}
-	if !strings.Contains(stderr.String(), config.EnvBooks) {
-		t.Errorf("stderr 应指明 WEREAD_CRON_BOOKS；实际:\n%s", stderr.String())
-	}
-	if !strings.Contains(stderr.String(), "自动从 Shelf 选书") {
-		t.Errorf("stderr 应说明自动选书未实现；实际:\n%s", stderr.String())
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{res: task.Result{Date: "2025-09-06", BookID: "601111", BookTitle: "自动选书书", Planned: time.Minute, Actual: time.Minute, Reports: 2}}, nil
+		})
+	if code != ExitOK {
+		t.Errorf("未配置候选书不再失败（自动选书），退出码 = %d；stderr=%s", code, stderr.String())
 	}
 }
 
-func TestBooksPlaceholder(t *testing.T) {
+// --- ticket 09：books 子命令（进程级呈现；应用层行为见 internal/app/books_test.go）---
+
+func TestBooksPrintsBookIdAndTitle(t *testing.T) {
 	env := testEnv(t, withCookie(t))
 	var stdout, stderr syncBuffer
-	code := Run(context.Background(), []string{"books"}, env, &stdout, &stderr)
-	if code != ExitConfig {
-		t.Errorf("退出码 = %d，期望 %d（占位应明确失败）", code, ExitConfig)
+	code := runWithApp(context.Background(), []string{"books"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{books: []weread.ShelfBook{
+				{BookID: "695233", Title: "三体全集"},
+				{BookID: "888888", Title: "活着"},
+			}}, nil
+		})
+	if code != ExitOK {
+		t.Errorf("退出码 = %d，期望 %d; stderr=%s", code, ExitOK, stderr.String())
 	}
-	if !strings.Contains(stderr.String(), "books 尚未实现") {
-		t.Errorf("stderr 缺少占位提示；实际:\n%s", stderr.String())
+	want := "695233\t三体全集\n888888\t活着\n"
+	if stdout.String() != want {
+		t.Errorf("stdout = %q，期望每行 bookId\ttitle\n%s", stdout.String(), want)
+	}
+	if stderr.String() != "" {
+		t.Errorf("成功时 stderr 应为空；实际:\n%s", stderr.String())
 	}
 }
 
-// fakeApp 是 run 子命令的可注入 App（进程内行为测试：退出码/stdout/stderr）。
+// TestBooksSessionInvalidPromptsCookieUpdate：books 会话失效（renewal 明确拒绝）→
+// 报错并提示更新初始 Cookie（issue 验收：不静默），退出码 ExitConfig。
+func TestBooksSessionInvalidPromptsCookieUpdate(t *testing.T) {
+	env := testEnv(t, withCookie(t))
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"books"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{booksErr: fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 后 renewal 仍失败", weread.ErrLoginInvalid)}, nil
+		})
+	if code != ExitConfig {
+		t.Errorf("退出码 = %d，期望 %d（会话失效应失败）", code, ExitConfig)
+	}
+	for _, want := range []string{"登录已失效", "请更新初始 Cookie", config.EnvCookie} {
+		if !strings.Contains(stderr.String(), want) {
+			t.Errorf("stderr 缺少 %q；实际:\n%s", want, stderr.String())
+		}
+	}
+	if stdout.String() != "" {
+		t.Errorf("失败时不应输出书架；实际:\n%s", stdout.String())
+	}
+}
+
+// TestBooksQueryFailureExitsNonZero：其他查询失败（暂时性/服务端错误）→ 非零退出 + stderr 原因。
+func TestBooksQueryFailureExitsNonZero(t *testing.T) {
+	env := testEnv(t, withCookie(t))
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"books"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{booksErr: errors.New("抓取 Shelf 失败: HTTP 500")}, nil
+		})
+	if code != ExitConfig {
+		t.Errorf("退出码 = %d，期望 %d", code, ExitConfig)
+	}
+	if !strings.Contains(stderr.String(), "books 查询失败") {
+		t.Errorf("stderr 应说明查询失败；实际:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "登录已失效") {
+		t.Errorf("普通失败不得套登录失效文案；实际:\n%s", stderr.String())
+	}
+}
+
+// TestBooksRejectedWhenTaskRunning：已有 Task 运行中 → books 被拒绝（并发守卫与
+// Task 共用：避免会话写竞争），退出码 ExitRunRejected + stderr 说明。
+func TestBooksRejectedWhenTaskRunning(t *testing.T) {
+	env := testEnv(t, withCookie(t))
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"books"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{booksErr: app.ErrTaskRunning}, nil
+		})
+	if code != ExitRunRejected {
+		t.Errorf("退出码 = %d，期望 %d", code, ExitRunRejected)
+	}
+	if !strings.Contains(stderr.String(), "正在运行") {
+		t.Errorf("stderr 应说明拒绝原因；实际:\n%s", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Errorf("拒绝时不应输出书架；实际:\n%s", stdout.String())
+	}
+}
+
+// fakeApp 是 run/books 子命令的可注入 App（进程内行为测试：退出码/stdout/stderr）。
 // calls 记录 RunTask 被调用次数（run 不受窗口限制的断言用）。
 type fakeApp struct {
 	res   task.Result
 	err   error
 	calls int
+
+	books    []weread.ShelfBook
+	booksErr error
 }
 
 func (f *fakeApp) RunTask(ctx context.Context) (task.Result, error) {
 	f.calls++
 	return f.res, f.err
+}
+
+func (f *fakeApp) ListBooks(ctx context.Context) ([]weread.ShelfBook, error) {
+	return f.books, f.booksErr
 }
 
 func TestRunTaskSuccessPrintsSummary(t *testing.T) {

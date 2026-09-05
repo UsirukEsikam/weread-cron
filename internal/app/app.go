@@ -184,3 +184,49 @@ func (a *App) checkTerminalGate() error {
 	}
 	return nil
 }
+
+// ListBooks 交付 `weread-cron books`（ticket 09；spec 决策 #12）：纯查询——列出
+// 当前 Shelf 的 bookId 与 title。
+//
+// 复用 daemon 的 Login Session 机制：session.New 恢复/初始化（无持久化会话时用初始
+// Cookie 建立并落盘）→ renewal（新 Cookie 并入会话并持久化）→ 凭明确证据判定登录
+// 失效时从初始 Cookie 重建一次并重试（与 Task 同姿态）。
+//
+// 边界（issue 验收）：不产生 Task、不读取或修改 Terminal State、不发送通知；
+// 并发守卫与 Task 共用 runMu（避免与运行中 Task 的会话写竞争，运行中返回
+// ErrTaskRunning）。renewal 重建仍失败时返回包装 weread.ErrLoginInvalid 的错误
+// （含更新初始 Cookie 的明确提示；CLI 负责进程级呈现）。
+func (a *App) ListBooks(ctx context.Context) ([]weread.ShelfBook, error) {
+	if !a.runMu.TryLock() {
+		return nil, ErrTaskRunning
+	}
+	defer a.runMu.Unlock()
+
+	sess, err := session.New(a.deps.Sessions, a.cfg.Cookie)
+	if err != nil {
+		return nil, err
+	}
+	current := sess
+	client := weread.NewClient(a.deps.WereadBaseURL, a.deps.HTTPClient, a.deps.UserAgent,
+		func() string { return current.CookieHeader() },
+		func(cookies []*http.Cookie) error { return current.MergeAndSaveCookies(cookies) })
+
+	if err := client.Renewal(ctx); err != nil {
+		if !errors.Is(err, weread.ErrLoginInvalid) {
+			// 暂时性失败（传输/HTTP 非 200/解析失败）：按普通查询错误报告，不套
+			// 登录失效文案（checklist #2 判别边界与 Task 一致）。
+			return nil, fmt.Errorf("登录 renewal 失败: %w", err)
+		}
+		a.deps.Logger.Warn("books 检测到登录失效（renewal 明确拒绝），从初始 Cookie 重建 Login Session", "err", err)
+		ns, rerr := session.Rebuild(a.deps.Sessions, a.cfg.Cookie)
+		if rerr != nil {
+			return nil, fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 失败: %v", weread.ErrLoginInvalid, rerr)
+		}
+		current = ns
+		if err2 := client.Renewal(ctx); err2 != nil {
+			return nil, fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 后 renewal 仍失败: %v", weread.ErrLoginInvalid, err2)
+		}
+	}
+
+	return client.Shelf(ctx)
+}

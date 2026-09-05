@@ -102,6 +102,31 @@ type fakeWeread struct {
 	//（用于注入"响应期间时钟跳变"模拟 suspend）。
 	blockTimed          chan struct{}
 	blockTimedTriggered chan struct{}
+
+	// shelfBooks 是 /web/shelf/sync 返回的书架条目（默认 nil = 空书架）。
+	shelfBooks []fakeShelfBook
+	// shelfStatus 非零时 /web/shelf/sync 返回该 HTTP 状态（暂时性故障注入）。
+	shelfStatus int
+	// shelfErrCode 非零时 /web/shelf/sync 返回 errCode!=0 的信封错误（如 -2010）。
+	shelfErrCode int
+
+	// readerFailByBook / readerNoStateByBook 以 EncodeID(bookId) 为键：探测不可用
+	// 的书（Reader 页 HTTP 500 / 不含 __INITIAL_STATE__ 的 HTML）。
+	readerFailByBook    map[string]bool
+	readerNoStateByBook map[string]bool
+	// readerProgressByBook 以 EncodeID(bookId) 为键：覆盖 Reader 页 progress
+	// （默认 35）——progress=100% 场景断言用。
+	readerProgressByBook map[string]int
+	// readerTitleByBook 以 EncodeID(bookId) 为键：覆盖 Reader 页 bookInfo.title
+	// （默认 testBookTitle）——自动选书书名断言用。
+	readerTitleByBook map[string]string
+}
+
+// fakeShelfBook 是 fake 服务端返回的书架条目（与 weread.ShelfBook 对应）。
+type fakeShelfBook struct {
+	BookID        string
+	Title         string
+	FinishReading bool
 }
 
 func newFakeWeread(t *testing.T) *fakeWeread {
@@ -113,6 +138,7 @@ func (f *fakeWeread) Handler() http.Handler {
 	mux.HandleFunc("/web/login/renewal", f.handleRenewal)
 	mux.HandleFunc("/web/reader/", f.handleReaderPage)
 	mux.HandleFunc("/web/book/read", f.handleReport)
+	mux.HandleFunc("/web/shelf/sync", f.handleShelf)
 	return mux
 }
 
@@ -207,16 +233,85 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	n := f.readerFetches
 	rotate := f.rotateReaderState
 	fail := f.readerFailAt > 0 && n == f.readerFailAt
+	enc := f.lastReaderEncoded
+	perBookFail := f.readerFailByBook[enc]
+	perBookNoState := f.readerNoStateByBook[enc]
+	progressOverride, hasProgress := f.readerProgressByBook[enc]
+	titleOverride, hasTitle := f.readerTitleByBook[enc]
 	f.mu.Unlock()
-	if fail {
+	if fail || perBookFail {
 		http.Error(w, "reader page unavailable", http.StatusInternalServerError)
 		return
 	}
+	if perBookNoState {
+		io.WriteString(w, `<html><body><div>这本书不可阅读</div></body></html>`)
+		return
+	}
 	if rotate {
-		io.WriteString(w, readerPageHTMLWith(fmt.Sprintf("fake-reader-token-%d", n), fmt.Sprintf("fake-psvts-%d", n)))
+		io.WriteString(w, readerPageHTMLWithProgress(fmt.Sprintf("fake-reader-token-%d", n), fmt.Sprintf("fake-psvts-%d", n), progressOr(hasProgress, progressOverride, 35)))
+		return
+	}
+	if hasProgress || hasTitle {
+		title := testBookTitle
+		if hasTitle {
+			title = titleOverride
+		}
+		io.WriteString(w, readerPageHTMLWithTitleProgress(title, testReaderToken, testPsvts, progressOr(hasProgress, progressOverride, 35)))
 		return
 	}
 	io.WriteString(w, readerPageHTML())
+}
+
+// progressOr 返回 v 或默认值（rotate 路径的进度覆盖合并）。
+func progressOr(set bool, v, def int) int {
+	if set {
+		return v
+	}
+	return def
+}
+
+// handleShelf 扮演 /web/shelf/sync（纯 Cookie 书架接口；ticket 09）：按 shelfBooks
+// 构造 {"books":[...]} 响应；shelfStatus/shelfErrCode 注入故障。
+func (f *fakeWeread) handleShelf(w http.ResponseWriter, r *http.Request) {
+	f.record(r)
+	if r.Method != http.MethodGet {
+		f.t.Errorf("shelf 方法 = %s，期望 GET", r.Method)
+	}
+	if r.Header.Get("User-Agent") != weread.DefaultUserAgent {
+		f.t.Errorf("shelf UA = %q", r.Header.Get("User-Agent"))
+	}
+	f.mu.Lock()
+	status, errCode := f.shelfStatus, f.shelfErrCode
+	books := append([]fakeShelfBook(nil), f.shelfBooks...)
+	f.mu.Unlock()
+	if status != 0 {
+		w.WriteHeader(status)
+		fmt.Fprint(w, `{"errCode":500,"errMsg":"boom"}`)
+		return
+	}
+	if errCode != 0 {
+		fmt.Fprintf(w, `{"errCode":%d,"errMsg":"not authorized"}`, errCode)
+		return
+	}
+	type entry struct {
+		BookID        string `json:"bookId"`
+		Title         string `json:"title"`
+		FinishReading int    `json:"finishReading"`
+	}
+	list := make([]entry, 0, len(books))
+	for _, b := range books {
+		fr := 0
+		if b.FinishReading {
+			fr = 1
+		}
+		list = append(list, entry{BookID: b.BookID, Title: b.Title, FinishReading: fr})
+	}
+	raw, err := json.Marshal(map[string]any{"books": list})
+	if err != nil {
+		f.t.Errorf("shelf 序列化失败: %v", err)
+		return
+	}
+	w.Write(raw)
 }
 
 func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
@@ -276,6 +371,18 @@ func readAll(r *http.Request) []byte {
 
 // readerPageHTMLWith 用指定 token/psvts 生成 Reader 页（恢复链刷新断言用）。
 func readerPageHTMLWith(readerToken, psvts string) string {
+	return readerPageHTMLWithProgress(readerToken, psvts, 35)
+}
+
+// readerPageHTMLWithProgress 用指定 token/psvts/progress 生成 Reader 页
+// （progress=100% 等场景断言用）。
+func readerPageHTMLWithProgress(readerToken, psvts string, progress int) string {
+	return readerPageHTMLWithTitleProgress(testBookTitle, readerToken, psvts, progress)
+}
+
+// readerPageHTMLWithTitleProgress 用指定书名/token/psvts/progress 生成 Reader 页
+// （自动选书生名断言与 progress 断言共用）。
+func readerPageHTMLWithTitleProgress(title, readerToken, psvts string, progress int) string {
 	state := map[string]any{
 		"reader": map[string]any{
 			"psvts": psvts,
@@ -283,7 +390,7 @@ func readerPageHTMLWith(readerToken, psvts string) string {
 			"token": readerToken,
 			"bookInfo": map[string]any{
 				"bookId": testBookID,
-				"title":  testBookTitle,
+				"title":  title,
 			},
 			"currentChapter": map[string]any{
 				"chapterUid":    testChapter,
@@ -295,7 +402,7 @@ func readerPageHTMLWith(readerToken, psvts string) string {
 					"chapterUid":    testChapter,
 					"chapterIdx":    3,
 					"chapterOffset": 1234,
-					"progress":      35,
+					"progress":      progress,
 					"summary":       testSummary,
 				},
 			},
@@ -305,7 +412,7 @@ func readerPageHTMLWith(readerToken, psvts string) string {
 	if err != nil {
 		panic(err)
 	}
-	return `<html><head><title>` + testBookTitle + `</title></head><body>` +
+	return `<html><head><title>` + title + `</title></head><body>` +
 		`<script>window.__INITIAL_STATE__ = ` + string(raw) + `; (function(){ /* ... */ })();</script>` +
 		`</body></html>`
 }

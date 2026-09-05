@@ -230,27 +230,27 @@ func TestSeamDaemonStartsAndStopsCleanly(t *testing.T) {
 	}
 }
 
-func TestSeamRunWithoutBooksFailsFast(t *testing.T) {
+// TestSeamBooksWithoutAuthFailsFast：`weread-cron books` 无初始 Cookie 且无持久化
+// Login Session → 启动前置条件不满足，快速失败（exit 1 + 指明 WEREAD_CRON_COOKIE）。
+// books 的成功路径（fake Shelf 服务端 + 输出 bookId/title）在应用 seam 覆盖：
+// 子进程 seam 无法注入 test server（真实二进制固定访问 weread.qq.com）。
+func TestSeamBooksWithoutAuthFailsFast(t *testing.T) {
 	start := time.Now()
-	code, _, stderr := runBin(t, []string{"run"}, baseEnv(t))
-	if code != 1 {
-		t.Errorf("退出码 = %d，期望 1（候选未配置应明确失败）", code)
+	var env []string
+	for _, kv := range baseEnv(t) {
+		if !strings.HasPrefix(kv, "WEREAD_CRON_COOKIE=") {
+			env = append(env, kv)
+		}
 	}
-	if !strings.Contains(stderr, "WEREAD_CRON_BOOKS") {
-		t.Errorf("stderr 应指明 WEREAD_CRON_BOOKS；实际:\n%s", stderr)
+	code, _, stderr := runBin(t, []string{"books"}, env)
+	if code != 1 {
+		t.Errorf("退出码 = %d，期望 1", code)
+	}
+	if !strings.Contains(stderr, "WEREAD_CRON_COOKIE") {
+		t.Errorf("stderr 应指明 WEREAD_CRON_COOKIE；实际:\n%s", stderr)
 	}
 	if elapsed := time.Since(start); elapsed > 10*time.Second {
-		t.Errorf("候选未配置应快速失败，耗时 %v", elapsed)
-	}
-}
-
-func TestSeamBooksPlaceholder(t *testing.T) {
-	code, _, stderr := runBin(t, []string{"books"}, baseEnv(t))
-	if code != 1 {
-		t.Errorf("退出码 = %d，期望 1（占位应明确失败）", code)
-	}
-	if !strings.Contains(stderr, "books 尚未实现") {
-		t.Errorf("stderr 缺少占位提示；实际:\n%s", stderr)
+		t.Errorf("缺 Cookie 应快速失败，耗时 %v", elapsed)
 	}
 }
 
