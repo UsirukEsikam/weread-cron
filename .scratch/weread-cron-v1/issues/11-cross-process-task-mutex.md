@@ -5,7 +5,7 @@
 **Finding:** F1 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** bug
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 同一 deployment（同一 /data）内 daemon 与 `weread-cron run` 的跨进程 Task 互斥：已有 Task 运行时第二个 Task（自动或手动）被拒绝。
 
@@ -25,12 +25,12 @@ Task 并发守卫是进程内 `sync.Mutex`（TryLock 非阻塞拒绝，返回 `E
 
 ## Acceptance criteria
 
-- [ ] daemon Task 运行中，另一进程执行 `weread-cron run` 被拒绝（`ErrTaskRunning` 语义、非阻塞）
-- [ ] `run` 运行时，daemon 到点不启动第二个 Task
-- [ ] 锁持有进程正常退出/崩溃后，后续 Task 可正常执行（锁自动释放）
-- [ ] 同一进程内多协程并发 RunTask 仍被拒绝（进程内守卫回归）
-- [ ] 不同 /data（不同 deployment）互不互斥（范围边界保持）
-- [ ] 拒绝路径不中断运行中的 Task
+- [x] daemon Task 运行中，另一进程执行 `weread-cron run` 被拒绝（`ErrTaskRunning` 语义、非阻塞）
+- [x] `run` 运行时，daemon 到点不启动第二个 Task
+- [x] 锁持有进程正常退出/崩溃后，后续 Task 可正常执行（锁自动释放）
+- [x] 同一进程内多协程并发 RunTask 仍被拒绝（进程内守卫回归）
+- [x] 不同 /data（不同 deployment）互不互斥（范围边界保持）
+- [x] 拒绝路径不中断运行中的 Task
 
 ## Out of scope
 
@@ -46,3 +46,19 @@ Review 输入 F1 已对当前代码确认：
 - CLI 每次命令调用都新建 App（internal/cli 的 `prodApp` → `app.New`）；daemon 与 run 是独立进程、独立 mutex。
 - 代码库无 flock / O_EXCL / 锁文件等跨进程机制。
 - spec 决策 #11 的"多实例防重不在 V1 范围"指不同 deployment/instance 的协调；同一 deployment 内 daemon 与正式支持的 run 入口互斥属于 V1 要求（用户故事 #43）。本次为修复该实现缺口，不扩展为多实例协调。
+
+## Answer
+
+实现「同一 deployment 内跨进程 Task 互斥」（spec 决策 #11；ADR-0008），三处新代码面 + 一个进程级测试面：
+
+1. **跨进程锁载体（internal/filelock，全新包）**：`/data/task.lock` 锁文件 + `flock(2)` `LOCK_EX|LOCK_NB`（非阻塞）。选 flock 而非 `O_EXCL` 锁文件 / fcntl 记录锁 / PID 协商的取舍记录在 ADR-0008：内核随持有进程退出/崩溃自动释放（无残留卡死）、非阻塞语义与 TryLock 一致、锁绑定 open file description（同一进程内两次独立 open 也互斥）、无第三方依赖。
+2. **并发守卫升级（internal/app/app.go）**：`acquireTaskGuard` = 进程内 `runMu`（第一道、零 I/O，ticket 08 语义与回归不变）+ 跨进程 flock（`ErrLocked` → `ErrTaskRunning`；其他失败 → 明确错误保守失败，不执行 Task）。`RunTask` 与 `ListBooks` 共用该守卫；释放顺序先跨进程锁、后 runMu（Task 结束后进程内后续调用不会被未释放的跨进程锁误拒）。
+3. **错误定义收拢（internal/task）**：`ErrTaskRunning` 改为在 task 包定义、app 别名导出——scheduler 判别该错误若依赖 app 会与 daemon 集成测试（app 包内 import scheduler）形成测试编译环。
+4. **daemon 拒绝语义（internal/scheduler）**：到点执行被并发守卫拒绝（另一进程手动 run 运行中）按非失败处理：Info 级日志「另一进程正在运行 Task，本次自动执行被拒绝（窗口内继续排定）」+ 窗口内重排；不进入 Warn 的"执行失败"文案、不写终态。
+5. **进程级测试（internal/app/crossprocess_test.go）**：测试二进制自启动子进程模式（每子进程 = 独立 OS 进程 + 独立 App + 独立 runMu，与生产 daemon/run 进程形态一致）——跨进程 run 拒绝（ErrTaskRunning、零网络请求、不中断运行中的 Task）、books 共用守卫拒绝、正常退出后锁自动释放（父进程转落入终态规则 ErrTerminalSuccess，严格证明锁已释放）、SIGKILL 崩溃后锁自动释放（父进程完整执行 Task 并落 success 终态）、不同 /data 下两个子进程同时运行 Task 互不干扰。进程内回归（多协程 RunTask 拒绝）由既有 `TestRunConcurrentSecondTaskRejected` / `TestListBooksRejectedWhileTaskRunning` 保持。
+
+### 范围说明
+
+互斥范围严格按 /data 隔离：daemon 睡眠等待期不持锁（锁只覆盖 Task 执行期）；跨主机多实例协调不在 V1 范围（spec 决策 #11 边界不变）。锁文件常驻 /data（零字节，内容不使用），不随释放删除。
+
+**Commit:** 1a7b183
