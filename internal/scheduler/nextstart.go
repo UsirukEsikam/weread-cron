@@ -11,9 +11,6 @@ import (
 	"weread-cron/internal/terminal"
 )
 
-// dayLayout 是 Terminal State 日期与调度的日期格式（cfg.TZ 下 YYYY-MM-DD）。
-const dayLayout = "2006-01-02"
-
 // Window 是每日 Run Window（分钟数，自当天 00:00 起）。只约束 Task 的**开始**时刻
 // （ADR-0001）：任务启动后读满目标时长，允许越过窗口结束点。Start==End = 固定启动
 // 时刻（合法）。
@@ -60,7 +57,7 @@ func NextStart(now time.Time, win Window, last terminal.State, tz *time.Location
 	tomorrow := time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, tz)
 
 	// 终态门控：当天已有终态（无论 success/failed）→ 明天窗口内随机。
-	if last.LastTaskDate == t.Format(dayLayout) {
+	if last.LastTaskDate == terminal.TodayKey(t, tz) {
 		return randomInWindow(tomorrow, win, rng), nil
 	}
 

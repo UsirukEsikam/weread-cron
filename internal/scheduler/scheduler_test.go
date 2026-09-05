@@ -71,7 +71,7 @@ func (r *recordingRunner) RunTask(ctx context.Context) (task.Result, error) {
 	if r.err != nil {
 		if r.failTerminal && r.term != nil {
 			_ = r.term.Save(terminal.State{
-				LastTaskDate:   r.clk.Now().In(r.tz).Format(dayLayout),
+				LastTaskDate:   r.clk.Now().In(r.tz).Format(terminal.DayLayout),
 				LastTaskResult: terminal.ResultFailed,
 			})
 		}
@@ -79,7 +79,7 @@ func (r *recordingRunner) RunTask(ctx context.Context) (task.Result, error) {
 	}
 	if r.term != nil {
 		if err := r.term.Save(terminal.State{
-			LastTaskDate:   r.clk.Now().In(r.tz).Format(dayLayout),
+			LastTaskDate:   r.clk.Now().In(r.tz).Format(terminal.DayLayout),
 			LastTaskResult: terminal.ResultSuccess,
 		}); err != nil {
 			return task.Result{}, err
@@ -222,7 +222,7 @@ func TestDaemonRechecksTerminalBeforeStart(t *testing.T) {
 	hook := func(now time.Time) {
 		if !now.In(testLoc).Before(at(2025, 9, 6, 23, 31)) {
 			if err := terminal.NewFileStore(cfg.DataDir).Save(terminal.State{
-				LastTaskDate:   now.In(testLoc).Format(dayLayout),
+				LastTaskDate:   now.In(testLoc).Format(terminal.DayLayout),
 				LastTaskResult: terminal.ResultSuccess,
 			}); err != nil {
 				t.Fatal(err)

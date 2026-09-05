@@ -1764,6 +1764,8 @@ func TestRunRenewalNoSuccIsNotLoginInvalid(t *testing.T) {
 
 // TestRunRestartRestoresRenewedSession 断言跨进程重启（新 App + 同一 /data）：
 // 恢复的是上次运行 renewal 后落盘的最新会话，而非初始 Cookie（用户故事 #7/#9）。
+// 重启场景取次日（ticket 08：当天 success 终态下 run 被拒绝执行——同一天重启后
+// 再 run 正是终态规则的拒绝场景，会话恢复语义由次日场景覆盖）。
 func TestRunRestartRestoresRenewedSession(t *testing.T) {
 	h := setup(t, nil)
 	if _, err := h.runTask(context.Background()); err != nil {
@@ -1771,12 +1773,14 @@ func TestRunRestartRestoresRenewedSession(t *testing.T) {
 	}
 	firstRequests := len(h.weread.snapshot())
 
-	// 重启：同一 /data、初始 Cookie 已更换（模拟运维更新 env）；
+	// 重启：同一 /data、初始 Cookie 已更换（模拟运维更新 env）；时钟推进到次日
+	//（昨日 success 终态不约束今天——ticket 08 的"只约束当天"语义同时被断言）；
 	// 复用同一 fake 服务端以便观察重启后首笔请求携带的 Cookie。
 	h2 := setup(t, func(h2 *testHarness) {
 		h2.cfg.DataDir = h.cfg.DataDir
 		h2.cfg.Cookie = "wr_gid=replaceme"
 		h2.weread = h.weread
+		h2.clk = clock.NewFake(time.Date(2025, 9, 7, 10, 0, 0, 0, testTZ))
 	})
 	if _, err := h2.runTask(context.Background()); err != nil {
 		t.Fatalf("重启后运行失败: %v", err)
@@ -1797,5 +1801,207 @@ func TestRunRestartRestoresRenewedSession(t *testing.T) {
 	}
 	if strings.Contains(string(sessData), "replaceme") || !strings.Contains(string(sessData), `"value": "new123"`) {
 		t.Errorf("Login Session 文件应含 new123 且不含 replaceme:\n%s", sessData)
+	}
+}
+
+// --- ticket 08：run 终态规则（success 拒绝 / failed 重试）与并发守卫 ---
+
+// seedTerminal 直接预置持久化 Terminal State（issue 08：failed 终态是 run 的合法
+// 输入状态，测试可直接 seed 持久化文件，无需经由 ticket 05 的真实失败路径）。
+func seedTerminal(t *testing.T, dir string, st terminal.State) {
+	t.Helper()
+	if err := terminal.NewFileStore(dir).Save(st); err != nil {
+		t.Fatalf("预置 Terminal State 失败: %v", err)
+	}
+}
+
+// TestRunNoGateWhenNoTerminal 断言无终态为 run 的默认输入：完整执行并写 success
+// 终态（用户故事 #42 的基线——由 ticket 03 happy path 与本文档共同覆盖）。
+func TestRunNoGateWhenNoTerminal(t *testing.T) {
+	h := setup(t, nil)
+	if _, err := h.runTask(context.Background()); err != nil {
+		t.Fatalf("无终态时 run 应完整执行: %v", err)
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("执行后应有终态: has=%v err=%v", has, err)
+	}
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultSuccess}) {
+		t.Errorf("Terminal State = %+v，期望 success", st)
+	}
+}
+
+// TestRunRejectedWhenTodaySuccessTerminal 断言当天已有 success 终态 → run 拒绝：
+// 返回 ErrTerminalSuccess、不发起任何网络请求（快速失败）、不发送通知、终态不被改写。
+func TestRunRejectedWhenTodaySuccessTerminal(t *testing.T) {
+	h := setup(t, nil)
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-06",
+		LastTaskResult: terminal.ResultSuccess,
+	})
+
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("当天 success 终态下运行应被拒绝")
+	}
+	if !errors.Is(err, ErrTerminalSuccess) {
+		t.Errorf("错误应包装 ErrTerminalSuccess，实际: %v", err)
+	}
+	if n := len(h.weread.snapshot()); n != 0 {
+		t.Errorf("拒绝时不应发起任何网络请求，实际 %d 条: %+v", n, h.weread.snapshot())
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("拒绝时不应发送任何通知，实际 %d 条", got)
+	}
+	// 终态不被改写（仍是原 seed）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("拒绝时终态被改写: %+v", st)
+	}
+}
+
+// TestRunRetriesAfterTodayFailedTerminal 断言当天 failed 终态（seed）是 run 的合法
+// 输入：重试成功 → 当天结果更新为 success（用户故事 #41；spec 决策 #12）。
+func TestRunRetriesAfterTodayFailedTerminal(t *testing.T) {
+	h := setup(t, nil)
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-06",
+		LastTaskResult: terminal.ResultFailed,
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("failed 终态下 run 应重试成功: %v", err)
+	}
+	if res.Reports != 2 {
+		t.Errorf("Reports = %d，期望 2（任务完整执行）", res.Reports)
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("重试后应有终态: has=%v err=%v", has, err)
+	}
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultSuccess}) {
+		t.Errorf("Terminal State = %+v，期望更新为 success", st)
+	}
+	// 成功通知（无失败通知残留语义：通知渠道每次执行独立计数，仅成功 1 条）。
+	if got := len(h.bark.snapshot()); got != 1 || h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("重试成功应有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
+	}
+}
+
+// TestRunIgnoresStaleTerminalFromPreviousDay 断言昨日（及更早）终态不约束今天：
+// success 终态只拒绝当天（日期匹配的唯一定义，同 scheduler 的 todayTerminal 谓词）。
+func TestRunIgnoresStaleTerminalFromPreviousDay(t *testing.T) {
+	h := setup(t, nil)
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-05",
+		LastTaskResult: terminal.ResultSuccess,
+	})
+	if _, err := h.runTask(context.Background()); err != nil {
+		t.Fatalf("昨日终态不应拒绝今天: %v", err)
+	}
+	if n := h.weread.count("/web/book/read"); n != 3 {
+		t.Errorf("report 数 = %d，期望 3（任务完整执行）", n)
+	}
+}
+
+// TestRunGateFailsOnCorruptTerminal 断言终态文件不可读时 run 保守失败（不执行）：
+// 无法判定"今天是否已完成"时不得冒险重复执行（写终态前的失败也不发送通知）。
+func TestRunGateFailsOnCorruptTerminal(t *testing.T) {
+	h := setup(t, nil)
+	if err := os.WriteFile(filepath.Join(h.cfg.DataDir, terminal.FileName), []byte("{oops"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("终态文件损坏时 run 应保守失败")
+	}
+	if n := len(h.weread.snapshot()); n != 0 {
+		t.Errorf("损坏终态下不应发起任何网络请求，实际 %d 条", n)
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("损坏终态下不应发送任何通知，实际 %d 条", got)
+	}
+}
+
+// TestRunConcurrentSecondTaskRejected 断言并发守卫（spec 决策 #11）：第一个 Task
+// 运行中，第二个 Task（run 或 daemon 触发的 RunTask——调用方身份无关）被拒绝，
+// 返回 ErrTaskRunning 且第一个 Task 不被中断；第一个 Task 完成后形成 success 终态，
+// 第三个调用落入终态规则（ErrTerminalSuccess）。
+func TestRunConcurrentSecondTaskRejected(t *testing.T) {
+	h := setup(t, nil)
+	h.weread.blockTimed = make(chan struct{})
+	h.weread.blockTimedTriggered = make(chan struct{}, 1)
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var firstErr error
+	go func() {
+		_, firstErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 等第一个 Task 阻塞在首笔 timed report（锁必然已持有）。
+	select {
+	case <-h.weread.blockTimedTriggered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed report 未在 10s 内到达")
+	}
+
+	// 第二个 RunTask：锁被持有 → 非阻塞拒绝（不等待第一个完成）。
+	_, err := h.app.RunTask(ctx)
+	if err == nil {
+		t.Fatal("运行中应拒绝第二个 Task")
+	}
+	if !errors.Is(err, ErrTaskRunning) {
+		t.Errorf("错误应包装 ErrTaskRunning，实际: %v", err)
+	}
+	// 拒绝不是失败：不写终态、不通知、不打断第一个（请求数不因第二次调用增加）。
+	if n := len(h.weread.snapshot()); n < 3 {
+		t.Errorf("首个 Task 请求数 = %d，期望 ≥3（renewal + reader + enter）", n)
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("拒绝时不应发送任何通知，实际 %d 条", got)
+	}
+
+	// 释放第一个 Task；它应正常完成（未被中断）并形成 success 终态。
+	close(h.weread.blockTimed)
+	select {
+	case <-done:
+		if firstErr != nil {
+			t.Fatalf("第一个 Task 不应被并发拒绝影响: %v", firstErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("第一个 Task 未在 30s 内完成")
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("首个 Task 完成应有终态: has=%v err=%v", has, err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("Terminal State = %+v，期望 success", st)
+	}
+
+	// 第三个调用：锁已释放但终态已形成 → 终态规则拒绝。
+	_, err = h.app.RunTask(ctx)
+	if !errors.Is(err, ErrTerminalSuccess) {
+		t.Errorf("首个 Task 完成后的调用应落入终态规则（ErrTerminalSuccess），实际: %v", err)
+	}
+}
+
+// TestRunIgnoresRunWindow 断言 run 不受 Run Window 限制（spec 决策 #12；用户故事
+// #42）：配置窗口已过（01:00–03:00，假时钟 10:00），无终态 → run 立即完整执行。
+func TestRunIgnoresRunWindow(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.WindowStart = 60 // 01:00
+		h.cfg.WindowEnd = 180  // 03:00
+	})
+	if _, err := h.runTask(context.Background()); err != nil {
+		t.Fatalf("窗口已过时 run 仍应执行（Run Window 只约束自动调度）: %v", err)
+	}
+	if h.weread.count("/web/book/read") != 3 {
+		t.Errorf("report 数 = %d，期望 3（任务完整执行）", h.weread.count("/web/book/read"))
 	}
 }

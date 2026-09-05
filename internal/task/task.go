@@ -251,7 +251,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	}
 
 	// 7. success 终态先落盘，再发成功通知（spec 决策 #9/#10；用户故事 #39）。
-	date := o.Clock.Now().In(o.TZ).Format("2006-01-02")
+	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
 	if err := o.Terminal.Save(terminal.State{
 		LastTaskDate:   date,
 		LastTaskResult: terminal.ResultSuccess,
@@ -390,7 +390,7 @@ func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st reade
 // 返回的错误供调用方报告，包装最终拒绝错误（errors.Is(err, report.ErrRejected)）。
 func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause error, actions []string) error {
 	o := r.opts
-	date := o.Clock.Now().In(o.TZ).Format("2006-01-02")
+	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
 	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
 		o.Logger.Warn("恢复链耗尽时写入 failed 终态失败", "err", err)
 	}
@@ -446,7 +446,7 @@ func (r *Runner) renew(ctx context.Context) error {
 // 报告，包装 weread.ErrLoginInvalid 并含更新初始 Cookie 的明确提示。
 func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error) error {
 	o := r.opts
-	date := o.Clock.Now().In(o.TZ).Format("2006-01-02")
+	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
 	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
 		o.Logger.Warn("登录失效时写入 failed 终态失败", "err", err)
 	}

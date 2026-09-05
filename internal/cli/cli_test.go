@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"weread-cron/internal/app"
 	"weread-cron/internal/config"
 	"weread-cron/internal/task"
 )
@@ -91,6 +92,7 @@ func TestUsageErrors(t *testing.T) {
 		{"未知 flag", []string{"--verbose"}, "未知 flag"},
 		{"run 多余参数", []string{"run", "extra"}, "不接受额外参数"},
 		{"books 多余参数", []string{"books", "x", "y"}, "不接受额外参数"},
+		{"run --force（无 force 选项）", []string{"run", "--force"}, "不接受额外参数"},
 	}
 
 	for _, tc := range cases {
@@ -254,12 +256,17 @@ func TestBooksPlaceholder(t *testing.T) {
 }
 
 // fakeApp 是 run 子命令的可注入 App（进程内行为测试：退出码/stdout/stderr）。
+// calls 记录 RunTask 被调用次数（run 不受窗口限制的断言用）。
 type fakeApp struct {
-	res task.Result
-	err error
+	res   task.Result
+	err   error
+	calls int
 }
 
-func (f *fakeApp) RunTask(ctx context.Context) (task.Result, error) { return f.res, f.err }
+func (f *fakeApp) RunTask(ctx context.Context) (task.Result, error) {
+	f.calls++
+	return f.res, f.err
+}
 
 func TestRunTaskSuccessPrintsSummary(t *testing.T) {
 	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
@@ -300,6 +307,73 @@ func TestRunTaskFailureExitsNonZero(t *testing.T) {
 	}
 	if stdout.String() != "" {
 		t.Errorf("失败时不应输出摘要；实际:\n%s", stdout.String())
+	}
+}
+
+// TestRunRejectedWhenTodaySuccessTerminal：当天 success 终态 → run 拒绝
+// （issue 08 验收口径：stdout 说明原因 + 约定退出码 ExitRunRejected）。
+// 终态规则本身由应用 seam 覆盖；本层断言进程级呈现。
+func TestRunRejectedWhenTodaySuccessTerminal(t *testing.T) {
+	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{err: app.ErrTerminalSuccess}, nil
+		})
+	if code != ExitRunRejected {
+		t.Errorf("退出码 = %d，期望 %d（约定拒绝退出码）", code, ExitRunRejected)
+	}
+	if !strings.Contains(stdout.String(), "success 终态") {
+		t.Errorf("stdout 应说明拒绝原因（success 终态）；实际:\n%s", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "无 force") {
+		t.Errorf("stdout 应说明 V1 无 force；实际:\n%s", stdout.String())
+	}
+	if strings.Contains(stderr.String(), "Task 失败") {
+		t.Errorf("拒绝不是 Task 失败，stderr 不应误报；实际:\n%s", stderr.String())
+	}
+	if strings.Contains(stdout.String(), "Task 成功") {
+		t.Errorf("拒绝时不应输出成功摘要；实际:\n%s", stdout.String())
+	}
+}
+
+// TestRunRejectedWhenTaskRunning：已有 Task 运行中 → 第二个 run 被拒绝
+// （退出码 ExitRunRejected + stderr 说明原因）。
+func TestRunRejectedWhenTaskRunning(t *testing.T) {
+	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{err: app.ErrTaskRunning}, nil
+		})
+	if code != ExitRunRejected {
+		t.Errorf("退出码 = %d，期望 %d（约定拒绝退出码）", code, ExitRunRejected)
+	}
+	if !strings.Contains(stderr.String(), "正在运行") {
+		t.Errorf("stderr 应说明拒绝原因（运行中）；实际:\n%s", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Errorf("拒绝时不应输出摘要；实际:\n%s", stdout.String())
+	}
+}
+
+// TestRunIgnoresRunWindowAtCLI：run 路径不检查 Run Window——窗口已过（00:00–01:00）
+// 仍直接调用 RunTask 并成功退出（spec 决策 #12；窗口语义由应用 seam 全覆盖）。
+func TestRunIgnoresRunWindowAtCLI(t *testing.T) {
+	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233",
+		config.EnvWindowStart+"=00:00", config.EnvWindowEnd+"=01:00")
+	fa := &fakeApp{res: task.Result{Date: "2025-09-06", BookID: "695233", BookTitle: "三体全集", Planned: time.Minute, Actual: time.Minute, Reports: 2}}
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) { return fa, nil })
+	if code != ExitOK {
+		t.Errorf("窗口已过时 run 仍应执行，退出码 = %d；stderr=%s", code, stderr.String())
+	}
+	if fa.calls != 1 {
+		t.Errorf("RunTask 调用次数 = %d，期望 1（run 立即执行、不受窗口约束）", fa.calls)
+	}
+	if !strings.Contains(stdout.String(), "Task 成功") {
+		t.Errorf("stdout 应输出成功摘要；实际:\n%s", stdout.String())
 	}
 }
 

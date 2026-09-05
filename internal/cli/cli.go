@@ -7,11 +7,15 @@
 //
 // `weread-cron run`（ticket 03）经内聚的应用边界（internal/app）执行一次完整 Task；
 // 进程级行为（退出码、stdout 摘要、stderr）由本层负责。ticket 08 交付 run 的
-// 终态规则（success 拒绝、failed 重试）与并发互斥。
+// 终态规则（success 拒绝、failed 重试）与并发守卫的进程级呈现：success 拒绝原因
+// 按 issue 验收口径输出到 stdout（约定退出码 ExitRunRejected）；其余非零情形
+// （含运行中拒绝）按“全部非零情形须在 stderr 指明原因”的约定输出到 stderr。
+// 无 force 选项：`run --force` 落入“不接受额外参数”的用法错误。
 package cli
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -25,15 +29,19 @@ import (
 	"weread-cron/internal/task"
 )
 
-// 退出码（全部非零情形须在 stderr 指明原因）。
+// 退出码（全部非零情形须指示原因）。
 const (
 	// ExitOK 表示成功。
 	ExitOK = 0
-	// ExitConfig 表示配置校验失败或启动前置条件不满足（缺 Cookie、缺 Login Session）。
+	// ExitConfig 表示配置校验失败、启动前置条件不满足（缺 Cookie、缺 Login Session）
+	// 或 Task 失败。
 	ExitConfig = 1
 	// ExitUsage 表示用法错误（--help、未知子命令、未知 flag、多余参数）。
 	// 按 spec 决策，--help 也以非零退出码结束。
 	ExitUsage = 2
+	// ExitRunRejected 表示 run 被拒绝执行（ticket 08 约定退出码）：
+	// 当天已有 success 终态（V1 无 force）或已有 Task 正在运行（并发守卫）。
+	ExitRunRejected = 3
 )
 
 // App 是 run 子命令依赖的应用边界（生产实现 = internal/app；测试注入 fake）。
@@ -95,7 +103,16 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 			return ExitConfig
 		}
 		res, err := a.RunTask(ctx)
-		if err != nil {
+		switch {
+		case errors.Is(err, app.ErrTerminalSuccess):
+			// ticket 08：success 终态 → 拒绝。验收口径：原因输出到 stdout，
+			// 返回约定的非零退出码（脚本可据此区分"执行成功"与"今天已完成"）。
+			fmt.Fprintln(stdout, "weread-cron: 今天已完成阅读任务（success 终态），拒绝重复执行（V1 无 force）")
+			return ExitRunRejected
+		case errors.Is(err, app.ErrTaskRunning):
+			fmt.Fprintln(stderr, "weread-cron: 已有 Task 正在运行，拒绝并发启动")
+			return ExitRunRejected
+		case err != nil:
 			fmt.Fprintf(stderr, "weread-cron: Task 失败: %v\n", err)
 			return ExitConfig
 		}

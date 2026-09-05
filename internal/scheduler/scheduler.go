@@ -130,7 +130,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 
 		d.log.Info("已到启动时刻，执行 Task",
-			"at", d.clk.Now().In(d.cfg.TZ).Format(dayLayout+" 15:04:05"))
+			"at", d.clk.Now().In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
 		if _, err := d.task.RunTask(ctx); err != nil {
 			// Task 失败但被取消：正常退出。
 			if ctx.Err() != nil {
@@ -166,7 +166,7 @@ func (d *Daemon) schedule() (time.Time, error) {
 	if has && d.todayTerminal(st, now) {
 		d.log.Info("当天已有终态，跳过今日自动执行", "result", st.LastTaskResult)
 	}
-	d.log.Info("已排定下次 Task 启动", "at", next.In(d.cfg.TZ).Format(dayLayout+" 15:04:05"))
+	d.log.Info("已排定下次 Task 启动", "at", next.In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
 	return next, nil
 }
 
@@ -179,9 +179,10 @@ func (d *Daemon) terminalDone() (bool, error) {
 	return has && d.todayTerminal(st, d.clk.Now()), nil
 }
 
-// todayTerminal 报告 st 是否为 now 当天（cfg.TZ）的终态（终态日期匹配的唯一定义）。
+// todayTerminal 报告 st 是否为 now 当天（cfg.TZ）的终态（终态日期匹配的唯一定义
+// 在 terminal.IsToday；此处是调度侧的本地别名）。
 func (d *Daemon) todayTerminal(st terminal.State, now time.Time) bool {
-	return st.LastTaskDate == now.In(d.cfg.TZ).Format(dayLayout)
+	return terminal.IsToday(st, now, d.cfg.TZ)
 }
 
 // sleepUntil 阻塞到 until。以 sleepChunk 分片睡眠，每次醒来检查 ctx：

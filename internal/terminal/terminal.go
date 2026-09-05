@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"time"
 
 	"weread-cron/internal/atomicfile"
 )
@@ -22,7 +23,21 @@ const (
 	// ResultSuccess / ResultFailed 是 last_task_result 的取值。
 	ResultSuccess = "success"
 	ResultFailed  = "failed"
+	// DayLayout 是 Terminal State 日期与调度日期的格式（cfg.TZ 下 YYYY-MM-DD）；
+	// 日期匹配的唯一定义（scheduler/nextstart、app 门控、task 落盘共用）。
+	DayLayout = "2006-01-02"
 )
+
+// TodayKey 返回 now 在 tz 下的当天日期键（YYYY-MM-DD）。
+func TodayKey(now time.Time, tz *time.Location) string {
+	return now.In(tz).Format(DayLayout)
+}
+
+// IsToday 报告 st 是否为 now 当天（tz 下）的终态——终态日期匹配的唯一定义
+// （scheduler 的 todayTerminal 谓词与 app 的终态规则门控共用）。
+func IsToday(st State, now time.Time, tz *time.Location) bool {
+	return st.LastTaskDate == TodayKey(now, tz)
+}
 
 // State 是当日 Task 的终态记录。
 type State struct {

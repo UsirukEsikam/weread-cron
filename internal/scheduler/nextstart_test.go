@@ -84,7 +84,7 @@ func TestNextStartWindowConstrainsStartOnly(t *testing.T) {
 					t.Fatalf("NextStart 返回错误: %v", err)
 				}
 				assertInRange(t, next, tc.wantFrom, tc.wantTo)
-				if got := next.In(testLoc).Format(dayLayout); got != tc.wantDayTZ {
+				if got := next.In(testLoc).Format(terminal.DayLayout); got != tc.wantDayTZ {
 					t.Errorf("日期 = %s，期望 %s（next=%v）", got, tc.wantDayTZ, next)
 				}
 			}
@@ -169,10 +169,10 @@ func TestNextStartTerminalBlocksToday(t *testing.T) {
 				if err != nil {
 					t.Fatalf("NextStart 返回错误: %v", err)
 				}
-				if got := next.In(testLoc).Format(dayLayout); got != tc.wantDay {
+				if got := next.In(testLoc).Format(terminal.DayLayout); got != tc.wantDay {
 					t.Errorf("日期 = %s，期望 %s（next=%v）", got, tc.wantDay, next)
 				}
-				if tc.notToday && next.In(testLoc).Format(dayLayout) == "2025-09-06" {
+				if tc.notToday && next.In(testLoc).Format(terminal.DayLayout) == "2025-09-06" {
 					t.Errorf("有终态时不应调度在今天：%v", next)
 				}
 			}

@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestFileStoreSaveLoad(t *testing.T) {
@@ -81,5 +82,40 @@ func TestCorruptFileErrors(t *testing.T) {
 	}
 	if _, _, err := NewFileStore(dir).Load(); err == nil {
 		t.Error("损坏的终态文件应报错而非静默")
+	}
+}
+
+// TestIsToday 覆盖终态日期匹配的唯一定义（scheduler 谓词 / app 门控共用）：
+// 同一天匹配、跨天不匹配、TZ 决定日期边界。
+func TestIsToday(t *testing.T) {
+	var loc = time.FixedZone("Asia/Shanghai", 8*3600)
+	now := time.Date(2025, 9, 6, 23, 30, 0, 0, loc)
+	cases := []struct {
+		name string
+		st   State
+		want bool
+	}{
+		{"当天", State{LastTaskDate: "2025-09-06", LastTaskResult: ResultSuccess}, true},
+		{"昨天", State{LastTaskDate: "2025-09-05", LastTaskResult: ResultSuccess}, false},
+		{"明天", State{LastTaskDate: "2025-09-07", LastTaskResult: ResultFailed}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := IsToday(tc.st, now, loc); got != tc.want {
+				t.Errorf("IsToday(%+v) = %v，期望 %v", tc.st, got, tc.want)
+			}
+		})
+	}
+	// TZ 边界：同一 UTC 时刻在上海已过午夜（次日），UTC 仍是当天。
+	utcNow := time.Date(2025, 9, 6, 16, 30, 0, 0, time.UTC) // = 上海 9-7 00:30
+	st := State{LastTaskDate: "2025-09-07", LastTaskResult: ResultSuccess}
+	if !IsToday(st, utcNow, loc) {
+		t.Errorf("上海 00:30 应属于 9-7")
+	}
+	if IsToday(st, utcNow, time.UTC) {
+		t.Errorf("UTC 16:30 应属于 9-6")
+	}
+	if got := TodayKey(utcNow, loc); got != "2025-09-07" {
+		t.Errorf("TodayKey(上海) = %q，期望 2025-09-07", got)
 	}
 }
