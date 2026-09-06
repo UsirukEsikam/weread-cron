@@ -5,7 +5,7 @@
 **Finding:** F9 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** bug（安全）
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 通知的传输层错误记录到日志时不暴露 Bark key / 企业微信 robot key。
 
@@ -25,11 +25,11 @@ Bark key 位于请求 URL 路径、企业微信 robot key 位于 URL query。Go 
 
 ## Acceptance criteria
 
-- [ ] 模拟 DNS / TLS / 连接失败时，日志不包含 Bark key
-- [ ] 模拟 DNS / TLS / 连接失败时，日志不包含企业微信 robot key
-- [ ] 通知层返回/记录的错误不含完整凭据 URL（脱敏或省略）
-- [ ] HTTP 状态错误行为不回归
-- [ ] 通知失败不影响 Task 结果（回归）
+- [x] 模拟 DNS / TLS / 连接失败时，日志不包含 Bark key
+- [x] 模拟 DNS / TLS / 连接失败时，日志不包含企业微信 robot key
+- [x] 通知层返回/记录的错误不含完整凭据 URL（脱敏或省略）
+- [x] HTTP 状态错误行为不回归
+- [x] 通知失败不影响 Task 结果（回归）
 
 ## Out of scope
 
@@ -42,3 +42,26 @@ Review 输入 F9 已对当前代码确认：
 
 - Bark URL 形态为 `https://api.day.app/<key>`（key 在路径）；企业微信 webhook URL 的 key 在 query。
 - 通知 POST 用底层 HTTP client 发送；传输错误（DNS / TLS / 连接）的 Go 错误串含完整请求 URL，被包装后经 Task 编排层 Warn 日志记录。HTTP 非 2xx 分支返回的"HTTP %d"错误不含 URL。
+
+## Answer
+
+实现「通知传输错误脱敏」（F9），收敛在 `internal/notify` 的公共 POST 路径，其余模块不改。
+
+1. **脱敏范围**（`postJSON`）：传输层错误（DNS / TLS / 连接失败）与请求构造错误统一经 `redactRequestError` 脱敏后返回——`*url.Error` 重建时保留 `Op`/`Err`、URL 替换为 `redactURL` 的"仅 scheme://host"形态（Bark key 在 path、企业微信 robot key 在 query，整体去除 path/query 即不暴露凭据）；非 `*url.Error` 的错误串中出现完整 URL 时整体替换（兜底，覆盖请求构造失败等路径）。脱敏只作用于返回的错误，实际发出的请求 URL 不变。
+2. **语义保持**：重建的 `*url.Error` 保留 `Err`，unwrap 语义与 `errors.Is(err, context.Canceled)` 判别贯通（取消路径判别不回归）；HTTP 非 2xx 分支仍返回不含 URL 的"通知端点返回 HTTP %d"（现有行为不变）；返回给调用方的错误与 Task 编排层写日志（`finalize` 的 Warn）用同一错误对象，日志与告警链路不再重新泄露。通知失败不影响 Task 结果与终态的语义未触碰（回归由现有 `TestRunNotifyFailureDoesNotAffectTask` 覆盖，全量通过）。
+3. **兜底分支的取舍**：fallback 不保留 unwrap 语义（`errors.New`）——net/http 传输错误恒为 `*url.Error`，该分支仅防未来非标准客户端，代价已在注释中说明。
+
+### 测试覆盖
+
+- `TestBarkTransportErrorRedactsKey`（验收 1/3）：Bark key（path）在 DNS / 连接 / TLS / 上下文取消四类传输失败的错误串中不出现；保持 `url.Error` 形态、URL 脱敏为仅主机、unwrap 贯通、实际请求 URL 未被改写。
+- `TestWeComTransportErrorRedactsKey`（验收 2/3）：企业微信 robot key（query）同上四类内层错误逐一断言（评审跟进：与 Bark 用例对齐）。
+- `TestNotifyHTTPStatusErrorUnchanged`（验收 4）：三种通知出口（Success / LoginInvalid / Failure）HTTP 500 均返回原样的"通知端点返回 HTTP 500"、不含 URL。
+- `TestNotifyRequestConstructionErrorRedacted`（验收 3 兜底路径）：URL 解析失败（控制字符）的构造错误不暴露 key。
+- 回归（验收 5）：现有 `TestRunNotifyFailureDoesNotAffectTask`（通知端点故障不影响 Task 结果与终态、渠道互不影响）通过。
+- 验证：`go test ./...`、`go vet ./...`、gofmt（本票文件）通过；notify 测试 `-count=3` 重复运行稳定。
+
+### 评审跟进（另立 ticket 建议）
+
+- **config 校验错误残留泄露点**：`internal/config/config.go` 对无效 Bark / 企业微信 URL 的校验错误用 `%q` 嵌入完整原始 URL（含凭据），启动阶段日志同样可能泄露。属本票 out-of-scope（"通知渠道配置方式"）——确认存在的同类敏感信息，建议另立 ticket 脱敏（如仅输出主机或截断）。
+
+**Commits:** c29dad6（fix + 测试）· 下一 commit（docs）
