@@ -12,7 +12,7 @@
 
 **Category:** enhancement（含 F3 的 Git 忽略规则安全项）
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 部署/运维对齐：默认本地部署改为 `compose.yaml.example` 模板 → 用户复制为被 Git 忽略的 `compose.yaml`；`/data` 默认改 Docker named volume；`.gitignore` 覆盖 `compose.yaml` 与 `data/`；默认部署文档与 Compose 镜像路径指向本仓库发布的 `ghcr.io/UsirukEsikam/weread-cron`（fork 发布另述）；README 补齐 `books` 与镜像更新的 Compose 操作示例；README 明确损坏 persisted Login Session 的人工恢复边界。
 
@@ -43,13 +43,13 @@
 
 ## Acceptance criteria
 
-- [ ] 仓库提交 `compose.yaml.example`;用户复制为 `compose.yaml` 后 `docker compose config` 解析通过
-- [ ] `compose.yaml` 与 `data/` 在 `.gitignore` 中;`git status` 不意外跟踪本地部署文件与新落盘的 `data/` 内容
-- [ ] 默认 compose 以 named volume 挂载 `/data`（非 `./data` bind mount）
-- [ ] README 与 compose 默认镜像路径为 `ghcr.io/UsirukEsikam/weread-cron`，无「替换为你的用户名」指令;fork 发布为单独小节
-- [ ] README 含 `books` 的 compose 调用示例与完整镜像更新流程（pull + recreate）
-- [ ] README 说明损坏 persisted Login Session 的恢复步骤（删除损坏文件/恢复备份后重启），并与登录失效场景区分
-- [ ] `docker-compose.yml` 不再作为活动部署文件（删除或明确废弃）
+- [x] 仓库提交 `compose.yaml.example`;用户复制为 `compose.yaml` 后 `docker compose config` 解析通过
+- [x] `compose.yaml` 与 `data/` 在 `.gitignore` 中;`git status` 不意外跟踪本地部署文件与新落盘的 `data/` 内容
+- [x] 默认 compose 以 named volume 挂载 `/data`（非 `./data` bind mount）
+- [x] README 与 compose 默认镜像路径为 `ghcr.io/UsirukEsikam/weread-cron`，无「替换为你的用户名」指令;fork 发布为单独小节
+- [x] README 含 `books` 的 compose 调用示例与完整镜像更新流程（pull + recreate）
+- [x] README 说明损坏 persisted Login Session 的恢复步骤（删除损坏文件/恢复备份后重启），并与登录失效场景区分
+- [x] `docker-compose.yml` 不再作为活动部署文件（删除或明确废弃）
 
 ## Out of scope
 
@@ -68,3 +68,29 @@
 - F4: README（`ghcr.io/<你的 GitHub 用户名>/weread-cron`）、compose（`ghcr.io/OWNER/weread-cron:latest`）、release.yml（`ghcr.io/${{ github.repository }}`）三处均为 OWNER 替换模型。
 - F6: README 无 `books` compose 示例、无镜像更新流程。
 - F8: `internal/session/session.go` `New()` 在 `HasLoginSession()==true` 时 `LoadJar` 失败或空 jar 直接返回错误，不回退初始 Cookie;`internal/scheduler/scheduler_test.go` `TestDaemonStartupFailsOnEmptySessionFile` 断言 daemon 启动失败;README「更新 Cookie 后重启自愈」仅限「登录已失效」通知场景。
+
+## Answer
+
+实现「Docker 部署/运维对齐」——纯文档/部署面变更，不改任何 Go 行为（F8 保守失败决策保留，`session.New` 未动；release.yml 未动，latest 语义属 ticket 21）。逐 finding 交付：
+
+1. **F1 模板模型**：`docker-compose.yml` 删除，新增 `compose.yaml.example`（git mv 保留历史）；README「部署」改为 `cp compose.yaml.example compose.yaml` → 填 `.env` → `docker compose up -d`，并说明 `compose.yaml` 是本地部署状态（不入 Git）、模板更新与新模板 diff 合并。
+2. **F2 named volume**：compose 模板 `volumes: weread-cron-data:/data` + 显式 `name: weread-cron-data`（卷名固定、不随 compose 项目名变化，便于运维定位）；README「/data 卷要求」新增「named volume vs 本地目录」条目（开发/定制部署可改挂 `./data:/data`，`data/` 不入 Git）。
+3. **F3 Git 忽略**：`.gitignore` 增加 `/compose.yaml` 与 `/data/`（根锚定），`.env` 等既有规则不变；`.dockerignore` 同步把 `docker-compose.yml` 替换为 `compose.yaml`（构建上下文排除本地部署文件，与 `.env`/`data` 同类）。
+4. **F4 镜像路径**：README/compose 默认路径统一为 `ghcr.io/UsirukEsikam/weread-cron`（与 origin remote 及 release.yml 的 `ghcr.io/${{ github.repository }}` 一致）；删除「替换 OWNER」指令；「镜像」新增独立小节「Fork 发布（可选）」（fork 后 path 改为 fork 镜像，本地构建亦可）。
+5. **F6 完整 CLI 工作流**：README 补齐 `books` 两种调用（`docker compose run --rm weread-cron books`——daemon 未启动、经 ENTRYPOINT；`docker compose exec weread-cron /weread-cron books`——daemon 已启动、exec 不经 ENTRYPOINT），新增「镜像更新」小节（`docker compose pull` + `docker compose up -d`，含 `--force-recreate` 说明与 /data 不受影响的说明）。
+6. **F8 损坏会话恢复**：README「/data 卷要求」新增「持久化 Login Session 损坏的恢复」条目——启动报「恢复 Login Session 失败」/空会话错误时退出码 1、不回退初始 Cookie（保守失败，更新 `.env` Cookie 无效，损坏文件遮挡初始 Cookie）；恢复 = `docker compose down` → 借临时 alpine 容器删除损坏 `login_session.json`（或恢复备份；镜像为 scratch 无 shell/rm）→ `docker compose up -d`，容器以初始 Cookie 重建会话；并明确与「登录已失效」场景（文件恢复成功、仅登录过期，更新 Cookie 重启自愈）的区别。`.env.example` 的 WEREAD_CRON_DATA_DIR 注释同步为 named volume 表述。
+
+### 验证记录（本地实跑）
+
+- `docker compose config`：模板复制为 `compose.yaml` + `.env` 后解析通过（named volume `weread-cron-data:/data`、`name:` 生效、`${TZ:-Asia/Shanghai}` 插值正确、镜像路径正确）。
+- `git check-ignore`：`/compose.yaml`（.gitignore:35）与 `/data/`（.gitignore:36）均命中；临时落盘 `data/login_session.json` 后 `git status` 不出现未跟踪项。
+- 本地构建镜像实测 compose 运行语义：`docker compose run --rm weread-cron books --help` 经 ENTRYPOINT 正确路由（旧写法 `run ... /weread-cron books` 证实报「未知子命令」——README 因此用 `run` 直接跟子命令、`exec` 用完整路径）；`docker compose up -d` 后 `exec` 同法验证；named volume 由 compose 自动创建，`down -v`/`volume rm` 后清理。
+- `go vet ./...` 与 `go test ./...` 全绿（本票无 Go 变更，防回归跑全量）。
+
+### 评审（ticket 20 双轴 code-review）与处理
+
+- **Spec 轴**：7 条 acceptance 全部实现；唯一字面差距 = AC1「复制 compose.yaml 后 config 解析通过」依赖 `.env` 已存在（env_file 模型固有，ticket 10 同样验证「缺失时按预期报错」）——README 步骤顺序已保证 `.env` 先于 config 校验，**不改行为**。
+- **Spec 轴**：`.dockerignore` 的 `docker-compose.yml`→`compose.yaml` 不在票面文件清单——判断裁决：系指向已删除文件的失效条目，一行对齐属部署模型一致性的必要收尾，保留。
+- **Standards 轴**：无硬违规；两条 mild 判断裁决（模板与 README 的 cp/up 步骤轻度重复——模板自包含优先；镜像路径多处出现——F4 票面要求实路径）均接受。
+- 修正：① `git mv` 造成的 staged rename 与未暂存内容不一致——`git reset` 统一后再提交；② `compose.yaml.example` 与 `.gitignore` 补末尾换行。
+- 评审复核确认：F8 引用的错误文案与 `session.New`/scheduler 实际一致；「exec 不经 ENTRYPOINT」「run 经 ENTRYPOINT」与 Dockerfile 的 `ENTRYPOINT ["/weread-cron"]` 一致；scratch 无 shell/rm 因此恢复示例用 alpine 挂载卷操作。
