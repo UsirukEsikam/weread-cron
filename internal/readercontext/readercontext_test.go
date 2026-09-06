@@ -102,3 +102,39 @@ func TestProviderMergeFailurePreservesErrorSemantics(t *testing.T) {
 		t.Errorf("错误应包装「抓取 Reader 页失败: 并入响应 Cookie 失败」，实际: %v", err)
 	}
 }
+
+// TestProviderAcceptsNumericPclts 断言 Provider 在真实服务端返回数字 pclts（如受控真机验证观察到的 0）
+// 时能够正常建立 Reader Context，不报反序列化错误。
+func TestProviderAcceptsNumericPclts(t *testing.T) {
+	pageHTML := `<html><head><title>x</title></head><body><script>window.__INITIAL_STATE__ = ` +
+		`{"reader":{"psvts":"5cb328e07aa94b32g0140f1","pclts":0,"token":"tok-test",` +
+		`"bookInfo":{"bookId":"695233","title":"三体全集"},` +
+		`"currentChapter":{"chapterUid":112,"chapterIdx":3,"chapterOffset":1234},` +
+		`"progress":{"book":{"chapterUid":112,"chapterIdx":3,"chapterOffset":1234,"progress":35,"summary":"s"}}}};` +
+		` (function(){return 1;})();</script></body></html>`
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(pageHTML))
+	}))
+	defer srv.Close()
+
+	client := weread.NewClient(srv.URL, srv.Client(), weread.DefaultUserAgent,
+		func() string { return "" },
+		func([]*http.Cookie) error { return nil })
+	p := NewProvider(client, Options{})
+
+	st, err := p.Fetch(context.Background(), "695233")
+	if err != nil {
+		t.Fatalf("Fetch() 失败: %v", err)
+	}
+	if st.Context.Psvts != "5cb328e07aa94b32g0140f1" {
+		t.Errorf("Psvts = %q, want %q", st.Context.Psvts, "5cb328e07aa94b32g0140f1")
+	}
+	if st.Context.Pclts != "0" {
+		t.Errorf("Pclts = %q, want %q", st.Context.Pclts, "0")
+	}
+	if st.Context.Token != "tok-test" {
+		t.Errorf("Token = %q, want %q", st.Context.Token, "tok-test")
+	}
+}
+

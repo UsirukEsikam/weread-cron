@@ -47,3 +47,12 @@
 ## 处理原则
 
 验证结果与设计假设不一致 → 在受影响 ticket 的 Comments 中提出问题与证据，由用户/维护者决定调整方向；不静默改用另一接口、另一套字段语义或另一签名方案。
+
+## 以下为一些手工记测试后的记录
+
+Verified:
+- Cookie-only Shelf endpoint works.
+- Shelf parsing works.
+- Real Reader state can return reader.pclts as JSON number.
+- Observed value: pclts = 0.
+- reader.psvts was a JSON string.

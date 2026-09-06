@@ -27,9 +27,9 @@ var initialStateMarker = regexp.MustCompile(`(?s)window\.__INITIAL_STATE__\s*=\s
 // InitialState 是解析后的 __INITIAL_STATE__（只保留本工具关心的字段）。
 type InitialState struct {
 	Reader struct {
-		Psvts    string `json:"psvts"`
-		Pclts    string `json:"pclts"`
-		Token    string `json:"token"`
+		Psvts    string     `json:"psvts"`
+		Pclts    flexString `json:"pclts"`
+		Token    string     `json:"token"`
 		BookInfo struct {
 			BookID string `json:"bookId"`
 			Title  string `json:"title"`
@@ -108,10 +108,40 @@ func (s *InitialState) ReadingProgress(bookID string) (ReadingProgress, error) {
 func (s *InitialState) ReaderContext() ReaderContext {
 	return ReaderContext{
 		Psvts: s.Reader.Psvts,
-		Pclts: s.Reader.Pclts,
+		Pclts: s.Reader.Pclts.String(),
 		Token: s.Reader.Token,
 	}
 }
+
+// flexString 解析 JSON 字符串或数字为 string（真实页面 reader.pclts 存在 0 或字符串等形态）。
+type flexString struct {
+	s string
+}
+
+// UnmarshalJSON 接受字符串字面量或数字字面量。
+func (f *flexString) UnmarshalJSON(b []byte) error {
+	f.s = ""
+	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
+		return nil
+	}
+	if len(b) > 0 && b[0] == '"' {
+		var str string
+		if err := json.Unmarshal(b, &str); err != nil {
+			return err
+		}
+		f.s = str
+		return nil
+	}
+	var num json.Number
+	if err := json.Unmarshal(b, &num); err == nil {
+		f.s = num.String()
+		return nil
+	}
+	return fmt.Errorf("flexString: 无法将 %s 解析为字符串或数字", string(b))
+}
+
+// String 返回字符串值。
+func (f flexString) String() string { return f.s }
 
 // flexInt 解析 JSON 数字或数字字符串为 int（真实页面 chapterOffset 等字段两种形式都有）。
 // 记录字段存在性：present=false 表示字段缺失（或 JSON null），present=true 表示字段存在

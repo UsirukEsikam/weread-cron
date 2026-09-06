@@ -1,7 +1,9 @@
 package weread
 
 import (
+	"fmt"
 	"testing"
+	"time"
 )
 
 // samplePage 生成模拟 Reader 页（结构参照真实页面：
@@ -237,3 +239,104 @@ func TestFlexIntsRejectGarbage(t *testing.T) {
 		t.Error("非法 chapterUid 应报错")
 	}
 }
+
+// TestParseInitialStatePcltsFlexibility 断言 pclts 兼容 JSON 数字与字符串等各形态，
+// 且非法类型报错，并在 payload 构造时触发正确的 pc fallback。
+func TestParseInitialStatePcltsFlexibility(t *testing.T) {
+	cases := []struct {
+		name      string
+		pcltsJSON string // e.g. `"pclts":0`，为空表示字段缺失
+		wantPclts string
+		wantErr   bool
+	}{
+		{
+			name:      "数字 0（受控真实验证观察值）",
+			pcltsJSON: `"pclts":0,`,
+			wantPclts: "0",
+		},
+		{
+			name:      "非零数字时间戳",
+			pcltsJSON: `"pclts":1744333820,`,
+			wantPclts: "1744333820",
+		},
+		{
+			name:      "字符串 0",
+			pcltsJSON: `"pclts":"0",`,
+			wantPclts: "0",
+		},
+		{
+			name:      "已编码字符串",
+			pcltsJSON: `"pclts":"aab32e207a65a466g010615",`,
+			wantPclts: "aab32e207a65a466g010615",
+		},
+		{
+			name:      "null 显式空值",
+			pcltsJSON: `"pclts":null,`,
+			wantPclts: "",
+		},
+		{
+			name:      "字段缺失",
+			pcltsJSON: "",
+			wantPclts: "",
+		},
+		{
+			name:      "非法类型（布尔值）报错",
+			pcltsJSON: `"pclts":true,`,
+			wantErr:   true,
+		},
+		{
+			name:      "非法类型（数组）报错",
+			pcltsJSON: `"pclts":[0],`,
+			wantErr:   true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := fmt.Sprintf(`{"reader":{"psvts":"5cb328e07aa94b32g0140f1",%s"token":"tok-1",`+
+				`"bookInfo":{"bookId":"9","title":"书"},`+
+				`"currentChapter":{"chapterUid":112,"chapterIdx":3,"chapterOffset":0}}}`, tc.pcltsJSON)
+			st, err := ParseInitialState(samplePage(state))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("期望解析报错，但成功返回: %+v", st)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("ParseInitialState 失败: %v", err)
+			}
+			rc := st.ReaderContext()
+			if rc.Pclts != tc.wantPclts {
+				t.Errorf("ReaderContext.Pclts = %q, want %q", rc.Pclts, tc.wantPclts)
+			}
+
+			// 验证下游 payload 构造中的 pc fallback 行为（EnterReportPayload 与 TimedReportPayload）
+			fixedNow := time.Unix(1744333820, 0)
+			progress, err := st.ReadingProgress("9")
+			if err != nil {
+				t.Fatalf("ReadingProgress 失败: %v", err)
+			}
+			enterPayload := EnterReportPayload(progress, rc, fixedNow, "test-ua")
+			timedPayload := TimedReportPayload(progress, rc, fixedNow, "test-ua", 30, fixedNow.UnixMilli(), 12345)
+			expectedFallback := EncodeID("1744333820")
+
+			if tc.wantPclts == "" || tc.wantPclts == "0" {
+				if enterPayload["pc"] != expectedFallback {
+					t.Errorf("enterPayload pc = %q, 期望回退为 e(now) %q", enterPayload["pc"], expectedFallback)
+				}
+				if timedPayload["pc"] != expectedFallback {
+					t.Errorf("timedPayload pc = %q, 期望回退为 e(now) %q", timedPayload["pc"], expectedFallback)
+				}
+			} else {
+				if enterPayload["pc"] != tc.wantPclts {
+					t.Errorf("enterPayload pc = %q, 期望保留原值 %q", enterPayload["pc"], tc.wantPclts)
+				}
+				if timedPayload["pc"] != tc.wantPclts {
+					t.Errorf("timedPayload pc = %q, 期望保留原值 %q", timedPayload["pc"], tc.wantPclts)
+				}
+			}
+		})
+	}
+}
+
