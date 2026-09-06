@@ -35,6 +35,12 @@
 // 一切统一 finalization（finalizeTransient / failBookSelection）之前被识别：不写
 // success/failed 终态、不发最终通知（取消不是业务最终失败），当天无终态，重启/
 // 手动 run 按"无 Terminal State"规则重新执行。
+// ticket 29 范围（本文件）：终态决策形成后的 finalization 持久化失败不丢失决策
+// 身份（findings/07 H4）——恢复链耗尽（failRecoveryExhausted）与链内登录失效
+// （failLoginInvalid）出口在写盘失败时，返回的错误仍联合包装 ErrRejected /
+// ErrLoginInvalid（errors.Is 贯通）：Timed 循环据此把"已形成终态决策但存储失败"
+// 判为终止而非可重试暂时性失败，绝不重入上报路径（否则存储恢复后后续上报可把
+// 该最终失败翻转为 success 终态）。
 //
 // # rt 语义（ADR-0004）
 //
@@ -677,6 +683,13 @@ func (r *Runner) finalizeTransient(ctx context.Context, stage string, cause erro
 //
 // notify 为 nil（nil Notifier 或出口无需通知）时跳过发送；通知发送失败不影响 Task
 // 结果与终态（用户故事 #38），仅记日志。
+//
+// 返回的持久化错误为裸错误（不携带终态决策身份）；经本方法返回错误后直接流向 Task
+// 调用方的出口（finalizeTransient / success / 选书失败）不会重入上报路径，无需身份。
+// 例外：经恢复链回流入 Timed 循环的终态决策出口（failRecoveryExhausted /
+// failLoginInvalid）在写盘失败时把返回错误与决策错误联合包装（ticket 29），
+// errors.Is 判别身份贯通——调用方据此区分"已形成终态决策但存储失败"与"可重试的
+// 暂时性失败"，绝不重入上报业务路径。
 func (r *Runner) finalize(ctx context.Context, st terminal.State, notify func(context.Context) error) error {
 	o := r.opts
 	shouldSave := true
@@ -709,7 +722,9 @@ func (r *Runner) finalize(ctx context.Context, st terminal.State, notify func(co
 // failRecoveryExhausted 输出恢复链耗尽的失败结果：failed 终态先落盘、再发失败通知
 // （spec 决策 #9/#10：失败阶段、主要错误、已尝试恢复动作；通知失败不影响 Task 结果；
 // 终态持久化失败 → 返回持久化错误、不发通知，#15）。返回的错误供调用方报告，包装
-// 最终拒绝错误（errors.Is(err, report.ErrRejected)）。taskDate 是 Task 开始日。
+// 最终拒绝错误（errors.Is(err, report.ErrRejected)）；写盘失败路径同样保留该判别
+// 身份（ticket 29：终态决策已形成，调用方不得把"已形成终态决策但存储失败"判为
+// 可重试暂时性失败而重入上报路径）。taskDate 是 Task 开始日。
 func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause error, actions []string, taskDate string) error {
 	o := r.opts
 	if err := r.finalize(ctx, terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}, func(ctx context.Context) error {
@@ -720,7 +735,11 @@ func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause 
 			Actions: actions,
 		})
 	}); err != nil {
-		return err
+		// ticket 29（findings/07 H4）：终态决策已形成——联合包装持久化错误与决策
+		// 错误（cause），errors.Is(err, report.ErrRejected) 贯通：Timed 循环据此
+		// 直接终止，绝不重入上报路径（否则存储恢复后后续成功上报可把该最终失败
+		// 翻转为 success 终态）。
+		return fmt.Errorf("终态持久化失败（恢复链已耗尽，Task 终止）: %w: %w", err, cause)
 	}
 	return fmt.Errorf("%s 被服务器拒绝且恢复链耗尽: %w", stage, cause)
 }
@@ -763,13 +782,20 @@ func (r *Runner) renew(ctx context.Context, taskDate string) error {
 // failLoginInvalid 输出登录失效的失败结果：failed 终态先落盘、再发送登录失效通知
 // （spec 决策 #7/#9/#10；通知失败不影响结果——用户故事 #38；终态持久化失败 →
 // 返回持久化错误、不发通知，#15）。返回的错误供调用方报告，包装 weread.ErrLoginInvalid
-// 并含更新初始 Cookie 的明确提示。taskDate 是 Task 开始日。
+// 并含更新初始 Cookie 的明确提示；写盘失败路径同样保留该判别身份（ticket 29：终态
+// 决策已形成，恢复链/外层循环不得判为可重试暂时性失败而重入上报路径）。taskDate 是
+// Task 开始日。
 func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error, taskDate string) error {
 	o := r.opts
 	if err := r.finalize(ctx, terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}, func(ctx context.Context) error {
 		return o.Notify.NotifyLoginInvalid(ctx, notify.LoginInvalid{Date: taskDate, Cause: cause.Error()})
 	}); err != nil {
-		return err
+		// ticket 29（findings/07 H4）：同 failRecoveryExhausted——联合包装持久化
+		// 错误与完整登录失效错误（含证据/重建诊断与 ErrLoginInvalid 身份），
+		// errors.Is(err, weread.ErrLoginInvalid) 贯通且诊断不丢。
+		return fmt.Errorf("终态持久化失败（登录失效，Task 终止）: %w: %w", err,
+			fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 后 renewal 仍失败。证据: %v；重建: %v。%s",
+				weread.ErrLoginInvalid, evidence, cause, notify.LoginInvalidPrompt))
 	}
 	return fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 后 renewal 仍失败。证据: %v；重建: %v。%s",
 		weread.ErrLoginInvalid, evidence, cause, notify.LoginInvalidPrompt)

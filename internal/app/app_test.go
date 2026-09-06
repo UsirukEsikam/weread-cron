@@ -2256,6 +2256,29 @@ func (f failTerminalStore) Load() (terminal.State, bool, error) {
 	return terminal.State{}, false, nil
 }
 
+// failOnceTerminalStore 是首次 Save 失败的 Terminal Store（ticket 29 / findings/07
+// H4 的确定性复现注入）：首次终态写盘失败（模拟本地存储故障），后续 Save 委托底层
+// 存储（存储恢复）——用于断言：终态决策形成后的首次写盘失败之后，外层不得重入上报
+// 路径，也不得在存储恢复后把最终失败翻转为 success。Load 委托底层存储（防降级
+// 规则可判）。
+type failOnceTerminalStore struct {
+	inner         terminal.Store
+	err           error
+	alreadyFailed bool
+}
+
+func (f *failOnceTerminalStore) Save(st terminal.State) error {
+	if !f.alreadyFailed {
+		f.alreadyFailed = true
+		return f.err
+	}
+	return f.inner.Save(st)
+}
+
+func (f *failOnceTerminalStore) Load() (terminal.State, bool, error) {
+	return f.inner.Load()
+}
+
 // TestRunReaderContextAndEnterTransientFailureConverge 断言 Reader Context 阶段与
 // enter 阶段的传输级暂时性失败同样无条件收敛为 failed 终态 + 失败通知（ticket 24：
 // renewal / Reader Context / enter / timed 各阶段暂时性失败都以最终失败结束，daemon
@@ -2330,6 +2353,93 @@ func TestRunTerminalPersistFailureSuppressesNotification(t *testing.T) {
 				t.Errorf("终态落盘失败时不得发送任何通知，实际 %d 条", got)
 			}
 		})
+	}
+}
+
+// TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity 断言 findings/07 H4 的
+// 确定性复现被修复（ticket 29）：恢复链耗尽已形成最终失败决策，但首次 failed 终态
+// 写盘失败（本地存储故障）→ 存储恢复后外层不得重入 Timed report 路径，不得在后续
+// 上报被接受后写入 success 终态。返回的错误保留 report.ErrRejected 判别身份并指明
+// 终态持久化失败——调用方据此区分"已形成终态决策但存储失败"与"可重试的暂时性失败"。
+func TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		// 首笔 timed + 恢复链 2 次重试拒绝 → 链耗尽；此后上报会被接受（存储恢复后
+		// 若无 ticket 29 的身份保留，后续成功上报会把该最终失败翻转为 success）。
+		h.weread.timedRejects = 3
+		h.term = &failOnceTerminalStore{inner: terminal.NewFileStore(h.cfg.DataDir), err: errors.New("disk full")}
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("首次 failed 终态写盘失败时 Task 应返回错误（不得继续上报并翻转为 success）")
+	}
+	if !errors.Is(err, report.ErrRejected) {
+		t.Errorf("错误应保留 report.ErrRejected 判别身份（终态决策已形成），实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "写入 Terminal State 失败") {
+		t.Errorf("错误应指明终态持久化失败；实际: %v", err)
+	}
+
+	// 决策点之后不再继续上报：线上序列恰为恢复链耗尽（enter + 3 笔 timed 尝试，
+	// 含 2 次重试），无任何后续被接受的 timed report（修复前：继续上报、写 success
+	// 终态、发成功通知）。
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "timed", "renewal", "refresh", "timed",
+	)
+
+	// 存储恢复后不得写入 success 终态：磁盘上无任何终态；不发任何最终通知（失败
+	// 通知因终态未落盘被抑制，成功通知不存在）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatalf("不得写入任何终态（首次写盘失败后 Task 终止）: %+v", st)
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("不得发送任何最终通知，实际 %d 条", got)
+	}
+}
+
+// TestRunLoginInvalidPersistFailKeepsInvalidIdentity 断言链内登录失效 finalization
+// 的终态写盘失败遵守同一规则（ticket 29）：恢复链中 renewal 出现登录失效证据、从
+// 初始 Cookie 重建后仍失败 → 已形成登录失效终态决策，但首次 failed 写盘失败 → 存储
+// 恢复后外层不得重入上报路径、不得翻转为 success。返回的错误保留
+// weread.ErrLoginInvalid 判别身份并指明终态持久化失败。
+func TestRunLoginInvalidPersistFailKeepsInvalidIdentity(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejects = 2    // timed#1 与 retry#1 拒绝，进入链内 renewal 步骤
+		h.weread.renewRejectFrom = 2 // 任务开始 renewal 成功；链内 renewal 起出现 succ:0 证据
+		h.term = &failOnceTerminalStore{inner: terminal.NewFileStore(h.cfg.DataDir), err: errors.New("disk full")}
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("首次 failed 终态写盘失败时 Task 应返回错误（不得继续上报并翻转为 success）")
+	}
+	if !errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("错误应保留 weread.ErrLoginInvalid 判别身份（终态决策已形成），实际: %v", err)
+	}
+	if !strings.Contains(err.Error(), "写入 Terminal State 失败") {
+		t.Errorf("错误应指明终态持久化失败；实际: %v", err)
+	}
+
+	// 决策点之后不再继续上报：链在 renewal 证据处终止（enter + 2 笔 timed 尝试、
+	// 证据 renewal + 重建后重试 renewal），无任何后续被接受的 timed report。
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "timed", "renewal", "renewal",
+	)
+
+	// 存储恢复后不得写入 success 终态：磁盘上无任何终态；不发任何最终通知。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatalf("不得写入任何终态（首次写盘失败后 Task 终止）: %+v", st)
+	}
+	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+		t.Errorf("不得发送任何最终通知，实际 %d 条", got)
 	}
 }
 
