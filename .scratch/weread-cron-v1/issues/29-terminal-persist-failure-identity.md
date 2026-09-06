@@ -6,7 +6,7 @@
 **Category:** bug
 **Blocked by:** None
 **Related:** ticket 15（终态先落盘再通知）、ticket 24（统一 finalization / 终态决策终局性）、ticket 12（timed report 连续失败预算）、ticket 27 / ticket 28（同源 findings/07，各自独立）
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Agent Brief
 
@@ -33,11 +33,11 @@
 - 相关注释同步（现注释声称错误身份"包装链保留、errors.Is 贯通"，终态写盘失败时该保证不成立）。
 
 **Acceptance criteria:**
-- [ ] 按 findings/07 H4 的确定性复现（恢复链耗尽 → 首次 failed 写盘失败 → 存储恢复 → 后续上报可被接受）运行，Task 仍以失败终止：不写 success 终态、不发成功通知、决策点之后不再继续上报。
-- [ ] 返回的错误指明终态持久化/存储失败，且不被调用方判为"可重试的暂时性上报失败"。
-- [ ] 恢复链内登录失效 finalization 的终态写盘失败遵守同一规则（不重入、不翻转为 success）。
-- [ ] 既有"持续写盘失败"测试回归：不发任何通知、Task 返回错误（`TestRunTerminalPersistFailureSuppressesNotification`）。
-- [ ] `go test -count=1 -race ./...` 全部通过。
+- [x] 按 findings/07 H4 的确定性复现（恢复链耗尽 → 首次 failed 写盘失败 → 存储恢复 → 后续上报可被接受）运行，Task 仍以失败终止：不写 success 终态、不发成功通知、决策点之后不再继续上报。
+- [x] 返回的错误指明终态持久化/存储失败，且不被调用方判为"可重试的暂时性上报失败"。
+- [x] 恢复链内登录失效 finalization 的终态写盘失败遵守同一规则（不重入、不翻转为 success）。
+- [x] 既有"持续写盘失败"测试回归：不发任何通知、Task 返回错误（`TestRunTerminalPersistFailureSuppressesNotification`）。
+- [x] `go test -count=1 -race ./...` 全部通过。
 
 **Out of scope:**
 - H1（恢复性 enter 重置失败预算）与 H2（恢复链大间隔未复查连续性）各自独立 ticket（27/28），不并入本票。
@@ -47,3 +47,18 @@
 ## 验证记录（triage）
 
 已对照 `internal/task/task.go` 确认：`failRecoveryExhausted`（约 L649–661）中 `finalize` 写盘失败时直接返回裸持久化错误，未包装 `report.ErrRejected`；该错误经 `recoverSend`（约 L536 处的返回）传回循环（约 L366–391），`errors.Is` 判别二者皆不匹配，落入暂时性失败分支（`consecutiveFailures++` + 继续）；后续成功上报走正常 success finalization。`failLoginInvalid` 经链内 renewal 步骤（约 L532 附近）返回时存在同类路径。测试缺口确认：`TestRunTerminalPersistFailureSuppressesNotification` 使用持续失败的 `failTerminalStore`，只验证"最终返回错误且不发通知"，未覆盖"首次终态写盘失败后不得重入 timed report 并在后续成功后翻转为 success"这一关键边界。
+
+## Answer
+
+全部验收通过。修复：`internal/task/task.go` 的两个终态决策出口在 `finalize` 持久化失败时，把返回错误与决策错误联合包装（Go 1.20+ 多 `%w`，`errors.Is` 贯通）——`failRecoveryExhausted` 包装 `cause`（`report.ErrRejected` 身份），`failLoginInvalid` 包装完整登录失效错误（`weread.ErrLoginInvalid` 身份 + 证据/重建诊断）；Timed 循环的终态判别（`errors.Is(err, report.ErrRejected) || errors.Is(err, weread.ErrLoginInvalid)`）据此直接终止 Task，绝不落入暂时性失败分支重入上报。
+
+1. **AC1/AC2（H4 确定性复现）**：新增 `TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity`——`timedRejects=3`（首笔 timed + 恢复链 2 次重试拒绝 → 链耗尽；此后上报会被接受）+ 首次 Save 失败的 `failOnceTerminalStore`（委托真实文件存储模拟存储恢复）。修复前：循环把裸持久化错误判为暂时性失败 → 继续上报 → success 终态 + 成功通知 + Task 返回 nil（翻转为 success）。修复后：线上序列恰为恢复链耗尽（enter + 3 笔 timed 尝试），决策点后零上报；磁盘无任何终态、零通知；返回错误同时满足 `errors.Is(err, report.ErrRejected)` 与包含"写入 Terminal State 失败"。
+2. **AC3（链内登录失效同一规则）**：新增 `TestRunLoginInvalidPersistFailKeepsInvalidIdentity`——`timedRejects=2` + `renewRejectFrom=2`（任务开始 renewal 成功、链内 renewal 起出现 succ:0 证据）：链在证据处终止（enter + 2 笔 timed 尝试 + 证据/重建两次 renewal），`errors.Is(err, weread.ErrLoginInvalid)` 贯通、无终态、零通知、无后续上报。
+3. **AC4（既有测试回归）**：`TestRunTerminalPersistFailureSuppressesNotification` 未改动且通过（五出口：success / renewal 收敛 / 恢复链耗尽 / 登录失效 / 选书失败；断言"写入 Terminal State 失败"文案与零通知均成立）。
+4. **AC5**：`go test -count=1 -race ./...` 全部通过。
+
+**边界遵守**：不改"先落盘再通知"顺序、通知渠道行为、失败预算数值（spec 决策 #13 / ADR-0005）；存储层（原子写/flock）未动；H1/H2 各自 ticket（27/28）已独立修复不并入。`finalize` 的裸持久化错误只流向不重入循环的出口（finalizeTransient / success / 选书失败），无需身份——例外说明已写入 `finalize` godoc（ticket 29 联合包装契约）。
+
+code-review（Standards + Spec 双轴）结论均为 OK with notes：Standards 轴 P2（两测试尾部断言重复，repo 风格偏好一场景一命名测试，不改；`alreadyFailed` 字段名与 doc 措辞已按意见修正）；Spec 轴 P2（登录失效持久化失败包装丢失证据/重建诊断——已改为联合包装完整登录失效错误，诊断保留）。
+
+**Commit:** 589cfad
