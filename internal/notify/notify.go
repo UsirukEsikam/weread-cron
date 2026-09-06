@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -230,7 +231,11 @@ func FormatDuration(d time.Duration) string {
 	}
 }
 
-// postJSON 向 url POST JSON body；非 2xx 视为失败。
+// postJSON 向 url POST JSON body；非 2xx 视为失败。传输层错误（DNS / TLS / 连接
+// 失败）与请求构造错误经 redactRequestError 脱敏后返回——Bark key 位于 URL path、
+// 企业微信 robot key 位于 URL query，Go 传输层错误串含完整请求 URL，不经脱敏会在
+// 日志/告警链路泄露通知凭据（issue 19 / F9）。脱敏只作用于返回的错误，实际发出的
+// 请求 URL 不变。
 func postJSON(ctx context.Context, client HTTPClient, url string, body any) error {
 	if client == nil {
 		client = http.DefaultClient
@@ -241,16 +246,44 @@ func postJSON(ctx context.Context, client HTTPClient, url string, body any) erro
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(data))
 	if err != nil {
-		return fmt.Errorf("构造通知请求失败: %w", err)
+		return fmt.Errorf("构造通知请求失败: %w", redactRequestError(err, url))
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := client.Do(req)
 	if err != nil {
-		return fmt.Errorf("发送通知失败: %w", err)
+		return fmt.Errorf("发送通知失败: %w", redactRequestError(err, url))
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		return fmt.Errorf("通知端点返回 HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// redactRequestError 对含完整请求 URL 的错误脱敏，仅保留"scheme://host"形态
+// （issue 19 / F9：Bark key 位于 URL path、企业微信 robot key 位于 URL query，
+// 去除 path/query 即不暴露通知凭据）。*url.Error 重建时保留 Op/Err——unwrap 语义
+// 与 errors.Is(err, context.Canceled) 等判别贯通保持；非 *url.Error 的错误串中
+// 出现完整 URL 时整体替换为脱敏形态（兜底，覆盖请求构造失败等路径；net/http 传输
+// 错误恒为 *url.Error，该兜底分支不保留 unwrap 语义——防未来非标准客户端即可）。
+func redactRequestError(err error, rawURL string) error {
+	var ue *url.Error
+	if errors.As(err, &ue) {
+		return &url.Error{Op: ue.Op, URL: redactURL(rawURL), Err: ue.Err}
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, rawURL) {
+		return err
+	}
+	return errors.New(strings.ReplaceAll(msg, rawURL, redactURL(rawURL)))
+}
+
+// redactURL 把通知 URL 脱敏为"仅 scheme://host"形态（主机足以在日志中定位端点；
+// path/query 中的凭据段整体去除）。解析失败时返回空串（宁可丢失定位信息也不泄露）。
+func redactURL(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
 }
