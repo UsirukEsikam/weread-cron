@@ -70,18 +70,30 @@ type fakeWeread struct {
 	// timedRejects > 0 时拒绝接下来 N 笔 timed report（恢复链中途成功场景）；
 	// enterRejects > 0 时拒绝接下来 N 笔 enter report。
 	// renewNoCookies 为 true 时 renewal 不返回 Set-Cookie。
+	// renewRejectCookies 为 true 时 renewal 的失败响应（HTTP 错误 / succ=0 /
+	// succ 缺失）也携带 Set-Cookie（断言失败响应不并入会话；issue 16）。
+	// reportRejectCookies 为 true 时被拒的 report 响应携带 Set-Cookie
+	// （断言失败响应不并入会话；issue 16）。
+	// readerRejectCookies 为 true 时 Reader 页失败响应（HTTP 500 / 无
+	// __INITIAL_STATE__ 的 HTML）携带 Set-Cookie（issue 16 断言用）。
+	// shelfErrCookies 为 true 时 Shelf errCode!=0 响应携带 Set-Cookie
+	// （issue 16 断言用）。
 	// timedFailCount > 0 时前 N 笔 timed report 返回 HTTP 500（传输级暂时性故障
 	// 注入，ticket 12：单次失败会话继续 / 连续失败预算场景）。注意与 timedRejects
 	// 的区分：后者是服务器明确拒绝（errCode 信封），前者是 HTTP 级故障。
 	// enterFailCount > 0 时前 N 笔 enter report 返回 HTTP 500（enter 阶段传输级
 	// 故障注入，ticket 24：enter 阶段暂时性失败的统一收敛场景）。
-	reportRejected bool
-	timedRejectAll bool
-	timedRejects   int
-	enterRejects   int
-	renewNoCookies bool
-	timedFailCount int
-	enterFailCount int
+	reportRejected      bool
+	timedRejectAll      bool
+	timedRejects        int
+	enterRejects        int
+	renewNoCookies      bool
+	renewRejectCookies  bool
+	reportRejectCookies bool
+	readerRejectCookies bool
+	shelfErrCookies     bool
+	timedFailCount      int
+	enterFailCount      int
 
 	// rotateReaderState 为 true 时每次 Reader 页抓取返回不同的 token/psvts
 	//（第 N 次抓取 = fake-reader-token-N / fake-psvts-N），用于断言恢复链刷新后
@@ -206,15 +218,24 @@ func (f *fakeWeread) handleRenewal(w http.ResponseWriter, r *http.Request) {
 	status := f.renewStatus
 	f.mu.Unlock()
 	if status != 0 {
+		if f.renewRejectCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPRENEW", Path: "/"})
+		}
 		w.WriteHeader(status)
 		fmt.Fprint(w, `{"errCode":500,"errMsg":"boom"}`)
 		return
 	}
 	if reject {
+		if f.renewRejectCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPRENEW", Path: "/"})
+		}
 		fmt.Fprint(w, `{"succ":0,"errMsg":"login expired"}`)
 		return
 	}
 	if f.renewNoSucc {
+		if f.renewRejectCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPRENEW", Path: "/"})
+		}
 		fmt.Fprint(w, `{"errCode":-2012,"errMsg":"error"}`)
 		return
 	}
@@ -253,10 +274,16 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	titleOverride, hasTitle := f.readerTitleByBook[enc]
 	f.mu.Unlock()
 	if fail || perBookFail {
+		if f.readerRejectCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPREADER", Path: "/"})
+		}
 		http.Error(w, "reader page unavailable", http.StatusInternalServerError)
 		return
 	}
 	if perBookNoState {
+		if f.readerRejectCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPREADER", Path: "/"})
+		}
 		io.WriteString(w, `<html><body><div>这本书不可阅读</div></body></html>`)
 		return
 	}
@@ -303,6 +330,9 @@ func (f *fakeWeread) handleShelf(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if errCode != 0 {
+		if f.shelfErrCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPSHELF", Path: "/"})
+		}
 		fmt.Fprintf(w, `{"errCode":%d,"errMsg":"not authorized"}`, errCode)
 		return
 	}
@@ -378,6 +408,9 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if reject {
+		if f.reportRejectCookies {
+			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPREPORT", Path: "/"})
+		}
 		fmt.Fprint(w, `{"errCode":-2014,"errMsg":"err"}`)
 		return
 	}
@@ -2016,6 +2049,60 @@ func TestRunEnterRejectedRecoveryChainSucceeds(t *testing.T) {
 	}
 }
 
+// TestRunRejectedReportDoesNotMergeResponseCookies 断言被服务器拒绝的 report
+// 响应携带的 Set-Cookie 不并入会话（issue 16 / F6）：enter 被拒 → 恢复链 refresh
+// → retry 接受 → Task 成功；会话文件含 renewal 新 Cookie、不含拒绝响应的 Cookie。
+func TestRunRejectedReportDoesNotMergeResponseCookies(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.enterRejects = 1 // 仅首笔 enter 拒绝；refresh 后重试接受
+		h.weread.reportRejectCookies = true
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("enter 恢复链成功后 Task 应继续: %v", err)
+	}
+	if res.Reports != 2 {
+		t.Errorf("Reports = %d，期望 2（任务完整执行）", res.Reports)
+	}
+	// renewal 新 Cookie 照常并入（回归）；被拒 enter 响应的 wr_gid=TRAPREPORT
+	// 不得进入持久化会话。
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sessData), `"value": "new123"`) || !strings.Contains(string(sessData), `"value": "newabc"`) {
+		t.Errorf("renewal 新 Cookie 应照常并入并持久化:\n%s", sessData)
+	}
+	if strings.Contains(string(sessData), "TRAPREPORT") {
+		t.Errorf("被拒 report 的 Set-Cookie 不得并入持久化 Login Session:\n%s", sessData)
+	}
+}
+
+// TestRunReaderPageFailureDoesNotMergeResponseCookies 断言 Reader 页业务失败
+// （200 但无法解析 __INITIAL_STATE__）响应携带的 Set-Cookie 不并入会话（issue 16
+// 一致语义）：renewal 新 Cookie 照常并入，Reader 页失败响应的不并入。
+func TestRunReaderPageFailureDoesNotMergeResponseCookies(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.readerNoStateByBook = map[string]bool{weread.EncodeID(testBookID): true}
+		h.weread.readerRejectCookies = true
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("Reader 页无法解析时 Task 应失败")
+	}
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// renewal 成功 → 新 Cookie 照常并入；Reader 页失败响应的 wr_gid=TRAPREADER 不得并入。
+	if !strings.Contains(string(sessData), `"value": "new123"`) {
+		t.Errorf("renewal 新 Cookie 应照常并入并持久化:\n%s", sessData)
+	}
+	if strings.Contains(string(sessData), "TRAPREADER") {
+		t.Errorf("Reader 页失败响应的 Set-Cookie 不得并入持久化 Login Session:\n%s", sessData)
+	}
+}
+
 // TestRunEnterRejectedRecoveryChainExhausted 断言 enter report 被拒且恢复链耗尽 →
 // failed 终态 + 失败通知（失败阶段 = enter report）：恢复链对 enter 同样适用、有界。
 func TestRunEnterRejectedRecoveryChainExhausted(t *testing.T) {
@@ -2311,6 +2398,65 @@ func TestRunRenewalNoSuccIsNotLoginInvalid(t *testing.T) {
 	}
 	if strings.Contains(string(msg), "登录已失效") {
 		t.Errorf("不含 succ 的失败不得套登录失效文案；body=%s", msg)
+	}
+}
+
+// TestRunRejectedRenewalDoesNotMergeResponseCookies 断言登录失效证据响应（succ=0）
+// 携带的 Set-Cookie 不被并入并持久化（issue 16 / F6）：证据 + 重建后重试均被拒，
+// 会话文件仍只含初始 Cookie（重建覆盖后不再被失败响应 Cookie 污染）。
+func TestRunRejectedRenewalDoesNotMergeResponseCookies(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewReject = 5 // 一律拒绝：证据 + 重建后重试均失败
+		h.weread.renewRejectCookies = true
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("renewal 被拒时 Task 应失败")
+	}
+	if !errors.Is(err, weread.ErrLoginInvalid) {
+		t.Errorf("应包装 ErrLoginInvalid，实际: %v", err)
+	}
+	if n := h.weread.count("/web/login/renewal"); n != 2 {
+		t.Errorf("renewal 数 = %d，期望 2（证据 + 重建后重试）", n)
+	}
+	// 失败响应的 Set-Cookie 不得进入持久化会话：文件只含初始 Cookie（重建覆盖），
+	// 不含失败响应携带的 wr_gid=TRAPRENEW。
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sessData), `"value": "123"`) || !strings.Contains(string(sessData), `"value": "abc"`) {
+		t.Errorf("会话文件应只含初始 Cookie:\n%s", sessData)
+	}
+	if strings.Contains(string(sessData), "TRAPRENEW") {
+		t.Errorf("被拒 renewal 的 Set-Cookie 不得并入持久化 Login Session:\n%s", sessData)
+	}
+}
+
+// TestRunRenewalNoSuccFailureDoesNotMergeResponseCookies 断言 200 但业务失败
+// （succ 缺失）的 renewal 响应携带的 Set-Cookie 不改写持久化 Login Session
+// （issue 16：非接受响应不并入；被拒时从初始 Cookie 重建也覆盖不到本场景）。
+func TestRunRenewalNoSuccFailureDoesNotMergeResponseCookies(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.renewNoSucc = true
+		h.weread.renewRejectCookies = true
+		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("renewal 无 succ 时 Task 应失败")
+	}
+	// 业务失败的 renewal 不改写持久化会话：仍是预置的 OLDSTALE，且不含失败
+	// 响应携带的 wr_gid=TRAPRENEW。
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sessData), `"value": "OLDSTALE"`) {
+		t.Errorf("业务失败的 renewal 不得改写持久化会话:\n%s", sessData)
+	}
+	if strings.Contains(string(sessData), "TRAPRENEW") {
+		t.Errorf("失败 renewal 的 Set-Cookie 不得并入持久化 Login Session:\n%s", sessData)
 	}
 }
 

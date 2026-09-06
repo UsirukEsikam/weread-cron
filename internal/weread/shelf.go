@@ -72,15 +72,19 @@ func ParseShelfResponse(data []byte) ([]ShelfBook, error) {
 
 // Shelf 获取当前账号书架：GET /web/shelf/sync（纯 Cookie 鉴权，UA/Cookie 由客户端
 // 统一注入，Referer 指向书架页）。传输/HTTP/解析失败均为普通错误（登录失效判别在
-// renewal 环节，不在此层）。
+// renewal 环节，不在此层）。响应 Set-Cookie 在业务接受（errCode==0）后才并入并
+// 持久化（issue 16：失败响应不改写持久化 Login Session）。
 func (c *Client) Shelf(ctx context.Context) ([]ShelfBook, error) {
-	resp, err := c.do(ctx, http.MethodGet, c.BaseURL+"/web/shelf/sync", c.BaseURL+"/web/shelf", nil)
+	resp, cookies, err := c.do(ctx, http.MethodGet, c.BaseURL+"/web/shelf/sync", c.BaseURL+"/web/shelf", nil)
 	if err != nil {
 		return nil, fmt.Errorf("抓取 Shelf 失败: %w", err)
 	}
 	books, err := ParseShelfResponse(resp)
 	if err != nil {
 		return nil, err // 错误已自描述（业务错误含 errCode/errMsg；解析错误含原因）
+	}
+	if err := c.MergeResponseCookies(cookies); err != nil {
+		return nil, fmt.Errorf("抓取 Shelf 失败: %w", err)
 	}
 	return books, nil
 }

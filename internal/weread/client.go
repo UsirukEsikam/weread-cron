@@ -5,7 +5,7 @@
 //
 // 请求形态按 weread.koplugin 的 client.lua 实现：
 //   - renewal：POST /web/login/renewal，body {"rq":"%2Fweb%2Fbook%2Fread","ql":false}，
-//     成功判定 succ==1（spec 决策 #5）；响应 Set-Cookie 交由调用方并入会话；
+//     成功判定 succ==1（spec 决策 #5）；响应 Set-Cookie 在接受后并入会话（issue 16）；
 //   - Shelf：GET /web/shelf/sync，纯 Cookie 鉴权；响应解析见 shelf.go（checklist #1）；
 //   - Reader 页：GET /web/reader/{_e(bookId)}，HTML 中解析 __INITIAL_STATE__；
 //   - report：POST /web/book/read，payload 为 JSON，enter/timed 字段集与签名由
@@ -59,7 +59,8 @@ type Client struct {
 	UserAgent string
 	// CookieHeader 返回发送给每种请求的 Cookie header（可为空串）。
 	CookieHeader func() string
-	// MergeCookies 接收响应 Set-Cookie（renewal 新 Cookie 并入 Login Session）。
+	// MergeCookies 接收响应 Set-Cookie（并入 Login Session；issue 16：接收方只在
+	// 响应被业务接受后调用本回调，失败的响应不改写持久化会话）。
 	MergeCookies func([]*http.Cookie) error
 }
 
@@ -80,13 +81,14 @@ func (c *Client) ReaderURL(bookID string) string {
 }
 
 // Renewal 在 Task 开始时刷新登录：POST /web/login/renewal（spec 决策 #5）。
-// 响应 Set-Cookie 经 MergeCookies 并入会话（持久化由 session 层负责）。
+// 响应 Set-Cookie 只在响应被接受后（HTTP 200 且 succ 确认）并入会话并持久化
+// （issue 16：失败的 renewal 不改写持久化 Login Session）。
 // 明确失败（HTTP 200 + 合法 JSON + succ 存在且不为 true/1）返回包装 ErrLoginInvalid
 // 的错误（登录失效的明确证据，checklist #2）；传输/非 200/解析失败/响应不含 succ
 // 字段不归为证据（暂时性失败）。
 func (c *Client) Renewal(ctx context.Context) error {
 	body := []byte(`{"rq":"%2Fweb%2Fbook%2Fread","ql":false}`)
-	resp, err := c.do(ctx, http.MethodPost, c.BaseURL+"/web/login/renewal", c.BaseURL, body)
+	resp, cookies, err := c.do(ctx, http.MethodPost, c.BaseURL+"/web/login/renewal", c.BaseURL, body)
 	if err != nil {
 		return fmt.Errorf("renewal 请求失败: %w", err)
 	}
@@ -102,47 +104,68 @@ func (c *Client) Renewal(ctx context.Context) error {
 		// 按暂时性失败处理（checklist #2 其余特征待实测，不静默加入判别集）。
 		return fmt.Errorf("renewal 响应无法确认为成功（succ 缺失）: %s", truncate(string(resp), 200))
 	}
+	// 响应被接受（HTTP 200 + succ 确认）后才并入并持久化响应 Set-Cookie。
+	if err := c.MergeResponseCookies(cookies); err != nil {
+		return fmt.Errorf("renewal 请求失败: %w", err)
+	}
 	return nil
 }
 
 // ReaderPage 抓取 Reader 页 HTML（用于解析 __INITIAL_STATE__ 与 Reading Progress）。
-func (c *Client) ReaderPage(ctx context.Context, bookID string) (string, error) {
+// 返回页面正文与响应 Set-Cookie；调用方在解析成功（业务接受）后经
+// MergeResponseCookies 并入会话（issue 16：失败响应不改写持久化 Login Session）。
+func (c *Client) ReaderPage(ctx context.Context, bookID string) (string, []*http.Cookie, error) {
 	url := c.ReaderURL(bookID)
-	resp, err := c.do(ctx, http.MethodGet, url, url, nil)
+	resp, cookies, err := c.do(ctx, http.MethodGet, url, url, nil)
 	if err != nil {
-		return "", fmt.Errorf("抓取 Reader 页失败: %w", err)
+		return "", nil, fmt.Errorf("抓取 Reader 页失败: %w", err)
 	}
-	return string(resp), nil
+	return string(resp), cookies, nil
 }
 
 // Report 发送 enter/timed report（POST /web/book/read）。
-// 返回解码后的响应体；是否被接受由 protocol.IsAccepted 判定（本层不裁决语义）。
-func (c *Client) Report(ctx context.Context, payload map[string]string, bookID string) (map[string]any, error) {
+// 返回解码后的响应体与响应 Set-Cookie；是否被接受由 protocol.IsAccepted 判定
+// （本层不裁决语义），接受后由调用方经 MergeResponseCookies 并入会话（issue 16）。
+func (c *Client) Report(ctx context.Context, payload map[string]string, bookID string) (map[string]any, []*http.Cookie, error) {
 	body, err := marshalPayload(payload)
 	if err != nil {
-		return nil, fmt.Errorf("序列化上报 payload 失败: %w", err)
+		return nil, nil, fmt.Errorf("序列化上报 payload 失败: %w", err)
 	}
-	resp, err := c.do(ctx, http.MethodPost, c.BaseURL+"/web/book/read", c.ReaderURL(bookID), body)
+	resp, cookies, err := c.do(ctx, http.MethodPost, c.BaseURL+"/web/book/read", c.ReaderURL(bookID), body)
 	if err != nil {
-		return nil, fmt.Errorf("上报请求失败: %w", err)
+		return nil, nil, fmt.Errorf("上报请求失败: %w", err)
 	}
 	var decoded map[string]any
 	if err := json.Unmarshal(resp, &decoded); err != nil {
-		return nil, fmt.Errorf("上报响应解析失败: %w", err)
+		return nil, nil, fmt.Errorf("上报响应解析失败: %w", err)
 	}
-	return decoded, nil
+	return decoded, cookies, nil
 }
 
-// do 执行带统一 header（UA/Cookie/Content-Type/Origin/Referer）的请求并返回 body。
-// 响应 Set-Cookie 经 MergeCookies 交给会话层。
-func (c *Client) do(ctx context.Context, method, url, referer string, body []byte) ([]byte, error) {
+// MergeResponseCookies 在响应被业务接受后并入响应 Set-Cookie（renewal / report /
+// Reader / Shelf 各业务调用方在成功判定后触发；issue 16：失败的响应不改写持久化
+// Login Session）。合并/持久化失败返回包装"并入响应 Cookie 失败"的错误（语义保持）。
+func (c *Client) MergeResponseCookies(cookies []*http.Cookie) error {
+	if c.MergeCookies == nil || len(cookies) == 0 {
+		return nil
+	}
+	if err := c.MergeCookies(cookies); err != nil {
+		return fmt.Errorf("并入响应 Cookie 失败: %w", err)
+	}
+	return nil
+}
+
+// do 执行带统一 header（UA/Cookie/Content-Type/Origin/Referer）的请求并返回 body
+// 与响应 Set-Cookie。本层不并入 Cookie：响应是否被接受由各业务调用方判定，接受后
+// 经 MergeResponseCookies 并入会话。非 200 响应的 Set-Cookie 不返回（响应未被接受）。
+func (c *Client) do(ctx context.Context, method, url, referer string, body []byte) ([]byte, []*http.Cookie, error) {
 	var rd io.Reader
 	if body != nil {
 		rd = bytes.NewReader(body)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, url, rd)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	req.Header.Set("User-Agent", c.UserAgent)
 	if c.CookieHeader != nil {
@@ -159,24 +182,17 @@ func (c *Client) do(ctx context.Context, method, url, referer string, body []byt
 	}
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("读取响应失败: %w", err)
-	}
-	if c.MergeCookies != nil {
-		if cookies := resp.Cookies(); len(cookies) > 0 {
-			if err := c.MergeCookies(cookies); err != nil {
-				return nil, fmt.Errorf("并入响应 Cookie 失败: %w", err)
-			}
-		}
+		return nil, nil, fmt.Errorf("读取响应失败: %w", err)
 	}
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
+		return nil, nil, fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(raw), 200))
 	}
-	return raw, nil
+	return raw, resp.Cookies(), nil
 }
 
 // marshalPayload 把 payload 序列化为 JSON：numericFields 中的键输出数字，其余输出字符串。

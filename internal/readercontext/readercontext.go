@@ -93,7 +93,7 @@ func (p *Provider) fetchAndStore(ctx context.Context, bookID string) (*State, er
 }
 
 func (p *Provider) fetch(ctx context.Context, bookID string) (*State, error) {
-	html, err := p.client.ReaderPage(ctx, bookID)
+	html, cookies, err := p.client.ReaderPage(ctx, bookID)
 	if err != nil {
 		return nil, fmt.Errorf("抓取 Reader 页失败: %w", err)
 	}
@@ -104,6 +104,11 @@ func (p *Provider) fetch(ctx context.Context, bookID string) (*State, error) {
 	progress, err := state.ReadingProgress(bookID)
 	if err != nil {
 		return nil, err
+	}
+	// 响应被接受（HTTP 200 + 解析成功）后才并入并持久化响应 Set-Cookie；失败的
+	// 响应不改写持久化 Login Session（issue 16：与 renewal/report/Shelf 同语义）。
+	if err := p.client.MergeResponseCookies(cookies); err != nil {
+		return nil, fmt.Errorf("抓取 Reader 页失败: %w", err)
 	}
 	return &State{Progress: progress, Context: state.ReaderContext(), Title: state.BookTitle()}, nil
 }

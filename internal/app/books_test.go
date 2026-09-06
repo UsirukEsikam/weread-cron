@@ -186,6 +186,31 @@ func TestListBooksShelfFailureIsPlainError(t *testing.T) {
 	}
 }
 
+// TestListBooksShelfRejectedDoesNotMergeResponseCookies 断言 Shelf 业务失败响应
+// （errCode!=0）携带的 Set-Cookie 不并入会话（issue 16 一致语义）：renewal 新
+// Cookie 照常并入并持久化，Shelf 失败响应的不并入。
+func TestListBooksShelfRejectedDoesNotMergeResponseCookies(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.shelfErrCode = -2010
+		h.weread.shelfErrCookies = true
+	})
+	_, err := h.app.ListBooks(context.Background())
+	if err == nil {
+		t.Fatal("Shelf errCode!=0 时 books 应失败")
+	}
+	// renewal 成功 → 新 Cookie 照常并入；Shelf 失败响应的 wr_gid=TRAPSHELF 不得并入。
+	sessData, err := os.ReadFile(filepath.Join(h.cfg.DataDir, "login_session.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(sessData), `"value": "new123"`) {
+		t.Errorf("renewal 新 Cookie 应照常并入并持久化:\n%s", sessData)
+	}
+	if strings.Contains(string(sessData), "TRAPSHELF") {
+		t.Errorf("Shelf 失败响应的 Set-Cookie 不得并入持久化 Login Session:\n%s", sessData)
+	}
+}
+
 // TestListBooksEmptyShelf 断言空书架返回空列表（无错误；CLI 输出为空即退出码 0）。
 func TestListBooksEmptyShelf(t *testing.T) {
 	h := setup(t, nil) // shelfBooks 默认 nil = 空书架
