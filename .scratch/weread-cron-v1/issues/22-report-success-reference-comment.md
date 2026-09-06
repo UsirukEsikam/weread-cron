@@ -5,7 +5,7 @@
 **Finding:** F7 · .scratch/weread-cron-v1/findings/02-deployment-and-operations.md
 **Category:** bug（低优先，注释失准）
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 修正 `internal/weread/protocol.go` 中 `IsAccepted` 的注释与证据描述:保持当前 OR 行为（succ 成功 或 synckey 存在即接受），不再写成「两参考项目共识」。准确表述为——该语义与 `weread.koplugin` 一致;`wxread` 更严格（succ 与 synckey 需同时存在才推进进度）;真实服务端 success boundary 仍属 protocol validation gap（checklist #9），本轮不改变 `IsAccepted` 行为。
 
@@ -35,9 +35,9 @@
 
 ## Acceptance criteria
 
-- [ ] `IsAccepted` 注释不再声称两参考项目共识;准确分述 koplugin（OR）与 wxread（AND，更严格）
-- [ ] 行为不变:相关测试（`TestIsAccepted` 等）全绿
-- [ ] 保留「边界未经实测 / protocol validation gap」标注（checklist #9）
+- [x] `IsAccepted` 注释不再声称两参考项目共识;准确分述 koplugin（OR）与 wxread（AND，更严格）
+- [x] 行为不变:相关测试（`TestIsAccepted` 等）全绿
+- [x] 保留「边界未经实测 / protocol validation gap」标注（checklist #9）
 
 ## Out of scope
 
@@ -60,3 +60,28 @@
   即 `succ` 与 `synckey` 同时存在才计数（AND，更严格）。
 - koplugin 侧:本地注释与 checklist #9 记载 koplugin 以 `succ==1` 或 `synckey` 存在判定接受（OR）。
 - 判断:注释不能继续写成「两参考项目共识」;真实服务端 success boundary 保持为 protocol validation gap，本轮只修注释与证据描述。
+
+## Answer
+
+修正 `internal/weread/protocol.go` 中 `IsAccepted` 的注释与证据描述，准确反映参考项目的实际实现分歧：
+
+1. **注释精确化**：
+   - 在 `internal/weread/protocol.go` 的包级未实测项说明（#9）与 `IsAccepted` 函数注释中，去除「两参考项目共识」的失准表述。
+   - 准确分述参考项目差异：`weread.koplugin` 接受 `succ` 成功或 `synckey` 存在（OR 逻辑，本实现与其一致）；`wxread`（findmover/wxread）更严格，要求 `succ` 与 `synckey` 均存在才推进进度（AND 逻辑），两者并不构成共识。
+   - 严格保留「真实服务端 success boundary 仍属 protocol validation gap（checklist #9）」的说明，本轮不改变运行时 OR 行为。
+2. **相邻注释与清单同步**：
+   - 同步修正 `internal/weread/protocol_test.go` 中 `TestIsAccepted` 的用例注释，替换原有的参考项目共识表述。
+   - 同步修正 `docs/protocol-validation-checklist.md` 第 9 项的「当前假设（待验证）」列，补充与 `weread.koplugin` 一致、`wxread` 更严格且两者非共识的背景描述。
+
+### 验证记录
+
+- **单测与回归验证**：
+  - `go test -v ./internal/weread -run TestIsAccepted` 通过。
+  - `go test -race ./internal/weread/...` 通过。
+  - `go vet ./...` 与全量测试 `go test -count=1 ./...` 全绿（15/15 包测试全部通过）。
+- **运行时行为不变**：`IsAccepted` 与 `IsSucc` 的函数实现保持 0 改动，现有 truthy/falsy 测试用例全部通过。
+
+### 评审（ticket 22 双轴 code-review）结果
+
+- **Standards 轴**：Pass（No issues found）。无代码异味，注释用语符合 `CONTEXT.md` 术语表与既有文档风格规范。
+- **Spec 轴**：Pass（No issues found）。验收条件全部满足，分述准确，未引入任何功能蔓延。
