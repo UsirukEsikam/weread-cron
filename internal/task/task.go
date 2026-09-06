@@ -10,9 +10,10 @@
 // Context → retry → renewal → refresh Reader Context → retry → 仍失败 → failed 终态 +
 // 失败通知（失败阶段、主要错误、已尝试恢复动作）。
 // ticket 06 范围：Reader Context TTL 到期（参考默认 ≈15 分钟）时主动重新抓取 Reader
-// 页刷新 Context（Reading Session 继续：无 enter、rt 基准不变）；异常墙钟间隔超过
-// 内部阈值（DefaultAnomalyThreshold）时不形成大 rt 上报，而是重建 Reading Session
-// （重新 enter；Task 继续、同一本书、累计保留）。TTL 与阈值均为内部默认（spec 决策 #13）。
+// 页刷新 Context；异常墙钟间隔超过内部阈值（DefaultAnomalyThreshold）时不形成大 rt
+// 上报，而是重建 Reading Session（重新 enter；Task 继续、同一本书、累计保留）。
+// TTL 与阈值均为内部默认（spec 决策 #13）。issue 31：TTL 到期主动刷新获得新 Context
+// 时同样重建 Reading Session（见下 "issue 31 范围"）。
 // ticket 09 范围（本文件）：未配置候选书时自动从 Shelf 选书——Shelf 元数据过滤
 // （优先未读完）→ 有界探测 Reader Context（验证可建）→ 全部不可用回退已读完但可用
 // 的书 → 仍不可用 → failed 终态 + 失败通知；`weread-cron books` 由应用边界交付
@@ -47,8 +48,26 @@
 // 秒级时间戳)），该会话的 enter 与全部 timed reports 复用——无论各报告构造时刻、
 // TTL 主动刷新或恢复链内 refresh Reader Context（均无 re-enter）如何；仅异常间隔
 // 重建（重新 enter）时生成新的 fallback pc（实证：fallback pc 每笔更换与长会话
-// 拒收关联，findings/08；本票不改动可用 pclts 路径与 TTL/-2012 recovery 是否
-// re-enter 的现状）。
+// 拒收关联，findings/08）。生命周期边界（issue 31 之后）：TTL 主动刷新或恢复链内
+// refresh 产生的新 Context = 重建 + 重新 enter = 新会话 = 新会话级 pc（fallback
+// 场景不复用前一会话的值，值 = e(重建时刻)；可用 pclts 场景 = 新 Context 原值）；
+// 同一会话内各报告构造时刻的差异不改变 pc。可用 pclts 路径与 -2012 recovery 是否
+// re-enter 的现状按本票验收口径执行。
+//
+// issue 31 范围（本文件）：统一不变量——任何新的 Reader Context 一旦被成功采用，
+// 在使用该 Context 发送任何 timed report 之前必须先成功 enter。两条采用路径同规则：
+//   - TTL 到期主动刷新（timed 循环每笔前的 Fetch 发现 TTL 过期、重新抓取获得新
+//     Context）：新 Context = 重建 Reading Session = 重新 enter（新会话级 pc；
+//     rt 基准从其被接受时刻重置）；本节奏点不发 timed、下一节奏点接续。
+//   - 恢复链内 refresh（recoverSend step 0/3）：采用新 Context 后，链内重试即重建
+//     enter（不再复用调用方传入的发送闭包——timed 阶段的链内重试不再是 timed
+//     report；enter 无 rt，重试步不做超阈值判定）。
+// re-enter 成功不得清零连续 timed-report failure budget（issue 27：只有被接受的
+// timed report 清零）且计入预算——服务器持续拒绝 timed（enter 被接受）时，拒绝 +
+// 重建循环必须收敛为 failed 终态（spec 决策 #7/#9/#12 有界收敛）。任何一笔 timed
+// report 的 rt 均不超过 DefaultAnomalyThreshold（ADR-0004；重建后基准重置）。
+// 刷新自身失败（未产生新 Context）不触发重建：沿用现有 Context 继续（ticket 05
+// 先例）。
 //
 // # rt 语义（ADR-0004）
 //
@@ -58,9 +77,12 @@
 // 间隔超过内部异常阈值（默认 90s）时，不把大间隔作为一次 rt 上报，而是重建
 // Reading Session（重新 enter report；Task 继续、同一本书、累计保留）。阈值判定
 // 沿用既有整秒边界（按上报的整秒 rt 值比较：> 阈值才重建；恰等于阈值不重建）。
-// 连续性判定对每一笔上报尝试生效——含恢复链内重试（重试时刻重算 rt 后再判，ticket
-// 28，findings/07 H2）与阻塞式工作（如慢速 Reader Context 抓取）推迟后的首次尝试
-// （时间基准在阻塞工作之后取得）：超过阈值的间隔不得作为一笔 rt 上报。
+// 连续性判定对每一笔 timed 首次尝试生效——含阻塞式工作（如慢速 Reader Context
+// 抓取 / TTL 到期重抓）推迟后的尝试（时间基准在阻塞工作之后取得）：超过阈值的
+// 间隔不得作为一笔 rt 上报（ticket 28，findings/07 H2）。恢复链内重试即重建
+// enter（enter 无 rt、无超阈值判定；issue 31）。重建（异常间隔重建 / TTL 新
+// Context 重建 / 恢复链重建 enter）被接受后 rt 基准从其被接受时刻重置——任何一笔
+// timed report 的 rt 均不超过 DefaultAnomalyThreshold（ADR-0004；issue 31）。
 //
 // # 有界恢复链（spec 决策 #7）
 //
@@ -69,17 +91,18 @@
 // 恢复链按固定有界序列执行 5 步：refresh Reader Context → retry → renewal →
 // refresh Reader Context → retry。任何一步成功即视为恢复成功、Task 继续；
 // 最后一步重试仍被拒绝 → 恢复链耗尽 → failed 终态先落盘、再发失败通知。
+// issue 31：refresh 采用新 Context 后，重试即重建 enter（新 Reading Session、新
+// 会话级 pc）——timed 阶段的链内重试不再是 timed report（enter 无 rt、重试步不做
+// 超阈值判定）；enter 被接受即恢复成功（新会话建立，rt 基准从其被接受时刻重置）。
 // 链中步骤的非拒绝失败（传输/HTTP/解析）按暂时性失败处理（ticket 24：经
 // finalizeTransient 无条件收敛为 failed 终态 + 失败通知，不再检查窗口截止时刻）——
 // 与 ticket 04 对 renewal 暂时性失败收敛为失败终态的姿态一致；renewal 的登录失效
 // 明确证据仍走 ticket 04 的判别与路径（重建一次 → 仍失败 → 登录失效终态 +
 // 登录失效通知，不混入普通失败文案）。
-// 链中重试按重试时刻重算 rt；若重算后已超过异常阈值（恢复期间耗时 / 时钟跳变），
-// 不发送该笔超限 rt、终止链（以 chainStop 载体返回），由调用方按 ADR-0004 重建
-// Reading Session（ticket 28）。
-// 恢复链终止的连续性断链计入 timed 循环的连续失败预算——拒绝 + 慢恢复把每次重试
-// 推过阈值的循环必须收敛（spec 决策 #7/#9/#12 有界收敛；与 ticket 27 同一预算
-// 语义：重建 enter 不清零、只有被接受的 timed report 清零）。
+// timed 循环的连续失败预算语义（issue 27/31）：重建 enter 不清零、只有被接受的
+// timed report 清零；恢复链以重建 enter 成功（reEnter）计入预算——服务器持续拒绝
+// timed（enter 被接受）时，拒绝 + 重建循环必须收敛为 failed 终态（spec 决策
+// #7/#9/#12 有界收敛；ticket 28 的拒绝 + 慢恢复循环同收敛于本预算）。
 package task
 
 import (
@@ -356,12 +379,10 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		// Reader Context TTL 主动刷新（spec 决策 #5/#6；用户故事 #30）：每笔 timed
 		// report 前经 Fetch 取 Context——TTL（readercontext.DefaultContextTTL，参考
 		// 默认 ≈15 分钟）内命中缓存零网络请求；到期时重新抓取 Reader 页刷新
-		// （新 token/psvts）。刷新不重置 rt 基准：Reading Session 继续，无 enter、
-		// 不中断（用户故事 #27/#30）。issue 30：刷新同样不改变会话级 pc（fallback
-		// pc 只在重新 enter 时重新生成）。
+		// （新 token/psvts）。
 		// 刷新失败按暂时性处理（ticket 05 对链中 refresh 失败的先例）：沿用现有
 		// Context 继续，下次周期再试；若服务器因此拒绝上报，恢复链会先 refresh 再
-		// retry（已覆盖该情形）。
+		// 重建 enter（已覆盖该情形）。
 		fresh, err := r.opts.Reader.Fetch(ctx, bookID)
 		if err != nil {
 			// ticket 18：Fetch 因 ctx 取消失败不是暂时性故障——不沿用现有 Context
@@ -370,6 +391,25 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 				return Result{}, cancelledExit(ctx)
 			}
 			o.Logger.Warn("Reader Context 刷新失败（沿用现有 Context，按暂时性处理）", "err", err)
+		} else if !sameContext(fresh.Context, st.Context) {
+			// issue 31：TTL 到期主动刷新获得新 Context（token/psvts 更换）——任何新
+			// Context 在被采用后、以其发送任何 timed report 之前必须先成功 enter。
+			// 重建 Reading Session（重新 enter = 新会话 = 新会话级 pc；fallback 场景
+			// 原值取 e(重建时刻)），rt 基准从新 enter 被接受时刻重置（不把旧会话的
+			// 长间隔带入下一笔 timed；ADR-0004）。TTL 刷新是正常轮换不是失败：不计入
+			// 连续失败预算（与异常间隔重建同一姿态）。本节奏点不发 timed（重建已消费
+			// 该节奏点），下一节奏点接续。
+			o.Logger.Info("Reader Context 已刷新（新 Context），重建 Reading Session")
+			enterResult, err := r.sendEnter(ctx, bookID, *fresh, o.Clock.Now(), taskDate)
+			if err != nil {
+				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
+			}
+			st, lastSent = enterResult.st, enterResult.at
+			// issue 30/31：重建 = 明确建立新的 Reading Session → 解析新的会话级 pc
+			// （fallback 场景不复用前一会话的值；可用 pclts 场景取新 Context 原值）。
+			sessionPC = enterResult.pc
+			next = lastSent.Add(DefaultRhythm)
+			continue
 		} else {
 			st = *fresh
 		}
@@ -379,44 +419,31 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		now = o.Clock.Now()
 
 		// 每笔 timed report 的 rt = 距上次被成功接受上报的实际间隔（ADR-0004）。
-		// send 对"首次尝试"与"恢复链内每次重试"（重试时刻重算 rt）共用同一连续性
-		// 判定：rt 超过异常阈值（DefaultAnomalyThreshold）时返回 errIntervalOverThreshold
+		// rt 超过异常阈值（DefaultAnomalyThreshold）时返回 errIntervalOverThreshold
 		// 且不发送该笔间隔（绝不落线），由调用方重建 Reading Session（ticket 28，
-		// findings/07 H2）——阈值内的重试延迟仍自然并入下一次被接受的 rt（用户故事
-		// #28）；恰等于阈值沿用既有边界（> 阈值才重建）。
+		// findings/07 H2）——阈值内的延迟仍自然并入下一次被接受的 rt（用户故事
+		// #28）；恰等于阈值沿用既有边界（> 阈值才重建）。恢复链内重试不再执行本
+		// 判定：refresh 后重试即重建 enter（enter 无 rt；issue 31）。
 		send := func(s readercontext.State, t time.Time) (int, error) {
 			rt := rtSeconds(t, lastSent)
 			if time.Duration(rt)*time.Second > DefaultAnomalyThreshold {
 				return 0, errIntervalOverThreshold
 			}
 			// issue 30：每笔上报携带会话级 pc（sessionPC 在 enter 建立时解析，
-			// fallback 场景会话内稳定，不随构造时刻/Context 刷新变化）。
+			// 会话内稳定；重建后为新会话的 pc）。
 			return rt, o.Sender.Timed(ctx, bookID, s.Progress, s.Context, sessionPC, t, rt, t.UnixMilli(), o.RNG.Intn(1000))
 		}
-		newSt, rt, at, err := r.recoverSend(ctx, bookID, StageTimedReport, st, now, send, taskDate)
+		res, err := r.recoverSend(ctx, bookID, StageTimedReport, st, now, send, sessionPC, taskDate)
 		if errors.Is(err, errIntervalOverThreshold) {
 			// 异常间隔（如主机 suspend / 恢复期间耗时 / 慢速 Fetch）：不作为一次大 rt
 			// 上报，重建 Reading Session（重新 enter；Task 继续、累计保留，用户故事
-			// #29；ADR-0004）。enter 使用 recoverSend 返回的 Context（恢复链刷新后的
-			// 最新 Context；未进链时为上方 Fetch 给出的 Context，跳变越过 TTL 即为刚
-			// 重抓的新 Context），同样走恢复链。
-			//
-			// 恢复链内触发的断链（重试重算 rt 超阈值；错误经 chainStop 载体返回）计入
-			// 连续失败预算：该拒绝未被链解决而重建，连续出现（拒绝 + 慢恢复把每轮重试
-			// 都推过阈值）时必须收敛为 failed 终态（spec 决策 #7/#9/#12 有界收敛）——
-			// 与 ticket 27 同一预算语义：重建 enter 不清零，只有下方被接受的 timed
-			// report 清零。首次尝试的连续性断链（非拒绝路径）不计入：其后必然接一笔
-			// ≤ 阈值的上报或其它失败路径，天然有界。
-			var stop *chainStop
-			if errors.As(err, &stop) {
-				consecutiveFailures++
-				if consecutiveFailures >= DefaultMaxConsecutiveReportFailures {
-					err = fmt.Errorf("timed report 连续 %d 次暂时性失败: %w", consecutiveFailures, err)
-					return Result{}, r.finalizeTransient(ctx, StageTimedReport, err, taskDate)
-				}
-			}
+			// #29；ADR-0004）。enter 使用本次 Fetch 给出的最新 Context（res.st），
+			// 同样走恢复链。首次尝试的连续性断链不计入连续失败预算：其后必然接一笔
+			// ≤ 阈值的上报或其它失败路径，天然有界（ticket 28；恢复链内重试已无
+			// 超限判定——重试即重建 enter）。重建 enter 不清零预算（ticket 27：只有
+			// 下方被接受的 timed report 清零）。
 			o.Logger.Warn("异常间隔，重建 Reading Session", "rt_sec", rtSeconds(o.Clock.Now(), lastSent))
-			enterResult, err := r.sendEnter(ctx, bookID, newSt, o.Clock.Now(), taskDate)
+			enterResult, err := r.sendEnter(ctx, bookID, res.st, o.Clock.Now(), taskDate)
 			if err != nil {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 			}
@@ -424,12 +451,6 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			// issue 30：重建 = 明确建立新的 Reading Session → 解析新的会话级 pc
 			// （fallback 场景不复用前一会话的值，值 = e(重建时刻)）。
 			sessionPC = enterResult.pc
-			// ticket 27（findings/07 H1）：重建 enter 成功只证明 Reader Context /
-			// Reading Session 重新建立，不证明 timed report 路径已恢复——连续失败
-			// 预算只在"一笔被接受的 timed report"出现时清零（下方成功分支），重建
-			// enter 不清零。否则持续慢故障（每笔 timed report 延迟后失败、每次失败
-			// 把下一次尝试推过异常阈值）时，重建 enter 会反复清零预算，Task 永不
-			// 收敛为 failed 终态（有界收敛保证，spec 决策 #7/#9/#12）。
 			next = lastSent.Add(DefaultRhythm)
 			continue
 		}
@@ -458,11 +479,33 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			next = now.Add(DefaultRhythm)
 			continue
 		}
+		if res.reEnter {
+			// issue 31：恢复链以重建 enter 成功（新会话建立，rt=0）——本节奏点的
+			// timed 已被拒收、不重发；rt 基准从新 enter 被接受时刻重置，下一节奏点
+			// 接续（不把旧会话的长间隔作为大 rt 上报；ADR-0004）。
+			// ticket 27/31：重建 enter 成功不得清零连续失败预算（只证明 Reading
+			// Session 重建、不证明 timed report 路径已恢复），且计入预算——服务器
+			// 持续拒绝 timed（enter 被接受）时，拒绝 + 重建循环必须收敛为 failed
+			// 终态（spec 决策 #7/#9/#12 有界收敛；仅被接受的 timed report 清零）。
+			consecutiveFailures++
+			if consecutiveFailures >= DefaultMaxConsecutiveReportFailures {
+				cause := &chainStop{
+					actions: append([]string(nil), res.actions...),
+					err:     fmt.Errorf("timed report 连续 %d 次暂时性失败（重建 Reading Session 未恢复 timed report 路径）", consecutiveFailures),
+				}
+				return Result{}, r.finalizeTransient(ctx, StageTimedReport, cause, taskDate)
+			}
+			o.Logger.Warn("timed report 被拒，恢复链重建 Reading Session 后继续（新会话；预算未清零）", "consecutive_failures", consecutiveFailures)
+			st, lastSent = res.st, res.at
+			sessionPC = res.pc
+			next = lastSent.Add(DefaultRhythm)
+			continue
+		}
 		consecutiveFailures = 0
-		st, lastSent = newSt, at
-		accumulated += time.Duration(rt) * time.Second
+		st, lastSent = res.st, res.at
+		accumulated += time.Duration(res.rt) * time.Second
 		reports++
-		o.Logger.Debug("timed report 接受", "rt_sec", rt, "accumulated", accumulated.String(), "reports", reports)
+		o.Logger.Debug("timed report 接受", "rt_sec", res.rt, "accumulated", accumulated.String(), "reports", reports)
 		next = lastSent.Add(DefaultRhythm)
 	}
 
@@ -508,6 +551,14 @@ func rtSeconds(t, lastSent time.Time) int {
 	return s
 }
 
+// sameContext 判断两个 Reader Context 是否一致（psvts/pclts/token 全等；issue 31）：
+// TTL 到期主动刷新 / 恢复链 refresh 得到的 Context 与当前会话采用的 Context 不一致
+// 时，即"新 Context 被采用"——在其上发送任何 timed report 之前必须先 enter（重建
+// Reading Session = 新会话 = 新会话级 pc）。
+func sameContext(a, b weread.ReaderContext) bool {
+	return a.Psvts == b.Psvts && a.Pclts == b.Pclts && a.Token == b.Token
+}
+
 // cancelledExit 是取消（ctx 取消）退出的统一错误（ticket 18）：取消不是 Task 的
 // 业务最终失败——尽快返回、不写 success/failed 终态、不发最终通知（当天无终态，
 // 重启/手动 run 按"无 Terminal State"规则重新执行）。包装 ctx.Err() 保持
@@ -522,63 +573,75 @@ func (r *Runner) fetchReaderState(ctx context.Context, bookID string) (*readerco
 	return r.opts.Reader.Fetch(ctx, bookID)
 }
 
-// sendResult 是一次上报尝试的结果：被接受的 Reader 状态、会话级 pc（issue 30：
-// Reading Session 建立时经 ResolvePC 解析一次，会话内全部上报复用）、被接受的 rt
-// （enter 为 0）与发送时刻（恢复链重试时为重试时刻）。
+// sendResult 是一次上报尝试/恢复链的结果：被接受的 Reader 状态、会话级 pc（issue
+// 30：Reading Session 建立时经 ResolvePC 解析一次，会话内全部上报复用）、被接受的
+// rt（enter 或重建 enter 为 0）与发送时刻（恢复链重试时为重试时刻）。
+// reEnter 为 true 表示恢复链以重建 enter（新 Reading Session）成功：rt=0、pc 为
+// 新会话的 pc、actions 为该轮链中已尝试的恢复动作（issue 31；timed 循环据此更新
+// 会话状态而不累计 rt、按预算计数收敛）。
 type sendResult struct {
-	st readercontext.State
-	pc string
-	rt int
-	at time.Time
+	st      readercontext.State
+	pc      string
+	rt      int
+	at      time.Time
+	reEnter bool
+	actions []string
 }
 
-// sendEnter 发送 enter report（不含计时字段）；被拒时按有界恢复链恢复，返回刷新后的状态。
-// 同时解析该 Reading Session 的会话级 pc（issue 30）：Pclts 可用（非空、非 "0"）→
-// Reader Context 原值；空/"0" → fallback e(会话建立时刻的秒级时间戳)——会话内 enter
-// 与全部 timed reports 复用（含恢复链内 refresh Reader Context，无 re-enter 不改变），
-// 仅明确重新 enter（新会话）时重新解析。
+// sendEnter 发送 enter report（不含计时字段）；被拒时按有界恢复链恢复，返回被接受
+// 的 enter 所用的状态与解析的会话级 pc。同时解析该 Reading Session 的会话级 pc
+// （issue 30）：Pclts 可用（非空、非 "0"）→ Reader Context 原值；空/"0" → fallback
+// e(会话建立时刻的秒级时间戳)——会话内 enter 与全部 timed reports 复用。issue 31：
+// 恢复链内 refresh 采用新 Context 后，重试即重建 Reading Session（新会话级 pc 从
+// 新 Context 重新解析；见 recoverSend）。
 // taskDate 是 Task 开始日（恢复链耗尽的终态/通知日期用；见 Run）。
 func (r *Runner) sendEnter(ctx context.Context, bookID string, st readercontext.State, now time.Time, taskDate string) (sendResult, error) {
 	pc := weread.ResolvePC(st.Context, now)
 	send := func(s readercontext.State, t time.Time) (int, error) {
 		return 0, r.opts.Sender.Enter(ctx, bookID, s.Progress, s.Context, pc, t)
 	}
-	newSt, rt, at, err := r.recoverSend(ctx, bookID, StageEnterReport, st, now, send, taskDate)
+	res, err := r.recoverSend(ctx, bookID, StageEnterReport, st, now, send, pc, taskDate)
 	if err != nil {
 		return sendResult{}, err
 	}
-	return sendResult{st: newSt, pc: pc, rt: rt, at: at}, nil
+	return res, nil
 }
 
 // reportSend 发送一笔上报并返回被接受的 rt（enter 恒为 0）；err 为 nil 代表被接受。
-// 恢复链的每次重试都重新调用（fresh Reader Context、fresh rt/ts/rn）。
-// 实现方（timed 循环的 send 闭包）对每次尝试（含重试）执行连续性判定：rt 超过异常
-// 阈值时返回 errIntervalOverThreshold 而不发送（ticket 28，findings/07 H2）。
+// 仅用于恢复链的首次尝试（issue 31：refresh 采用新 Context 后，链内重试即重建
+// enter，不再复用本闭包）。实现方（timed 循环的 send 闭包）执行连续性判定：rt 超过
+// 异常阈值时返回 errIntervalOverThreshold 而不发送（ticket 28，findings/07 H2）。
 type reportSend func(st readercontext.State, now time.Time) (rtSec int, err error)
 
 // recoverSend 是上报发送 + 有界恢复链核心：
-//   - 首次尝试被接受 → 直接成功；
-//   - 首次尝试非"拒绝"（传输/HTTP/解析失败）→ 原样返回（恢复链只针对明确拒绝）；
-//   - 首次尝试被拒绝 → 按 spec 决策 #7 执行有界序列：refresh Reader Context → retry →
-//     renewal → refresh Reader Context → retry。任何一步成功即恢复；
+//   - 首次尝试（send 闭包：enter 阶段为 enter、timed 阶段为 timed）被接受 → 直接
+//     成功（reEnter=false；返回的 pc = 调用方传入的当前会话 pc）；
+//   - 首次尝试非"拒绝"（传输/HTTP/解析失败）→ 原样返回（恢复链只针对明确拒绝），
+//     返回的 st 保持传入状态（调用方在异常间隔重建时使用）；
+//   - 首次尝试被拒绝 → 按 spec 决策 #7 执行有界序列：refresh Reader Context → retry
+//     → renewal → refresh Reader Context → retry。issue 31：refresh 采用新 Context
+//     后，重试即重建 enter（新 Reading Session），不再复用首次尝试的闭包——timed
+//     阶段的链内重试不再是 timed report（enter 无 rt，重试步不做超阈值判定）；新
+//     会话级 pc 从新 Context 重新解析（fallback = e(重试时刻)，可用 pclts = 新
+//     Context 原值）。enter 被接受 = 恢复成功（reEnter=true、rt=0、at = 重试时刻）；
 //     最后一步重试仍被拒绝 → failRecoveryExhausted（failed 终态 + 失败通知）；
 //     链中步骤的非拒绝失败按暂时性失败处理（ticket 24：由调用方经 finalizeTransient
 //     收敛为 failed 终态 + 失败通知）；
-//     renewal 的登录失效明确证据经 r.renew 走 ticket 04 路径（登录失效终态 + 通知）；
-//     重试重算 rt 后若已超异常阈值（恢复期间耗时 / 时钟跳变），终止链并以 chainStop
-//     携带 errIntervalOverThreshold 返回（不发送该笔超限 rt），由调用方重建 Reading
-//     Session 并计入连续失败预算（ticket 28）。
+//     renewal 的登录失效明确证据经 r.renew 走 ticket 04 路径（登录失效终态 + 通知）。
 //
+// 返回 sendResult：直接接受时 pc = sessionPC（timed 阶段 = 当前会话的 sessionPC；
+// enter 阶段 = 本入口首次尝试的 pc）；链内重建 enter 成功时 pc = 新会话的 pc
+// （调用方据此更新会话状态）。
 // taskDate 是 Task 开始日（终态/通知日期用；见 Run）。
-func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st readercontext.State, now time.Time, send reportSend, taskDate string) (readercontext.State, int, time.Time, error) {
+func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st readercontext.State, now time.Time, send reportSend, sessionPC string, taskDate string) (sendResult, error) {
 	o := r.opts
 
 	rt, err := send(st, now)
 	if err == nil {
-		return st, rt, now, nil
+		return sendResult{st: st, pc: sessionPC, rt: rt, at: now}, nil
 	}
 	if !errors.Is(err, report.ErrRejected) {
-		return st, 0, now, err
+		return sendResult{st: st}, err
 	}
 	o.Logger.Warn("上报被服务器拒绝，进入有界恢复链", "stage", stage, "err", err)
 
@@ -592,49 +655,41 @@ func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st reade
 			actions = append(actions, ActionRefreshContext)
 			newSt, ferr := r.opts.Reader.Refresh(ctx, bookID)
 			if ferr != nil {
-				return current, 0, now, &chainStop{
+				return sendResult{}, &chainStop{
 					actions: append([]string(nil), actions...),
 					err:     fmt.Errorf("%s 恢复链终止（刷新 Reader Context 失败，按暂时性失败处理）: %w", stage, ferr),
 				}
 			}
 			current = *newSt
 		case 1, 4:
-			// 重试上报：rt/ts/rn 重算（重试延迟自然并入下一次 rt，ADR-0004 / 用户
-			// 故事 #28）。
+			// 重试 = 重建 enter（issue 31）：refresh 已采用新 Context——任何 timed
+			// report 之前必须先 enter，故重试即重新建立 Reading Session（enter 无
+			// rt，重试时刻不重算 timed rt、无超阈值判定）。新会话级 pc 从新 Context
+			// 重新解析（lifecycle：明确重新 enter = 新会话 = 新会话级 pc）。enter 被
+			// 接受 = 恢复成功（reEnter=true、rt=0；at/ts/rn 以重试时刻为准——rt 基准
+			// 从其被接受时刻重置，ADR-0004）。
 			actions = append(actions, ActionRetryReport)
 			t := o.Clock.Now()
-			rt, err := send(current, t)
-			if err == nil {
-				return current, rt, t, nil
+			pc := weread.ResolvePC(current.Context, t)
+			if err := o.Sender.Enter(ctx, bookID, current.Progress, current.Context, pc, t); err == nil {
+				return sendResult{st: current, pc: pc, rt: 0, at: t, reEnter: true, actions: append([]string(nil), actions...)}, nil
 			}
 			lastErr = err
-			if errors.Is(err, errIntervalOverThreshold) {
-				// ticket 28（findings/07 H2）：重试重算 rt 后发现间隔已超过异常阈值
-				//（恢复期间耗时 / 时钟跳变 / 慢速刷新）——不发送这笔超限 rt、终止链，
-				// 由调用方按 ADR-0004 重建 Reading Session（重新 enter；Task 继续、
-				// 同一本书、累计保留）。以 chainStop 载体返回：调用方据此把该断链
-				// 计入连续失败预算（拒绝 + 慢恢复循环必有界收敛）、并在预算耗尽时
-				// 用已尝试动作构造失败通知。
-				return current, 0, t, &chainStop{
-					actions: append([]string(nil), actions...),
-					err:     err,
-				}
-			}
 			if !errors.Is(err, report.ErrRejected) {
-				return current, 0, now, &chainStop{
+				return sendResult{}, &chainStop{
 					actions: append([]string(nil), actions...),
 					err:     fmt.Errorf("%s 恢复链终止（重试失败，按暂时性失败处理）: %w", stage, err),
 				}
 			}
 			if step == recoverySteps-1 {
-				return current, 0, now, r.failRecoveryExhausted(ctx, stage, lastErr, actions, taskDate)
+				return sendResult{}, r.failRecoveryExhausted(ctx, stage, lastErr, actions, taskDate)
 			}
 		case 2:
 			// renewal：ticket 04 语义内嵌（明确证据 → 从初始 Cookie 重建一次 → 重试；
 			// 仍失败 → 登录失效终态 + 登录失效通知，错误在此返回不进入普通失败路径）。
 			actions = append(actions, ActionRenewal)
 			if rerr := r.renew(ctx, taskDate); rerr != nil {
-				return current, 0, now, &chainStop{
+				return sendResult{}, &chainStop{
 					actions: append([]string(nil), actions...),
 					err:     fmt.Errorf("%s 恢复链终止（renewal 失败）: %w", stage, rerr),
 				}
@@ -642,14 +697,16 @@ func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st reade
 		}
 	}
 	// 不可达：recoverySteps 内的最后一次 retry 已返回。
-	return current, 0, now, fmt.Errorf("%s 恢复链耗尽: %w", stage, lastErr)
+	return sendResult{}, fmt.Errorf("%s 恢复链耗尽: %w", stage, lastErr)
 }
 
 // chainStop 是恢复链"未解决即终止"的错误的载体（ticket 12/24/28）：携带链中已尝试的
 // 恢复动作（失败通知的 notify.Failure.Actions 数据源）。errors.As 提取；包装链
 // 保留（errors.Is 贯通——恢复链从不携带 ErrRejected，携带的收敛错误
-// ErrLoginInvalid 经 errors.Is 判别跳过重复收敛；携带 errIntervalOverThreshold
-// 时表示"重试重算 rt 超阈值、不发送、链终止"，ticket 28）。
+// ErrLoginInvalid 经 errors.Is 判别跳过重复收敛）。issue 31：恢复链内重试即重建
+// enter（无 rt），已不再携带 errIntervalOverThreshold（timed 循环以 reEnter 结果
+// 计数预算收敛，见 Run）；chainStop 仍承载链中非拒绝失败的暂时性终止与 timed 循环
+// 重建预算耗尽的失败通知动作。
 type chainStop struct {
 	actions []string
 	err     error

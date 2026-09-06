@@ -84,10 +84,16 @@ type fakeWeread struct {
 	// 的区分：后者是服务器明确拒绝（errCode 信封），前者是 HTTP 级故障。
 	// enterFailCount > 0 时前 N 笔 enter report 返回 HTTP 500（enter 阶段传输级
 	// 故障注入，ticket 24：enter 阶段暂时性失败的统一收敛场景）。
+	// enterRejectAt > 0 时仅拒绝第 N 笔 enter report（一次性；issue 31 恢复链场景：
+	// 初始 enter 接受、仅链中重建 enter 拒绝）。
+	// enterRejectFrom > 0 时从第 N 笔 enter report 起全部拒绝（issue 31 恢复链耗尽
+	// 场景：初始 enter 接受、链中全部重建 enter 拒绝）。
 	reportRejected      bool
 	timedRejectAll      bool
 	timedRejects        int
 	enterRejects        int
+	enterRejectAt       int
+	enterRejectFrom     int
 	renewNoCookies      bool
 	renewRejectCookies  bool
 	reportRejectCookies bool
@@ -502,6 +508,19 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 	} else if f.enterRejects > 0 {
 		reject = true
 		f.enterRejects--
+	} else if f.enterRejectAt > 0 {
+		// issue 31：仅拒绝第 N 笔 enter（一次性）——初始 enter 接受、链内重建 enter
+		// 拒绝；随后 enter 恢复接受（恢复链经 renewal 成功后继续的场景）。
+		f.enterRejectAt--
+		if f.enterRejectAt == 0 {
+			reject = true
+		}
+	} else if f.enterRejectFrom == 1 {
+		// issue 31：从第 N 笔 enter 起全部拒绝——初始 enter 接受、链内全部重建
+		// enter 拒绝（恢复链耗尽的场景）。
+		reject = true
+	} else if f.enterRejectFrom > 1 {
+		f.enterRejectFrom--
 	}
 	f.mu.Unlock()
 	if timedFail || enterFail {
@@ -1290,8 +1309,9 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 }
 
 // runTTLScenario 运行 20 分钟目标 Task（40 笔 timed report，跨越 DefaultContextTTL
-// 边界）并断言公共骨架：Reports=40、41 笔 report（1 enter + 40 timed）、enter 恰 1 笔
-// （无 enter 重复）、所有 rt=30（TTL 刷新不重置 rt 基准）。返回 report 记录供各测试
+// 边界）并断言公共骨架：Reports=40、42 笔 report（2 enter + 40 timed）、enter 恰 2
+// 笔（初始 + TTL 边界重建；issue 31：新 Context 必须先 enter）、所有 rt=30（重建后
+// rt 基准从新 enter 被接受时刻重置，不把旧会话间隔带入）。返回 report 记录供各测试
 // 断言各自的 Context 切换边界。
 func runTTLScenario(t *testing.T, h *testHarness) []wereadRequest {
 	t.Helper()
@@ -1303,8 +1323,8 @@ func runTTLScenario(t *testing.T, h *testHarness) []wereadRequest {
 		t.Fatalf("Reports = %d，期望 40（20 分钟 × 30s 节奏）", res.Reports)
 	}
 	reports := h.reportRecords()
-	if len(reports) != 41 {
-		t.Fatalf("report 数 = %d，期望 41（1 enter + 40 timed）", len(reports))
+	if len(reports) != 42 {
+		t.Fatalf("report 数 = %d，期望 42（2 enter + 40 timed）", len(reports))
 	}
 	enterCount := 0
 	for _, rec := range reports {
@@ -1312,8 +1332,8 @@ func runTTLScenario(t *testing.T, h *testHarness) []wereadRequest {
 			enterCount++
 		}
 	}
-	if enterCount != 1 {
-		t.Errorf("enter 数 = %d，期望 1（TTL 刷新不重建 Reading Session）", enterCount)
+	if enterCount != 2 {
+		t.Errorf("enter 数 = %d，期望 2（初始 + TTL 边界重建）", enterCount)
 	}
 	for i, rec := range reports {
 		p := payloadFromWire(t, rec.Body)
@@ -1327,11 +1347,13 @@ func runTTLScenario(t *testing.T, h *testHarness) []wereadRequest {
 	return reports
 }
 
-// TestRunContextTTLExpiryRefreshesWithoutEnter 断言 Reader Context TTL（参考默认
-// ≈15 分钟 = 900s；30s 节奏下第 30 笔 timed report 前到期）到期时主动重新抓取 Reader
-// 页（新 token/psvts）刷新 Context；后续 timed report 继续——无 enter 重复、rt 不受
-// 影响（用户故事 #30；spec 决策 #5/#6；验证清单 #7/#8 口径）。
-func TestRunContextTTLExpiryRefreshesWithoutEnter(t *testing.T) {
+// TestRunContextTTLExpiryReentersBeforeTimedUseNewContext 断言 Reader Context TTL
+// （参考默认 ≈15 分钟 = 900s；30s 节奏下第 30 笔 timed report 前到期）到期时主动重新
+// 抓取 Reader 页（新 token/psvts）获得新 Context 后，下一笔上报是 enter report
+// （重建 Reading Session；新会话级 pc），enter 被接受后才以其发送 timed report——
+// 边界前 timed 使用初始 Context、边界后 timed 使用新 Context；边界处 enter 数 = 2
+// （初始 + TTL 边界；issue 31）。
+func TestRunContextTTLExpiryReentersBeforeTimedUseNewContext(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.rotateReaderState = true // 第 N 次抓取 = token-N/psvts-N，断言刷新生效
 		h.cfg.ReadMinutesMin = 20
@@ -1345,9 +1367,9 @@ func TestRunContextTTLExpiryRefreshesWithoutEnter(t *testing.T) {
 		t.Errorf("Reader 页抓取数 = %d，期望 2（初始 + TTL 到期主动刷新）", n)
 	}
 
-	// ---- Context 切换边界：TTL = 900s、节奏 30s → 第 30 笔 timed（索引 30）起使用
+	// ---- Context 切换边界：TTL = 900s、节奏 30s → 第 30 笔 timed（索引 31）起使用
 	//      TTL 刷新后的 Context（psvts-2/token-2）；此前（索引 1..29）为初始 Context
-	//      （psvts-1/token-1）。 ----
+	//      （psvts-1/token-1）；索引 30 是 TTL 边界的重建 enter（psvts-2）。 ----
 	enter := payloadFromWire(t, reports[0].Body)
 	if enter["ps"] != "fake-psvts-1" {
 		t.Errorf("enter.ps = %s，期望初始 Context（psvts-1）", enter["ps"])
@@ -1370,19 +1392,114 @@ func TestRunContextTTLExpiryRefreshesWithoutEnter(t *testing.T) {
 			}
 		}
 	}
-	// issue 30（可用 pclts 路径也按会话建立时解析一次携带）：TTL 刷新换页带来新
-	// pclts（fake-pclts-2），但 enter 与全部 timed reports 的 pc 均为会话建立时的
-	// fake-pclts-1（换页不改变会话 pc；与官方客户端页面会话内 pc 稳定一致）。
+	// 重建 enter（索引 30）使用 TTL 刷新后的新 Context（psvts-2）。
+	if ps := payloadFromWire(t, reports[30].Body)["ps"]; ps != "fake-psvts-2" {
+		t.Errorf("重建 enter.ps = %s，期望 TTL 刷新后的新 Context（psvts-2）", ps)
+	}
+	// issue 30/31（可用 pclts 路径）：pc 按会话携带——会话 1（enter 与 timed[0..29]）
+	// 为会话建立时的 fake-pclts-1；TTL 边界重建（新会话）后（索引 30..41）为
+	// 新 Context 的 fake-pclts-2（重建 + re-enter = 新会话新 pc）。
 	for i, rec := range reports {
-		if pc := payloadFromWire(t, rec.Body)["pc"]; pc != "fake-pclts-1" {
-			t.Errorf("report[%d].pc = %s，期望会话建立时解析的可用 pclts（fake-pclts-1）", i, pc)
+		want := "fake-pclts-1"
+		if i >= 30 {
+			want = "fake-pclts-2"
+		}
+		if pc := payloadFromWire(t, rec.Body)["pc"]; pc != want {
+			t.Errorf("report[%d].pc = %s，期望 %s（会话级 pc，重建后取新 Context 原值）", i, pc, want)
+		}
+	}
+}
+
+// TestRunTTLRebuildEnterRejectedRecoversWithFreshContext 断言 TTL 边界的重建 enter
+// 本身被拒时走 enter 的有界恢复链（issue 31：TTL 新 Context 必须先 enter；enter 被拒
+// → 恢复链 refresh（再次换新 Context）→ 重建 enter 被接受 → 新会话以链内刷新后的
+// 最新 Context 继续；恢复链内重试即重建 enter，非 timed retry）：20 分钟 Task 跨 TTL
+// 边界持续成功，enter 数 = 2（初始 + TTL 边界），边界后全部 timed 接受且用链内刷新
+// 后的新 Context（psvts-3）；fallback pc 随新会话更新（值 = e(重建时刻)）。
+func TestRunTTLRebuildEnterRejectedRecoversWithFreshContext(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.pcltsZero = true
+		h.weread.rotateReaderState = true
+		h.weread.enterRejectAt = 2 // 仅拒绝 TTL 边界的重建 enter（初始 enter 接受）
+		h.cfg.ReadMinutesMin = 20
+		h.cfg.ReadMinutesMax = 20
+	})
+	est := h.clk.Now()
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("TTL 边界重建 enter 被拒后应经恢复链恢复并完成 Task: %v", err)
+	}
+	if res.Reports != 40 || res.Actual != 20*time.Minute {
+		t.Errorf("Result = reports:%d actual:%v，期望 40 次/20 分钟", res.Reports, res.Actual)
+	}
+
+	// ---- 线上按序：renewal → refresh(1) → enter#1 → timed×29 → refresh(2,TTL 到期) →
+	//      enter#2(重建,拒) → refresh(3,链内) → enter#3(重建,接受) → timed×11。 ----
+	want := []string{"renewal", "refresh", "enter"}
+	for i := 0; i < 29; i++ {
+		want = append(want, "timed")
+	}
+	want = append(want, "refresh", "enter", "refresh", "enter")
+	for i := 0; i < 11; i++ {
+		want = append(want, "timed")
+	}
+	if kinds := h.requestKinds(); !reflect.DeepEqual(kinds, want) {
+		t.Errorf("请求序列 = %v\n期望 = %v", kinds, want)
+	}
+	if n := h.weread.count("/web/reader/"); n != 3 {
+		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + TTL 到期重抓 + 链内刷新）", n)
+	}
+
+	// ---- 会话 1（索引 0..29）pc = e(t=0)、psvts-1；重建（索引 30..42）pc = e(t=900)、
+	//      链内刷新后的 psvts-3（enter#2 被拒后链内 refresh 换出的新 Context）。 ----
+	reports := h.reportRecords()
+	if len(reports) != 43 {
+		t.Fatalf("report 数 = %d，期望 43（3 enter 尝试 + 40 timed）", len(reports))
+	}
+	pc1 := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+	pc2 := weread.EncodeID(strconv.FormatInt(est.Add(900*time.Second).Unix(), 10))
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		want := pc1
+		if i >= 30 {
+			want = pc2
+		}
+		if p["pc"] != want {
+			t.Errorf("report[%d].pc = %s，期望 %s（会话级 fallback pc）", i, p["pc"], want)
+		}
+		switch {
+		case i <= 29:
+			if p["ps"] != "fake-psvts-1" {
+				t.Errorf("report[%d].ps = %s，期望会话 1 Context（psvts-1）", i, p["ps"])
+			}
+		case i == 30:
+			// 被拒的 TTL 边界重建 enter 使用重抓的 Context（psvts-2；尚未进链刷新）。
+			if p["ps"] != "fake-psvts-2" {
+				t.Errorf("report[%d].ps = %s，期望 TTL 重抓的新 Context（psvts-2）", i, p["ps"])
+			}
+		default:
+			if p["ps"] != "fake-psvts-3" {
+				t.Errorf("report[%d].ps = %s，期望链内刷新后的最新 Context（psvts-3）", i, p["ps"])
+			}
+		}
+	}
+	// 全部 timed rt=30（重建后 rt 基准从新 enter 被接受时刻重置）。
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		if p["rt"] != "30" {
+			t.Errorf("timed[%d].rt = %s，期望 30", i, p["rt"])
 		}
 	}
 }
 
 // TestRunContextTTLRefreshFailureContinuesWithExistingContext 断言 TTL 主动刷新失败
 // （暂时性：HTTP 500）时 Task 不中断：沿用现有 Context 继续上报，下次周期重试刷新并
-// 成功；Reading Session 无 enter 重建（ticket 05 对链中 refresh 暂时性失败的同一姿态）。
+// 成功（ticket 05 对链中 refresh 暂时性失败的同一姿态）。刷新失败未产生新 Context，
+// 不触发重建（issue 31：只有新 Context 被采用才需先 enter）：失败周期照常发 timed；
+// 重试成功获得新 Context 后以重建 enter 切换会话。
 func TestRunContextTTLRefreshFailureContinuesWithExistingContext(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.rotateReaderState = true
@@ -1398,7 +1515,8 @@ func TestRunContextTTLRefreshFailureContinuesWithExistingContext(t *testing.T) {
 	}
 
 	// ---- 失败周期（索引 30，t=900s 的 TTL 到期那次）沿用旧 Context（psvts-1）；
-	//      之后（索引 31..40）使用重试成功的 Context（psvts-3/token-3）。 ----
+	//      之后索引 31 是重试成功后的重建 enter（psvts-3），timed 索引 32..41 使用
+	//      重试成功的 Context（psvts-3/token-3）。 ----
 	for i, rec := range reports {
 		p := payloadFromWire(t, rec.Body)
 		if _, isTimed := p["rt"]; !isTimed {
@@ -1421,14 +1539,12 @@ func TestRunContextTTLRefreshFailureContinuesWithExistingContext(t *testing.T) {
 
 // --- issue 30（findings/08）：fallback pc 会话内稳定 ---
 
-// TestRunFallbackPCStableWithinSession 断言 Reader Context 无可用的 pclts（数字 0，
-// 真实账号观察形态；ticket 25 解析）时，fallback pc 在 Reading Session 建立时生成
-// 一次（值 = e(会话建立时刻的秒级时间戳)）并随会话复用：enter 与全部 timed reports
-// 携带同一个 pc，尽管各报告构造时刻（ct）不同；TTL 到期主动刷新 Reader Context
-// （无 re-enter，新 token/psvts）不改变所复用的 pc——与官方 Web Reader 页面会话内
-// 复用 pc 的口径一致（实证：fallback pc 每笔更换与长会话约 5 分钟拒收关联，
-// findings/08；修复前每笔上报按构造时刻重新生成 pc）。
-func TestRunFallbackPCStableWithinSession(t *testing.T) {
+// TestRunFallbackPCStablePerSessionRebuiltAtTTL 断言 Reader Context 无可用的 pclts
+// （数字 0，真实账号观察形态；ticket 25 解析）时，fallback pc 在每个 Reading Session
+// 建立时生成一次（值 = e(会话建立时刻的秒级时间戳)）并随会话复用（issue 30）；TTL
+// 到期主动刷新获得新 Context 时重建 Reading Session（重新 enter，issue 31）——新会话
+// 生成新的 fallback pc（值 = e(重建时刻)），不复用前一会话的值；两个会话内各自稳定。
+func TestRunFallbackPCStablePerSessionRebuiltAtTTL(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.pcltsZero = true
 		h.weread.rotateReaderState = true // TTL 刷新后 Context 变化可判别
@@ -1436,37 +1552,38 @@ func TestRunFallbackPCStableWithinSession(t *testing.T) {
 		h.cfg.ReadMinutesMax = 20
 	})
 
-	// enter 建立时刻 = Task 启动时刻（renewal/Reader 页抓取不消耗测试时钟）。
+	// 会话 1 建立时刻 = Task 启动时刻（renewal/Reader 页抓取不消耗测试时钟）；
+	// 会话 2 建立时刻 = TTL 边界重建时刻（t=900s，30s 节奏下的主动刷新点）。
 	est := h.clk.Now()
-	reports := runTTLScenario(t, h) // 41 笔：1 enter + 40 timed，enter 恰 1 笔（无 re-enter）
-	want := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+	reports := runTTLScenario(t, h) // 42 笔：2 enter + 40 timed，enter 恰 2 笔
+	want1 := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+	want2 := weread.EncodeID(strconv.FormatInt(est.Add(900*time.Second).Unix(), 10))
 
-	// ---- 全部报告的 pc 相同且等于 e(会话建立时刻)；各报告构造时刻不同。 ----
-	cts := map[string]bool{}
+	// ---- 会话 1（enter#1 与 timed[1..29]，索引 0..29）全部 pc = e(建立时刻)；
+	//      TTL 边界重建 enter（索引 30）与后续 timed（索引 31..41）全部 pc =
+	//      e(重建时刻)；不复用前一会话的值。 ----
 	for i, rec := range reports {
-		p := payloadFromWire(t, rec.Body)
-		cts[p["ct"]] = true
-		if p["pc"] != want {
-			t.Errorf("report[%d].pc = %s，期望会话级 fallback pc %s（建立时刻 %s）", i, p["pc"], want, est.Format(time.RFC3339))
+		want := want1
+		if i >= 30 {
+			want = want2
+		}
+		if pc := payloadFromWire(t, rec.Body)["pc"]; pc != want {
+			t.Errorf("report[%d].pc = %s，期望会话级 fallback pc %s", i, pc, want)
 		}
 	}
-	if len(cts) < 2 {
-		t.Errorf("报告构造时刻应不同（ct 集合大小 = %d），fallback pc 却保持同一值", len(cts))
-	}
 
-	// ---- TTL 刷新确实发生（索引 30 起 Context 切换为 psvts-2）且 pc 不变。 ----
+	// ---- TTL 刷新确实发生（索引 30 起 Context 切换为 psvts-2）且 pc 随会话切换。 ----
 	if ps := payloadFromWire(t, reports[30].Body)["ps"]; ps != "fake-psvts-2" {
-		t.Errorf("timed[30].ps = %s，期望 TTL 刷新后的 Context（psvts-2）", ps)
-	}
-	if pc := payloadFromWire(t, reports[30].Body)["pc"]; pc != want {
-		t.Errorf("TTL 刷新后 timed[30].pc = %s，期望仍为同一 fallback pc %s", pc, want)
+		t.Errorf("重建 enter（索引 30）.ps = %s，期望 TTL 刷新后的 Context（psvts-2）", ps)
 	}
 }
 
-// TestRunRecoveryRefreshKeepsFallbackPC 断言恢复链内 refresh Reader Context（无
-// re-enter）后继续使用同一 fallback pc（issue 30 AC4）：首笔 timed report 被拒 →
-// 恢复链 refresh（新 Context，token-2/psvts-2）→ 重试接受；链内刷新不改变会话 pc。
-func TestRunRecoveryRefreshKeepsFallbackPC(t *testing.T) {
+// TestRunRecoveryRefreshReentersWithNewFallbackPC 断言恢复链内 refresh Reader Context
+// 后重建 Reading Session（issue 31）：首笔 timed report 被拒 → 恢复链 refresh（新
+// Context，token-2/psvts-2）→ 重建 enter（新 Session、新会话级 fallback pc = e(重建
+// 时刻)）→ 恢复成功后 timed 继续且复用新 pc；不复用前一会话的值（issue 30 生命周期
+// 按「重建 + re-enter = 新会话新 pc」重写）。
+func TestRunRecoveryRefreshReentersWithNewFallbackPC(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.pcltsZero = true
 		h.weread.timedRejects = 1         // 仅首笔 timed 拒绝 → 进入恢复链
@@ -1477,23 +1594,31 @@ func TestRunRecoveryRefreshKeepsFallbackPC(t *testing.T) {
 	if err != nil {
 		t.Fatalf("恢复链 refresh 后 Task 应继续完成: %v", err)
 	}
-	want := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+	want1 := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+	want2 := weread.EncodeID(strconv.FormatInt(est.Add(30*time.Second).Unix(), 10))
 
-	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh → timed(重试
-	//      接受) → timed；全部报告的 pc 相同且 = e(会话建立时刻)。 ----
-	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "timed", "timed")
+	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh → enter(重建) →
+	//      timed → timed；会话 1（索引 0..1）pc = e(t=0)、会话 2（索引 2..4）pc =
+	//      e(t=30)（重建后不复用前一会话的值）。 ----
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "enter", "timed", "timed")
 	reports := h.reportRecords()
-	if len(reports) != 4 {
-		t.Fatalf("report 数 = %d，期望 4（1 enter + 3 timed）", len(reports))
+	if len(reports) != 5 {
+		t.Fatalf("report 数 = %d，期望 5（2 enter + 3 timed）", len(reports))
 	}
-	for i, rec := range reports {
-		if pc := payloadFromWire(t, rec.Body)["pc"]; pc != want {
-			t.Errorf("report[%d].pc = %s，期望同一 fallback pc %s", i, pc, want)
+	for i, want := range []string{want1, want1, want2, want2, want2} {
+		if pc := payloadFromWire(t, reports[i].Body)["pc"]; pc != want {
+			t.Errorf("report[%d].pc = %s，期望 %s（会话内稳定、重建后更新）", i, pc, want)
 		}
 	}
-	// 链内 refresh 确实发生：重试（索引 2）与后续 timed 使用新 Context（token-2）。
-	verifySG(t, payloadFromWire(t, reports[2].Body), "fake-reader-token-2")
-	verifySG(t, payloadFromWire(t, reports[3].Body), "fake-reader-token-2")
+	// 链内 refresh 确实发生：重建 enter（索引 2）与后续 timed 使用新 Context（psvts-2）。
+	if ps := payloadFromWire(t, reports[2].Body)["ps"]; ps != "fake-psvts-2" {
+		t.Errorf("重建 enter.ps = %s，期望链内刷新后的新 Context（psvts-2）", ps)
+	}
+	for _, i := range []int{3, 4} {
+		if ps := payloadFromWire(t, reports[i].Body)["ps"]; ps != "fake-psvts-2" {
+			t.Errorf("timed[%d].ps = %s，期望重建后的新 Context（psvts-2）", i, ps)
+		}
+	}
 	if res.Actual != time.Minute || res.Reports != 2 {
 		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次", res.Actual, res.Reports)
 	}
@@ -1799,13 +1924,12 @@ func TestRunSlowReaderFetchBeyondThresholdRebuildsNotOversizedRT(t *testing.T) {
 }
 
 // TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal 断言拒绝 + 慢恢复
-// 循环的有界收敛（ticket 28 与 spec 决策 #7/#9/#12）：服务器持续拒绝 timed、且每
-// 轮恢复链的 refresh 都慢到把重试时刻推过异常阈值——恢复链在重试步因连续性断链
-// 提前终止（超限 rt 不落线）、重建 enter 被接受后 Task 继续；若无预算约束该循环
-// 将无限重建（旧实现中同场景由链在 5 步内耗尽收敛，修复后链在第 1 步即终止，收敛
-// 责任转移到连续失败预算）。预算只在"被接受的 timed report"清零（ticket 27），
-// 恢复链内断链计入预算后 Task 在 3 轮内收敛为 failed 终态 + 失败通知（含已尝试
-// 恢复动作）。
+// 循环的有界收敛（ticket 28/issue 31 与 spec 决策 #7/#9/#12）：服务器持续拒绝 timed、
+// 且每轮恢复链的 refresh 都慢（重试时刻被推过异常阈值）——issue 31 下链内重试即重建
+// enter（enter 无 rt、无超阈值判定，慢恢复不产生超限 rt），被接受后 Task 继续、重建
+// enter 不清零预算且计入预算；若无预算约束该循环将无限重建。预算只在"被接受的
+// timed report"清零（ticket 27），Task 在 3 轮内收敛为 failed 终态 + 失败通知
+// （含已尝试恢复动作）。
 func TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.timedRejectAll = true                      // timed 一律拒绝；enter 接受
@@ -1820,9 +1944,10 @@ func TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal(t *testing.T)
 		close(done)
 	}()
 
-	// 每笔 Reader 页抓取都慢 70s（> 节奏 30s，把重试时刻推过阈值 90s）：初始抓取
-	// 不推进墙钟；随后每轮恢复链 refresh 推进 70s → 重试时刻 rt=100 > 90 → 连续性
-	// 断链 → 重建 enter。第 3 轮断链预算耗尽（cf=3）→ 收敛为 failed，不无限重建。
+	// 每笔 Reader 页抓取都慢 70s（> 节奏 30s）：初始抓取不推进墙钟；随后每轮恢复链
+	// refresh 推进 70s。issue 31：链内重试即重建 enter（enter 无 rt、无超阈值判定），
+	// 每轮拒绝 → refresh → 重建 enter 成功都计入连续失败预算（重建 enter 不清零）；
+	// 第 3 轮预算耗尽（cf=3）→ 收敛为 failed，不无限重建。
 	h.slowRefreshOnce(0) // 初始 Reader 页抓取
 	h.slowRefreshOnce(70 * time.Second)
 	h.slowRefreshOnce(70 * time.Second)
@@ -1843,14 +1968,14 @@ func TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal(t *testing.T)
 		t.Errorf("错误应说明连续失败预算；实际: %v", runErr)
 	}
 
-	// ---- 线上按序：三轮 = timed(拒) → refresh(慢) → [断链] → enter(重建)；第 3 轮
-	//      断链预算耗尽（不再重建）；Reader 页 4 次（初始 + 3 轮刷新）；超限 rt 从未
-	//      落线。 ----
+	// ---- 线上按序：三轮 = timed(拒) → refresh(慢) → enter(链内重建，被接受)；第 3
+	//      轮重建 enter 后预算耗尽（cf=3）→ 收敛为 failed，不无限重建；Reader 页 4
+	//      次（初始 + 3 轮刷新）；超限 rt 从未落线。 ----
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
 		"timed", "refresh", "enter",
 		"timed", "refresh", "enter",
-		"timed", "refresh",
+		"timed", "refresh", "enter",
 	)
 	if n := h.weread.count("/web/reader/"); n != 4 {
 		t.Errorf("Reader 页抓取数 = %d，期望 4（初始 + 3 轮恢复链刷新）", n)
@@ -2403,9 +2528,12 @@ func TestRunSuccessAcrossMidnightUsesTaskStartDate(t *testing.T) {
 // 耗尽）的终态与通知日期同样 = Task 开始日（ticket 24 的统一 taskDate invariant）：
 // Task 23:59:31 开始，首笔 timed report 于次日 00:00:01 到达并被拒，恢复链 5 步耗尽
 // ≈ 次日凌晨——failed 终态与失败通知用开始日 09-06（证明各失败出口共享同一日期规则）。
+// issue 31：链内重试即重建 enter，恢复链耗尽 = 链内全部重建 enter 被拒（初始 enter
+// 接受），故用 enterRejectFrom=2 拒绝自第 2 笔起的全部 enter。
 func TestRunRecoveryExhaustedAcrossMidnightUsesTaskStartDate(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejectAll = true // enter 接受；timed 一律拒绝 → 恢复链耗尽
+		h.weread.timedRejectAll = true // timed 一律拒绝 → 进入恢复链
+		h.weread.enterRejectFrom = 2   // 初始 enter 接受；链内重建 enter 全部拒绝 → 链耗尽
 		h.clk = clock.NewFake(time.Date(2025, 9, 6, 23, 59, 31, 0, testTZ))
 	})
 	_, err := h.runTask(context.Background())
@@ -2549,9 +2677,11 @@ func TestRunTerminalPersistFailureSuppressesNotification(t *testing.T) {
 // 终态持久化失败——调用方据此区分"已形成终态决策但存储失败"与"可重试的暂时性失败"。
 func TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		// 首笔 timed + 恢复链 2 次重试拒绝 → 链耗尽；此后上报会被接受（存储恢复后
-		// 若无 ticket 29 的身份保留，后续成功上报会把该最终失败翻转为 success）。
-		h.weread.timedRejects = 3
+		// 首笔 timed 拒绝 + 恢复链 2 次重建 enter 拒绝（issue 31：链内重试即重建
+		// enter）→ 链耗尽；此后上报会被接受（存储恢复后若无 ticket 29 的身份保留，
+		// 后续成功上报会把该最终失败翻转为 success）。
+		h.weread.timedRejects = 1
+		h.weread.enterRejectFrom = 2 // 初始 enter 接受；链内重建 enter 全部拒绝
 		h.term = &failOnceTerminalStore{inner: terminal.NewFileStore(h.cfg.DataDir), err: errors.New("disk full")}
 	})
 	_, err := h.runTask(context.Background())
@@ -2565,12 +2695,12 @@ func TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity(t *testing.T) {
 		t.Errorf("错误应指明终态持久化失败；实际: %v", err)
 	}
 
-	// 决策点之后不再继续上报：线上序列恰为恢复链耗尽（enter + 3 笔 timed 尝试，
-	// 含 2 次重试），无任何后续被接受的 timed report（修复前：继续上报、写 success
-	// 终态、发成功通知）。
+	// 决策点之后不再继续上报：线上序列恰为恢复链耗尽（enter + 首笔 timed + 链内
+	// 2 次重建 enter 尝试），无任何后续被接受的 timed report（修复前：继续上报、写
+	// success 终态、发成功通知）。
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
-		"timed", "refresh", "timed", "renewal", "refresh", "timed",
+		"timed", "refresh", "enter", "renewal", "refresh", "enter",
 	)
 
 	// 存储恢复后不得写入 success 终态：磁盘上无任何终态；不发任何最终通知（失败
@@ -2594,7 +2724,8 @@ func TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity(t *testing.T) {
 // weread.ErrLoginInvalid 判别身份并指明终态持久化失败。
 func TestRunLoginInvalidPersistFailKeepsInvalidIdentity(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejects = 2    // timed#1 与 retry#1 拒绝，进入链内 renewal 步骤
+		h.weread.timedRejects = 1    // timed#1 拒绝，进入链内重建 enter 步骤
+		h.weread.enterRejectAt = 2   // 链内重建 enter 拒绝 → 进入链内 renewal 步骤（issue 31）
 		h.weread.renewRejectFrom = 2 // 任务开始 renewal 成功；链内 renewal 起出现 succ:0 证据
 		h.term = &failOnceTerminalStore{inner: terminal.NewFileStore(h.cfg.DataDir), err: errors.New("disk full")}
 	})
@@ -2609,11 +2740,12 @@ func TestRunLoginInvalidPersistFailKeepsInvalidIdentity(t *testing.T) {
 		t.Errorf("错误应指明终态持久化失败；实际: %v", err)
 	}
 
-	// 决策点之后不再继续上报：链在 renewal 证据处终止（enter + 2 笔 timed 尝试、
-	// 证据 renewal + 重建后重试 renewal），无任何后续被接受的 timed report。
+	// 决策点之后不再继续上报：链在 renewal 证据处终止（enter + 首笔 timed + 链内
+	// 重建 enter + 证据 renewal + 重建后重试 renewal），无任何后续被接受的 timed
+	// report。
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
-		"timed", "refresh", "timed", "renewal", "renewal",
+		"timed", "refresh", "enter", "renewal", "renewal",
 	)
 
 	// 存储恢复后不得写入 success 终态：磁盘上无任何终态；不发任何最终通知。
@@ -2748,11 +2880,13 @@ func (h *testHarness) assertRequestSequence(want ...string) {
 // --- ticket 05：有界恢复链与失败通知 ---
 
 // TestRunReportRejectedRecoveryChainExhausted 断言 timed report 被拒时按有序恢复链
-// refresh → retry → renewal → refresh → retry 恢复（顺序与次数有界），仍失败 →
-// failed 终态（先落盘再通知）+ 失败通知（失败阶段/主要错误/已尝试恢复动作）。
+// refresh → 重建 enter → renewal → refresh → 重建 enter 恢复（顺序与次数有界；issue
+// 31：refresh 采用新 Context 后重试即重建 enter），仍失败 → failed 终态（先落盘再
+// 通知）+ 失败通知（失败阶段/主要错误/已尝试恢复动作）。
 func TestRunReportRejectedRecoveryChainExhausted(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejectAll = true // enter 接受；timed 一律拒绝
+		h.weread.timedRejectAll = true // timed 一律拒绝 → 进入恢复链
+		h.weread.enterRejectFrom = 2   // 初始 enter 接受；链内重建 enter 全部拒绝 → 链耗尽
 	})
 	// 通知端点收到失败通知时 failed 终态必须已落盘（spec 决策 #9/#10）。
 	h.bark.Check = func() error {
@@ -2779,10 +2913,10 @@ func TestRunReportRejectedRecoveryChainExhausted(t *testing.T) {
 	}
 
 	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh →
-	//      retry(拒) → renewal → refresh → retry(拒)：恢复链 5 步、次数有界 ----
+	//      enter(重建,拒) → renewal → refresh → enter(重建,拒)：恢复链 5 步、次数有界 ----
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
-		"timed", "refresh", "timed", "renewal", "refresh", "timed",
+		"timed", "refresh", "enter", "renewal", "refresh", "enter",
 	)
 	if n := h.weread.count("/web/reader/"); n != 3 {
 		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + 恢复链 2 次刷新）", n)
@@ -2791,7 +2925,7 @@ func TestRunReportRejectedRecoveryChainExhausted(t *testing.T) {
 		t.Errorf("renewal 数 = %d，期望 2（任务开始 + 恢复链 1 次）", n)
 	}
 	if n := h.weread.count("/web/book/read"); n != 4 {
-		t.Errorf("report 数 = %d，期望 4（enter + 3 次 timed（含 2 次重试））", n)
+		t.Errorf("report 数 = %d，期望 4（enter + timed + 2 次重建 enter）", n)
 	}
 
 	// ---- failed 终态（阻止当天再次自动执行）----
@@ -2835,11 +2969,12 @@ func TestRunReportRejectedRecoveryChainExhausted(t *testing.T) {
 	}
 }
 
-// TestRunRecoveryChainFirstRetrySucceeds 断言恢复链中途成功（refresh 后重试被接受）→
-// Task 继续并最终成功；刷新后的 payload 使用新 Reader Context（新 token/psvts）。
+// TestRunRecoveryChainFirstRetrySucceeds 断言恢复链中途成功（refresh 后重建 enter
+// 被接受；issue 31：refresh 采用新 Context 后重试即重建 enter）→ Task 继续并最终
+// 成功；刷新后的 payload 使用新 Reader Context（新 token/psvts）。
 func TestRunRecoveryChainFirstRetrySucceeds(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejects = 1 // 仅第 1 笔 timed 拒绝；重试即成功
+		h.weread.timedRejects = 1 // 仅第 1 笔 timed 拒绝；链内重建 enter 即成功
 		h.weread.rotateReaderState = true
 	})
 	res, err := h.runTask(context.Background())
@@ -2851,8 +2986,8 @@ func TestRunRecoveryChainFirstRetrySucceeds(t *testing.T) {
 	}
 
 	// ---- 线上按序：renewal → refresh(1) → enter → timed(拒) → refresh(2) →
-	//      timed(接受) → timed(接受)；无 renewal（重试即恢复）----
-	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "timed", "timed")
+	//      enter(重建,接受) → timed(接受) → timed(接受)；无 renewal（重建即恢复）----
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "enter", "timed", "timed")
 	if n := h.weread.count("/web/login/renewal"); n != 1 {
 		t.Errorf("renewal 数 = %d，期望 1（仅任务开始）", n)
 	}
@@ -2899,10 +3034,12 @@ func TestRunRecoveryChainFirstRetrySucceeds(t *testing.T) {
 }
 
 // TestRunRecoveryChainViaRenewalSucceeds 断言恢复链走到 renewal 环节成功
-// （renewal → refresh → retry 被接受）→ Task 继续并最终成功；次数有界。
+// （timed 被拒 → refresh → 重建 enter 被拒 → renewal → refresh → 重建 enter 被接受，
+// issue 31：链内重试即重建 enter）→ Task 继续并最终成功；次数有界。
 func TestRunRecoveryChainViaRenewalSucceeds(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejects = 2 // timed#1 与 retry#1 拒绝；renewal 后 retry#2 接受
+		h.weread.timedRejects = 1  // timed#1 拒绝 → 进入恢复链
+		h.weread.enterRejectAt = 2 // 链内重建 enter#1 拒绝；renewal 后重建 enter 接受
 	})
 	res, err := h.runTask(context.Background())
 	if err != nil {
@@ -2913,10 +3050,10 @@ func TestRunRecoveryChainViaRenewalSucceeds(t *testing.T) {
 	}
 
 	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh →
-	//      retry(拒) → renewal → refresh → retry(接受) → timed(接受) ----
+	//      enter(重建,拒) → renewal → refresh → enter(重建,接受) → timed×2 ----
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
-		"timed", "refresh", "timed", "renewal", "refresh", "timed", "timed",
+		"timed", "refresh", "enter", "renewal", "refresh", "enter", "timed", "timed",
 	)
 	if n := h.weread.count("/web/reader/"); n != 3 {
 		t.Errorf("Reader 页抓取数 = %d，期望 3（初始 + 恢复链 2 次刷新）", n)
@@ -2946,7 +3083,8 @@ func TestRunRecoveryChainViaRenewalSucceeds(t *testing.T) {
 // 故障（500）不影响企业微信渠道收到失败通知，也不影响 Task 结果（failed 终态落盘）。
 func TestRunRecoveryChainNotifyChannelIndependence(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejectAll = true
+		h.weread.timedRejectAll = true // timed 一律拒绝 → 进入恢复链
+		h.weread.enterRejectFrom = 2   // 初始 enter 接受；链内重建 enter 全部拒绝 → 链耗尽
 		h.bark.status = 500
 	})
 	_, err := h.runTask(context.Background())
@@ -2984,8 +3122,9 @@ func TestRunRecoveryChainNotifyChannelIndependence(t *testing.T) {
 // + 登录失效通知（固定提示）；不混入普通失败文案（无失败通知）。
 func TestRunRecoveryChainLoginInvalidGoesThroughT4(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejectAll = true
-		h.weread.renewRejectFrom = 2 // 任务开始 renewal 成功；恢复链中的 renewal 起出现 succ:0 证据
+		h.weread.timedRejectAll = true // timed 一律拒绝 → 进入恢复链
+		h.weread.enterRejectFrom = 2   // 初始 enter 接受；链内重建 enter 拒绝 → 走到链内 renewal
+		h.weread.renewRejectFrom = 2   // 任务开始 renewal 成功；恢复链中的 renewal 起出现 succ:0 证据
 		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
 	})
 	_, err := h.runTask(context.Background())
@@ -2997,11 +3136,11 @@ func TestRunRecoveryChainLoginInvalidGoesThroughT4(t *testing.T) {
 	}
 
 	// ---- 线上按序：renewal(任务开始) → refresh → enter → timed(拒) → refresh →
-	//      retry(拒) → renewal(succ:0 证据) → renewal(重建后重试) ----
+	//      enter(重建,拒) → renewal(succ:0 证据) → renewal(重建后重试) ----
 	//      有界：1 次证据 + 1 次重建重试，不无限重试。
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
-		"timed", "refresh", "timed", "renewal", "renewal",
+		"timed", "refresh", "enter", "renewal", "renewal",
 	)
 	if n := h.weread.count("/web/login/renewal"); n != 3 {
 		t.Errorf("renewal 数 = %d，期望 3（任务开始 + 证据 + 重建后重试）", n)
@@ -3057,10 +3196,12 @@ func TestRunRecoveryChainLoginInvalidGoesThroughT4(t *testing.T) {
 }
 
 // TestRunRecoveryChainLoginInvalidRebuildSucceedsContinues 断言恢复链中登录失效证据
-// 出现后从初始 Cookie 重建一次成功 → 恢复链继续（refresh → retry）→ Task 最终成功。
+// 出现后从初始 Cookie 重建一次成功 → 恢复链继续（refresh → 重建 enter）→ Task 最终
+// 成功。
 func TestRunRecoveryChainLoginInvalidRebuildSucceedsContinues(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
-		h.weread.timedRejects = 2      // timed#1 与 retry#1 拒绝
+		h.weread.timedRejects = 1      // timed#1 拒绝 → 进入恢复链
+		h.weread.enterRejectAt = 2     // 链内重建 enter 拒绝 → 走到链内 renewal
 		h.weread.renewRejectOnceAt = 2 // 仅恢复链中的那次 renewal 出现一次 succ:0 证据
 		seedSession(t, h.cfg.DataDir, &http.Cookie{Name: "wr_gid", Value: "OLDSTALE"})
 	})
@@ -3073,11 +3214,11 @@ func TestRunRecoveryChainLoginInvalidRebuildSucceedsContinues(t *testing.T) {
 	}
 
 	// ---- 线上按序：renewal(任务开始) → refresh → enter → timed(拒) → refresh →
-	//      retry(拒) → renewal(证据) → renewal(重建后重试) → refresh → retry(接受)
-	//      → timed(接受) ----
+	//      enter(重建,拒) → renewal(证据) → renewal(重建后重试) → refresh →
+	//      enter(重建,接受) → timed(接受) ×2 ----
 	h.assertRequestSequence(
 		"renewal", "refresh", "enter",
-		"timed", "refresh", "timed", "renewal", "renewal", "refresh", "timed", "timed",
+		"timed", "refresh", "enter", "renewal", "renewal", "refresh", "enter", "timed", "timed",
 	)
 
 	// success 终态 + 成功通知；无登录失效通知、无失败通知。
