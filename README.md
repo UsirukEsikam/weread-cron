@@ -1,14 +1,14 @@
 # weread-cron
 
-微信读书自动阅读服务（单账号）。
+微信读书自动阅读（单账号）。
 
-服务在后台常驻运行，每天在设定的运行时间窗口（Run Window）内随机挑一个时刻自动执行阅读任务。阅读时在真实书籍页面停留并累计阅读时长，固定在当前页面不翻页，不伪造异常阅读进度。
+每天在设定的运行时间窗口（Run Window）内随机挑一个时刻自动执行阅读任务。
 
 如果任务执行失败，程序会记录当天失败结果并支持手动重试；次日继续按计划执行新的自动任务。
 
 ## 快速部署
 
-镜像已发布至 GitHub Container Registry：`ghcr.io/UsirukEsikam/weread-cron:latest`，支持 `linux/amd64` 与 `linux/arm64`（Apple Silicon 及主流 Linux 服务器均可直接运行）。
+镜像已发布至 GitHub Container Registry：`ghcr.io/UsirukEsikam/weread-cron:latest`，支持 `linux/amd64` 与 `linux/arm64`。
 
 使用 Docker Compose 部署步骤如下：
 
@@ -35,7 +35,7 @@ docker compose logs -f
 docker compose logs -f
 ```
 
-立即按需执行一次阅读任务（无需等待时间窗口，不受当天是否已成功完成限制；若执行失败，当天已有的成功记录不会被降级覆盖）：
+如需手动执行：
 
 ```bash
 # 执行指定时长的阅读任务（例如 30 分钟，自动从书架或配置候选选书）：
@@ -45,7 +45,7 @@ docker compose exec weread-cron /weread-cron run --minutes 30
 docker compose exec weread-cron /weread-cron run --minutes 30 --book 695233
 ```
 
-查看书架上的图书列表（用于获取书籍 ID，挑选阅读书籍）：
+查看书架上的图书列表（用于获取书籍 ID）：
 
 ```bash
 # 容器运行中执行：
