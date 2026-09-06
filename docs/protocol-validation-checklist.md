@@ -61,3 +61,34 @@ Verified:
 - The same failure occurred with a newly added unread book, a completed book, and an ordinary unfinished book.
 - Recreating the container/volume and supplying a fresh initial Cookie did not change the behavior.
 - Therefore book completion/unread status is not yet independently validated; those cases are blocked by the broader long-session report rejection.
+
+### 2026-09-06 controlled real-account validation
+
+- Cookie-only Shelf retrieval succeeded with a real account.
+- A 5-minute manual Task on a previously read book completed successfully, and the account's reading time increased accordingly.
+- Real Reader state returned:
+    - `psvts` as a JSON string;
+    - `pclts` as JSON number `0`.
+- The original implementation regenerated fallback `pc` on every report when `pclts == 0`.
+- A temporary probe fixed fallback `pc` for the lifetime of one Reading Session.
+- With fixed `pc`, Timed reports remained accepted beyond the previous ~5–5.5 minute failure point and continued successfully for about 7 minutes.
+- At about 7.5 minutes, the server returned:
+    - `errCode: -2012`
+    - `errMsg: 登录超时`
+- The bounded recovery chain then ran:
+    - refresh Reader Context;
+    - retry;
+    - renewal;
+    - refresh Reader Context;
+    - retry.
+- The two recovery retries were rejected with an empty JSON object (`{}` / `map[]`), and the Task ended in failure.
+- Reading time accumulated before the rejection was still reflected in the real account.
+- Recreating the container and named volume and supplying the initial Cookie again did not remove the long-session failure.
+
+Current validation status:
+
+- Session-stable fallback `pc` is strongly supported by real-account evidence but still requires one complete successful long run before being treated as fully confirmed.
+- `-2012` is confirmed as a real report response.
+- The meaning of `-2012` as Login Session expiry versus Reading Session expiry is not yet established.
+- Whether recovery requires re-entering the Reading Session is not yet established.
+- Newly unread books and completed books remain unvalidated independently because both tests were blocked by the same long-session failure.
