@@ -92,3 +92,7 @@ Current validation status:
 - The meaning of `-2012` as Login Session expiry versus Reading Session expiry is not yet established.
 - Whether recovery requires re-entering the Reading Session is not yet established.
 - Newly unread books and completed books remain unvalidated independently because both tests were blocked by the same long-session failure.
+
+另一拨手动测试的一些记录：
+- Official Web Reader capture confirmed that `pc` and `ps` remain stable across consecutive timed reports and real page turns. During the same session, `ct`, `rt`, `rn`, `sg`, `s`, and reading-position fields changed as expected.
+- For a Reader page whose initial `reader.pclts` was numeric `0`, the official client sent a non-zero `pc` value and reused that same value for subsequent timed reports.
