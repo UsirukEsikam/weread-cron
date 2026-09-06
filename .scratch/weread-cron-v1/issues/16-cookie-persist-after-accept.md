@@ -50,7 +50,7 @@ Review 输入 F6 已对当前代码确认：
 2. **各业务调用方在成功判定后触发合并**：
    - renewal（`Client.Renewal`）：HTTP 200 + succ 确认后才合并；明确拒绝（succ!=1）与 succ 缺失（暂时性失败）均不合并、不改写持久化 Login Session；
    - report（`report.Sender.Enter/Timed`）：`Client.Report` 返回响应 Set-Cookie，`IsAccepted`（succ==1 或 synckey 存在）通过后才合并——被拒响应不合并（`ErrRejected` 判别不受影响）；
-   - Reader（`readercontext.Provider.fetch`）：`Client.ReaderPage` 返回响应 Set-Cookie，`__INITIAL_STATE__` 解析成功后才合并；
+   - Reader（`readercontext.Provider.fetch`）：`Client.ReaderPage` 返回响应 Set-Cookie，`__INITIAL_STATE__` 解析成功且 Reading Progress 提取成功（State 完整可建）后才合并——比"仅解析成功"更保守：State 建不成即调用方视角的业务未接受，失败响应不改写持久化会话；
    - Shelf（`Client.Shelf`）：`ParseShelfResponse` 业务成功（errCode==0）后才合并。
 3. **会话层不变**：`session.MergeAndSaveCookies` 的并入 + 原子持久化语义保持；合并/持久化失败仍使操作失败（错误链保留历史前缀，如"renewal 请求失败: 并入响应 Cookie 失败…"），不静默吞错。
 
@@ -58,6 +58,9 @@ Review 输入 F6 已对当前代码确认：
 
 - `TestRenewalMergesCookiesOnlyAfterAcceptance`（weread 单测，表驱动 5 子用例）：HTTP 500 / succ=0 / succ 缺失携带 Set-Cookie 均不触发合并回调；成功携带时合并回调 1 次且 Cookie 原样交付；成功无 Set-Cookie 时零调用。
 - `TestRenewalMergeFailurePreservesErrorSemantics`（weread 单测）：合并失败仍使 renewal 报错、包装"并入响应 Cookie 失败"、不归类为登录失效。
+- `TestShelfMergesCookiesOnlyAfterBusinessAcceptance`（weread 单测，3 子用例）：errCode!=0 失败不合并；成功合并且 Cookie 原样交付、书架解析正常；成功但合并失败报错语义保持。
+- `TestSenderMergesCookiesOnlyAfterAcceptance` / `TestSenderMergeFailurePreservesErrorSemantics`（report 包单测，4 + 1 子用例）：enter/timed 被拒响应不触发合并且返回 ErrRejected；接受响应合并且 Cookie 原样交付；合并失败仍报错、不归类为 ErrRejected。
+- `TestProviderMergesCookiesOnlyAfterAcceptance` / `TestProviderMergeFailurePreservesErrorSemantics`（readercontext 包单测，3 + 1 子用例）：HTTP 500 / 页面无法解析不合并；成功合并且 State 完整可建；合并失败报错语义保持。
 - `TestRunRejectedRenewalDoesNotMergeResponseCookies` / `TestRunRenewalNoSuccFailureDoesNotMergeResponseCookies`（应用 seam）：失败 renewal 响应携带的 Set-Cookie 不进持久化会话文件（预置 OLDSTALE 不被覆盖）。
 - `TestRunRejectedReportDoesNotMergeResponseCookies`（应用 seam）：被拒 enter 响应携带的 Set-Cookie 不并入；renewal 新 Cookie 照常并入（回归）。
 - `TestRunReaderPageFailureDoesNotMergeResponseCookies`、`TestListBooksShelfRejectedDoesNotMergeResponseCookies`（应用 seam）：Reader/Shelf 失败响应的 Set-Cookie 不并入、成功路径照常（一致语义）。
@@ -65,4 +68,4 @@ Review 输入 F6 已对当前代码确认：
 - 全部验证：`go test ./...`、`go vet ./...` 通过（`internal/weread/protocol.go` 的既有 gofmt 偏差不在本票范围）。
 - 反向验证：临时恢复旧行为（do() 内提前合并）后上述失败路径断言如期失败，确认测试真实覆盖 F6。
 
-**Commit:** 待提交（fix + docs 两条）
+**Commit:** dae246a（fix）· 91cf3c6（test 跟进）· 1a677b3（docs）
