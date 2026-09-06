@@ -159,9 +159,9 @@ Cookie 后重启即可自愈（`login_session.json` 文件本身损坏时的恢�
 - 镜像内二进制即完整 V1（daemon / run / books 全部子命令），每次发布为当前 main
   全量代码。
 - 构建与发布（`.github/workflows/release.yml`）：test 全绿 → buildx 构建
-  `linux/amd64,linux/arm64` → 推送 GHCR；`main` 分支推送 `latest`，`v*` tag 推送版本
-  标签。镜像路径为 `ghcr.io/UsirukEsikam/weread-cron`（工作流由仓库推导，无需
-  配置）。
+  `linux/amd64,linux/arm64` → 推送 GHCR；`main` 分支推送 `latest`（及 `main`），
+  `v*` tag 仅推送版本标签（如 `v1.0.0`，不触碰 `latest`）。镜像路径为
+  `ghcr.io/UsirukEsikam/weread-cron`（工作流由仓库推导，无需配置）。
 - 不含 shell 与调试工具；排查问题用 `docker compose logs`，或
   `docker run --rm ghcr.io/UsirukEsikam/weread-cron:latest --help` 查看用法。
 

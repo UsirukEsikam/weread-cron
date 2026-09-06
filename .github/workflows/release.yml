@@ -1,7 +1,7 @@
 # 镜像发布（ticket 10）：test 全绿 → buildx 构建 linux/amd64 + linux/arm64 →
 # 推送 GHCR。触发后：
 #   - main 分支推送 → latest（+ main 分支标签）
-#   - v* 版本 tag → 版本标签（如 v1.0.0）
+#   - v* 版本 tag → 仅版本标签（如 v1.0.0，不含 latest）
 # 推送目标 ghcr.io/<仓库 owner>/<仓库名>（由 github.repository 推导，无需硬编码用户名）。
 
 name: Release GHCR
@@ -37,6 +37,10 @@ jobs:
         id: meta
         with:
           images: ghcr.io/${{ github.repository }}
+          # 禁用 flavor 的 auto-latest（type=ref,event=tag 默认会自动附加 latest）；
+          # latest 仅由下方 raw 规则在 main 分支推送时显式产生。
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch
             type=ref,event=tag
