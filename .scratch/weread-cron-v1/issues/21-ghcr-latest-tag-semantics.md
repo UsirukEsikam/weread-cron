@@ -5,7 +5,7 @@
 **Finding:** F5 · .scratch/weread-cron-v1/findings/02-deployment-and-operations.md
 **Category:** bug
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 修正 release.yml 的 metadata-action 配置，使 `latest` 标签的实际行为与项目既定发布模型一致:main 分支 → `latest`（+ `main`）;`v*` tag → 仅版本标签（如 `v1.0.0`），不触碰 `latest`。
 
@@ -33,9 +33,9 @@ docker/metadata-action v5 的 `flavor.latest` 默认 `auto`:对 `type=ref,event=
 
 ## Acceptance criteria
 
-- [ ] `v*` tag 构建产出的 tags 不含 `latest`（metadata-action dry-run 或等价方式验证）
-- [ ] main 构建仍产出 `latest` 与 `main`
-- [ ] release.yml 注释与 README 所述发布模型与实际行为一致
+- [x] `v*` tag 构建产出的 tags 不含 `latest`（metadata-action dry-run 或等价方式验证）
+- [x] main 构建仍产出 `latest` 与 `main`
+- [x] release.yml 注释与 README 所述发布模型与实际行为一致
 
 ## Out of scope
 
@@ -47,3 +47,27 @@ docker/metadata-action v5 的 `flavor.latest` 默认 `auto`:对 `type=ref,event=
 一手来源（docker/metadata-action v5 README）: `flavor` 输入 `latest` 默认 `auto`，对 `type=ref,event=tag`、`type=semver`、`type=pep440`、`type=match` 默认生成 `latest`;表格示例 `push tag v1.2.3 → v1.2.3, latest`。
 
 当前 release.yml 未设置 `flavor`，且显式 `type=raw,value=latest,enable=main` 表达「latest=main-only」意图，两者叠加后 `v*` tag 构建会同时带 `latest`——F5 属实。
+
+## Answer
+
+实现 GHCR 镜像 `latest` 标签语义与项目既定发布模型（main → `latest` + `main`；`v*` tag → 仅版本标签，不触碰 `latest`）对齐：
+
+1. **release.yml 配置修正**：在 `.github/workflows/release.yml` 的 `docker/metadata-action@v5` 步骤中增加 `flavor: |\n  latest=false`，显式禁用 metadata-action 针对 `type=ref,event=tag` 自动附加 `latest` 的默认行为；保留 `type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}`，使 `latest` 标签严格且仅在 `main` 分支构建时产生。
+2. **文档与注释一致性**：
+   - 更新 `release.yml` 文件头注释，明确 `v*` tag 推送仅产出版本标签（不含 `latest`）。
+   - 更新 `README.md`「镜像」章节表述，明确 `main` 分支推送 `latest`（及 `main`），`v*` tag 仅推送版本标签（不触碰 `latest`）。
+
+### 验证记录（dry-run 与本地验证）
+
+- **metadata-action dry-run 验证**：
+  - 提取 `release.yml` 中 `docker/metadata-action` step 的真实输入，运行 `docker/metadata-action@v5` 引擎进行 dry-run 对比验证：
+    - 旧配置在 `refs/tags/v1.0.0` 下产出 `ghcr.io/usirukesikam/weread-cron:v1.0.0` 与 `ghcr.io/usirukesikam/weread-cron:latest`（复现缺陷）。
+    - 引入 `flavor: latest=false` 后在 `refs/tags/v1.0.0` 下仅产出 `ghcr.io/usirukesikam/weread-cron:v1.0.0`，不再含 `latest`（AC1 通过）。
+    - 在 `refs/heads/main` 下仍正常产出 `ghcr.io/usirukesikam/weread-cron:main` 与 `ghcr.io/usirukesikam/weread-cron:latest`（AC2 通过）。
+- **YAML 语法校验**：经解析器校验 `.github/workflows/release.yml` 语法合法无误。
+- **全量回归测试**：`go vet ./...` 与 `go test -count=1 ./...` 全绿（15/15 包测试全部通过）。
+
+### 评审（ticket 21 双轴 code-review）结果
+
+- **Standards 轴**：Pass。注释遵循仓库既有风格与 CONTEXT.md 领域术语；diff 极简且精准，无 Fowler 代码坏味。
+- **Spec 轴**：Pass。所有验收项均满足，无 scope creep，实现完全符合官方 action 规范。
