@@ -636,7 +636,7 @@ func (h *testHarness) advance(d time.Duration) {
 }
 
 // pinClock 是测试注入时钟（ticket 18）：包装 Fake，Sleep 在 release 关闭前阻塞、
-// 每次进入向 slep 发信号（缓冲 1）。用于把 Task 钉在 report 间隔等待中，测试可
+// 每次进入向 slep 发信号（缓冲 1）。用于把 Task 钉在 timed report 间隔等待中，测试可
 // 确定地取消 ctx 后再释放。release 关闭后行为与底层 Fake 相同。
 //
 // 生产代码不感知 pinClock；它与 Fake/Capped 同类（ADR-0006：clock 是领域真实
@@ -682,6 +682,32 @@ func (h *testHarness) runTask(ctx context.Context) (task.Result, error) {
 	case <-time.After(30 * time.Second):
 		h.t.Fatal("RunTask 超时")
 		return task.Result{}, nil
+	}
+}
+
+// assertCancelledExit 断言取消出口的统一可观察结果（ticket 18）：错误判别
+// context.Canceled、无 Result、无 Terminal State、无任何通知（取消不是业务最终
+// 失败）。
+func (h *testHarness) assertCancelledExit(t *testing.T, err error, res task.Result) {
+	t.Helper()
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
+	}
+	if res != (task.Result{}) {
+		t.Errorf("取消退出不应返回 Result，got %+v", res)
+	}
+	h.assertNoTerminalNoNotify(t)
+}
+
+// assertNoTerminalNoNotify 断言当天无 Terminal State、无任何通知（取消出口与
+// daemon 重启前检查共用；ticket 18）。
+func (h *testHarness) assertNoTerminalNoNotify(t *testing.T) {
+	t.Helper()
+	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
+	}
+	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
+		t.Errorf("取消后不应发送通知，实际 %d 条", n)
 	}
 }
 
@@ -1386,7 +1412,7 @@ func TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal(t *testing.T) {
 	}
 }
 
-// TestRunCancelDuringReportWaitExitsWithoutTerminal：report 间隔等待期间 ctx 取消
+// TestRunCancelDuringReportWaitExitsWithoutTerminal：timed report 间隔等待期间 ctx 取消
 // （ticket 18 验收 1/2/3/5）——pinClock 把等待钉住：enter 后首个节奏等待进入 Sleep
 // 即阻塞，测试取消 ctx 后释放；waitUntil 下一轮醒来检查 ctx 直接返回。断言：退出
 // 在分片上界内（≤5s）、错误判别 context.Canceled、不写终态、不发通知、不产生
@@ -1409,7 +1435,7 @@ func TestRunCancelDuringReportWaitExitsWithoutTerminal(t *testing.T) {
 	select {
 	case <-pin.slep:
 	case <-time.After(10 * time.Second):
-		t.Fatal("未进入 report 间隔等待")
+		t.Fatal("未进入 timed report 间隔等待")
 	}
 	// 等待已挂起：enter 已发出、尚无 timed report。
 	if n := h.weread.count("/web/book/read"); n != 1 {
@@ -1421,20 +1447,9 @@ func TestRunCancelDuringReportWaitExitsWithoutTerminal(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
-		}
+		h.assertCancelledExit(t, err, res)
 	case <-time.After(5 * time.Second):
 		t.Fatal("取消后 Task 未在分片上界（5s）内退出")
-	}
-	if res != (task.Result{}) {
-		t.Errorf("取消退出不应返回 Result，got %+v", res)
-	}
-	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
-		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
-	}
-	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
-		t.Errorf("取消后不应发送通知，实际 %d 条", n)
 	}
 	if n := h.weread.count("/web/book/read"); n != 1 {
 		t.Errorf("取消后不应产生额外 timed report，上报数 = %d", n)
@@ -1451,18 +1466,7 @@ func TestRunCancelBeforeStartExitsWithoutTerminal(t *testing.T) {
 	cancel()
 
 	res, err := h.runTask(ctx)
-	if !errors.Is(err, context.Canceled) {
-		t.Fatalf("退出错误 = %v，期望判别 context.Canceled", err)
-	}
-	if res != (task.Result{}) {
-		t.Errorf("取消退出不应返回 Result，got %+v", res)
-	}
-	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
-		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
-	}
-	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
-		t.Errorf("取消后不应发送通知，实际 %d 条", n)
-	}
+	h.assertCancelledExit(t, err, res)
 	if n := h.weread.count("/web/book/read"); n != 0 {
 		t.Errorf("取消后不应有任何上报，实际 %d", n)
 	}
@@ -1501,20 +1505,9 @@ func TestRunCancelDuringBookSelectionExitsWithoutTerminal(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
-		}
+		h.assertCancelledExit(t, err, res)
 	case <-time.After(5 * time.Second):
 		t.Fatal("取消后 Task 未在 5s 内退出")
-	}
-	if res != (task.Result{}) {
-		t.Errorf("取消退出不应返回 Result，got %+v", res)
-	}
-	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
-		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
-	}
-	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
-		t.Errorf("取消后不应发送通知，实际 %d 条", n)
 	}
 }
 
@@ -1556,25 +1549,13 @@ func TestRunCancelDuringTimedReportExitsWithoutTerminal(t *testing.T) {
 
 	select {
 	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
-		}
+		h.assertCancelledExit(t, err, res)
 	case <-time.After(5 * time.Second):
 		t.Fatal("取消后 Task 未在 5s 内退出")
 	}
-	if res != (task.Result{}) {
-		t.Errorf("取消退出不应返回 Result，got %+v", res)
-	}
-	// 预算收敛测试的对照：取消不得形成 failed 终态、不得发失败通知。
-	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
-		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
-	}
-	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
-		t.Errorf("取消后不应发送通知，实际 %d 条", n)
-	}
 	// 线上：enter + 已被接收的在途 timed；取消退出后不再产生任何上报。
 	if n := h.weread.count("/web/book/read"); n != 2 {
-		t.Errorf("report 数 = %d，期望 2（enter + 在途 timed，取消后无后续上报）", n)
+		t.Errorf("上报数 = %d，期望 2（enter + 在途 timed，取消后无后续上报）", n)
 	}
 }
 

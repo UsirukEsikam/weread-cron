@@ -94,7 +94,7 @@ func NextStart(now time.Time, win Window, last terminal.State, tz *time.Location
 //   - 其余 → 不可启动：真实时间跳变（主机挂起/恢复）已使启动时刻越出窗口，越出即
 //     "错过当天"，daemon 改排次日（错过不补跑，ADR-0002）。
 //
-// 前置条件：now ≥ planned（sleepUntil 只在其目标时刻到达或越过之后返回；调用点即
+// 前置条件：now ≥ planned（clock.WaitUntil 只在其目标时刻到达或越过之后返回；调用点即
 // daemon 的睡眠返回处）。窗口配置已由 config 校验（Window.Valid），本函数不复检。
 func CanStartAt(now, planned time.Time, win Window) bool {
 	plannedDay := time.Date(planned.Year(), planned.Month(), planned.Day(), 0, 0, 0, 0, planned.Location())

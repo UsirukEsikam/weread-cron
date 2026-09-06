@@ -132,7 +132,7 @@ func TestDaemonExecutesTaskAndSchedulesNextDay(t *testing.T) {
 }
 
 // TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes：daemon 内真实 Task 于
-// report 间隔等待中被取消（SIGINT/SIGTERM）→ 取消不是业务最终失败：不写终态、
+// timed report 间隔等待中被取消（SIGINT/SIGTERM）→ 取消不是业务最终失败：不写终态、
 // daemon 按现有语义正常退出（ticket 18 验收 6）；重启后当天无终态 → 按"无
 // Terminal State"异常启动规则（ticket 24：窗口内立即执行）重新执行并形成 success
 // 终态（验收 4 新增覆盖）。
@@ -163,7 +163,7 @@ func TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes(t *testing.T) {
 	select {
 	case <-pin.slep:
 	case <-time.After(10 * time.Second):
-		t.Fatal("Task 未进入 report 间隔等待")
+		t.Fatal("Task 未进入 timed report 间隔等待")
 	}
 	cancel()
 	close(pin.release)
@@ -180,9 +180,7 @@ func TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes(t *testing.T) {
 		t.Errorf("取消后应记录 daemon 退出日志:\n%s", got)
 	}
 	// 取消不写终态：重启前当天无 Terminal State（取消 = 正常退出，非业务失败）。
-	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
-		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
-	}
+	h.assertNoTerminalNoNotify(t)
 
 	// 第 2 次运行（重启）：新的 App（全新 Fake 时钟）与 daemon（Capped 钉在次日
 	// 窗口前）；无终态 + 窗口内 → 立即执行，成功形成终态并排定次日。
@@ -231,6 +229,6 @@ func TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes(t *testing.T) {
 	}
 	// 线上：第 1 次运行仅 enter（取消前），第 2 次完整 enter + 2×timed。
 	if n := h.weread.count("/web/book/read"); n != 4 {
-		t.Errorf("report 总数 = %d，期望 4（1 + enter + 2×timed）", n)
+		t.Errorf("上报总数 = %d，期望 4（1 + enter + 2×timed）", n)
 	}
 }

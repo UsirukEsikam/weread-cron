@@ -30,11 +30,11 @@
 // （跨午夜不转移日期归属）；手动 run 与自动 Task 使用同一 finalization。
 // timed report 单次传输级失败的会话内容错保留（跳过本节奏点、会话继续，连续失败
 // 超预算判失败）；Task 失败后由 `weread-cron run` 手动重试。
-// ticket 18 范围（本文件）：Task 的取消生命周期——report 间隔等待分片 + 每片检查
-// ctx（取消响应延迟 ≤2s，与 daemon 睡眠对齐）；取消在一切统一 finalization
-// （finalizeTransient / failBookSelection）之前被识别：不写 success/failed 终态、
-// 不发最终通知（取消不是业务最终失败），当天无终态，重启/手动 run 按"无 Terminal
-// State"规则重新执行。
+// ticket 18 范围（本文件）：Task 的取消生命周期——timed report 间隔等待分片 + 每片
+// 检查 ctx（取消响应延迟 ≤2s，与 daemon 睡眠对齐；共用 clock.WaitUntil）；取消在
+// 一切统一 finalization（finalizeTransient / failBookSelection）之前被识别：不写
+// success/failed 终态、不发最终通知（取消不是业务最终失败），当天无终态，重启/
+// 手动 run 按"无 Terminal State"规则重新执行。
 //
 // # rt 语义（ADR-0004）
 //
@@ -95,11 +95,6 @@ const (
 	// 传输级失败跳过本节奏点、会话继续；连续失败达到预算才判本 Task 最终失败
 	// （ticket 12/24：不因一次抖动丢失整个 Task，也不无限跳过）。
 	DefaultMaxConsecutiveReportFailures = 3
-	// reportWaitChunk 是 report 间隔等待的分片上限（内部默认，ADR-0005）。
-	// clock.Sleep 不感知 ctx（clock 抽象语义："ctx 取消不打断；Task 对取消的
-	// 响应在别的层"），分片 + 每片检查 ctx 把取消响应延迟约束在 ≤ reportWaitChunk
-	// （ticket 18：与 daemon 睡眠分片同级，2s 上下取平衡）。
-	reportWaitChunk = 2 * time.Second
 )
 
 // 失败阶段（notify.Failure.Stage；spec 决策 #10：失败通知含失败阶段）。
@@ -292,9 +287,10 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			return Result{}, cancelledExit(ctx)
 		}
 		if d := next.Sub(o.Clock.Now()); d > 0 {
-			// ticket 18：间隔等待分片 + 每片检查 ctx（与 daemon 睡眠同一形态）——
-			// 取消响应延迟 ≤ reportWaitChunk；正常 report 节奏与 rt 计算不受影响。
-			if err := waitUntil(ctx, o.Clock, next); err != nil {
+			// ticket 18：间隔等待分片 + 每片检查 ctx（与 daemon 睡眠同一形态，共用
+			// clock.WaitUntil）——取消响应延迟 ≤ clock.WaitChunk；正常 timed report
+			// 节奏与 rt 计算不受影响。
+			if err := clock.WaitUntil(ctx, o.Clock, next); err != nil {
 				return Result{}, cancelledExit(ctx)
 			}
 		}
@@ -427,26 +423,6 @@ func rtSeconds(t, lastSent time.Time) int {
 // 正常退出"；CLI 判别"已取消"提示与正常退出码）。
 func cancelledExit(ctx context.Context) error {
 	return fmt.Errorf("Task 已取消（未形成终态）: %w", ctx.Err())
-}
-
-// waitUntil 阻塞到 until，以 reportWaitChunk 分片睡眠、每次醒来检查 ctx（ticket
-// 18；与 daemon 的 sleepUntil 同一形态）：ctx 取消 → 返回该错误（取消响应延迟
-// ≤ reportWaitChunk）；到点 → 返回 nil。clock.Sleep 本身不感知 ctx（clock 抽象
-// 文档），分片检查由本层承担。
-func waitUntil(ctx context.Context, c clock.Clock, until time.Time) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		d := until.Sub(c.Now())
-		if d <= 0 {
-			return nil
-		}
-		if d > reportWaitChunk {
-			d = reportWaitChunk
-		}
-		c.Sleep(d)
-	}
 }
 
 // fetchReaderState 抓取并解析 Reader 页（Task 建立时使用）。

@@ -25,13 +25,8 @@ import (
 // replanMinGap 是 ErrTaskRunning 并发拒绝后重试守卫的最短间隔（内部默认，不暴露为
 // 配置，ADR-0005）。ticket 24 起 daemon 不再 whole-Task 重排（Task 失败直接排次日），
 // 本间隔只用于并发拒绝后的再次尝试：NextStart 的"窗口内立即执行"会马上指回 now，
-// 间隔避免 sleepUntil 立即返回 → 背靠背重试的紧循环。
+// 间隔避免 clock.WaitUntil 立即返回 → 背靠背重试的紧循环。
 const replanMinGap = time.Minute
-
-// sleepChunk 是 sleepUntil 的分片上限。clock.Sleep 不感知 ctx（clock 抽象对 Task
-// 的语义是"不可打断"，注释见 clock.Clock），分片保证 SIGINT/SIGTERM 的取消延迟
-// 有上界（≤ sleepChunk；2s 在取消延迟与唤醒频率之间取平衡）。
-const sleepChunk = 2 * time.Second
 
 // TaskRunner 执行一次 Task（生产 = internal/app.App；测试注入 fake；ADR-0006）。
 // daemon 只负责"到点执行"，Task 内部的终态落盘/通知由 Task 自身完成（spec 决策 #9）。
@@ -119,7 +114,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		if err != nil {
 			return err
 		}
-		if err := sleepUntil(ctx, d.clk, next); err != nil {
+		if err := clock.WaitUntil(ctx, d.clk, next); err != nil {
 			d.log.Info("daemon 退出")
 			return nil
 		}
@@ -158,7 +153,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// 最短重排间隔后重试；运行中的 Task 不受影响。
 			if errors.Is(err, task.ErrTaskRunning) {
 				d.log.Info("另一进程正在运行 Task，本次自动执行被拒绝（最短间隔后重试）")
-				if err := sleepUntil(ctx, d.clk, d.clk.Now().Add(replanMinGap)); err != nil {
+				if err := clock.WaitUntil(ctx, d.clk, d.clk.Now().Add(replanMinGap)); err != nil {
 					d.log.Info("daemon 退出")
 					return nil
 				}
@@ -178,7 +173,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			d.log.Info("Task 失败后下次启动排定于次日",
 				"at", next.In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
-			if err := sleepUntil(ctx, d.clk, next); err != nil {
+			if err := clock.WaitUntil(ctx, d.clk, next); err != nil {
 				d.log.Info("daemon 退出")
 				return nil
 			}
@@ -240,22 +235,4 @@ func (d *Daemon) terminalDone() (bool, error) {
 // 在 terminal.IsToday；此处是调度侧的本地别名）。
 func (d *Daemon) todayTerminal(st terminal.State, now time.Time) bool {
 	return terminal.IsToday(st, now, d.cfg.TZ)
-}
-
-// sleepUntil 阻塞到 until。以 sleepChunk 分片睡眠，每次醒来检查 ctx：
-// ctx 取消（SIGINT/SIGTERM）时返回该错误；到点返回 nil（取消延迟 ≤ sleepChunk）。
-func sleepUntil(ctx context.Context, c clock.Clock, until time.Time) error {
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		d := until.Sub(c.Now())
-		if d <= 0 {
-			return nil
-		}
-		if d > sleepChunk {
-			d = sleepChunk
-		}
-		c.Sleep(d)
-	}
 }

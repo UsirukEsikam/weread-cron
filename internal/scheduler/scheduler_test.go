@@ -504,7 +504,7 @@ func TestDaemonSchedulesNextDayAfterFailedTerminal(t *testing.T) {
 }
 
 // TestDaemonStopsOnCancel：取消（SIGINT/SIGTERM）时 daemon 在睡眠中干净退出，
-// 且不执行 Task（取消延迟 ≤ sleepChunk + 轻微等待）。
+// 且不执行 Task（取消延迟 ≤ clock.WaitChunk + 轻微等待）。
 func TestDaemonStopsOnCancel(t *testing.T) {
 	cfg := daemonConfig(t, func(c *config.Config) {
 		c.WindowStart = 60

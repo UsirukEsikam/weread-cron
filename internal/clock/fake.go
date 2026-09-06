@@ -59,12 +59,12 @@ func NewCapped(start, cap time.Time, hook func(time.Time)) *Capped {
 }
 
 // Sleep 推进 d（同 Fake），但不越过 cap：越过时推进到 cap 并返回（此后不再前进，
-// 直到外部取消——sleepUntil 每轮检查 ctx，取消延迟 ≤ 一个分片加轻微等待）。
+// 直到外部取消——clock.WaitUntil 每轮检查 ctx，取消延迟 ≤ 一个分片加轻微等待）。
 func (c *Capped) Sleep(d time.Duration) {
 	now := c.Fake.Now()
 	if next := now.Add(d); next.After(c.cap) {
 		c.Fake.Sleep(c.cap.Sub(now))
-		time.Sleep(time.Millisecond) // 防忙等；daemon 的 sleepUntil 每次醒来检查 ctx
+		time.Sleep(time.Millisecond) // 防忙等；daemon 的 clock.WaitUntil 每次醒来检查 ctx
 		return
 	}
 	c.Fake.Sleep(d)
