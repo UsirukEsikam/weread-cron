@@ -392,6 +392,30 @@ func TestRunTaskFailureExitsNonZero(t *testing.T) {
 	}
 }
 
+// TestRunTaskCancelledExitsOK：Task 因 ctx 取消退出（ticket 18：取消不是业务最终
+// 失败——不写终态、不发通知）→ run 以正常退出码结束并说明未形成终态（与 daemon
+// 的"取消 = 正常退出"一致），不误报"Task 失败"。
+func TestRunTaskCancelledExitsOK(t *testing.T) {
+	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
+	var stdout, stderr syncBuffer
+	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) {
+			return &fakeApp{err: context.Canceled}, nil
+		})
+	if code != ExitOK {
+		t.Errorf("退出码 = %d，期望 %d（取消 = 正常退出）", code, ExitOK)
+	}
+	if !strings.Contains(stderr.String(), "已取消") {
+		t.Errorf("stderr 应说明已取消；实际:\n%s", stderr.String())
+	}
+	if strings.Contains(stderr.String(), "Task 失败") {
+		t.Errorf("取消不是 Task 失败，stderr 不应误报；实际:\n%s", stderr.String())
+	}
+	if stdout.String() != "" {
+		t.Errorf("取消时不应输出摘要；实际:\n%s", stdout.String())
+	}
+}
+
 // TestRunRejectedWhenTodaySuccessTerminal：当天 success 终态 → run 拒绝
 // （issue 08 验收口径：stdout 说明原因 + 约定退出码 ExitRunRejected）。
 // 终态规则本身由应用 seam 覆盖；本层断言进程级呈现。

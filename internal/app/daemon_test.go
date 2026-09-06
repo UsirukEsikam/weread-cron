@@ -5,6 +5,7 @@ package app
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 
 	"weread-cron/internal/clock"
 	"weread-cron/internal/scheduler"
+	"weread-cron/internal/session"
 	"weread-cron/internal/terminal"
 )
 
@@ -126,5 +128,109 @@ func TestDaemonExecutesTaskAndSchedulesNextDay(t *testing.T) {
 	}
 	if got := log.String(); !strings.Contains(got, "已排定下次 Task 启动") {
 		t.Errorf("缺少排定日志:\n%s", got)
+	}
+}
+
+// TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes：daemon 内真实 Task 于
+// report 间隔等待中被取消（SIGINT/SIGTERM）→ 取消不是业务最终失败：不写终态、
+// daemon 按现有语义正常退出（ticket 18 验收 6）；重启后当天无终态 → 按"无
+// Terminal State"异常启动规则（ticket 24：窗口内立即执行）重新执行并形成 success
+// 终态（验收 4 新增覆盖）。
+func TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes(t *testing.T) {
+	start := time.Date(2025, 9, 6, 10, 0, 0, 0, testTZ)
+	pin := newPinClock(start)
+	h := setup(t, func(h *testHarness) {
+		h.cfg.TZName = "Asia/Shanghai"
+		h.cfg.WindowStart = 9*60 + 55
+		h.cfg.WindowEnd = 10*60 + 5
+		h.clk = pin // Task 时钟：节奏等待可钉住
+	})
+
+	// 第 1 次运行：daemon 用独立 Fake（无终态 + 窗口内 → 立即执行，无 daemon 睡眠）；
+	// Task 的真实节奏等待被 pin 钉住。
+	var log daemonLog
+	d := scheduler.New(h.cfg, scheduler.Deps{
+		Clock:  clock.NewFake(start),
+		RNG:    h.rng,
+		Task:   h.app,
+		Logger: slog.New(slog.NewTextHandler(&log, nil)),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitDaemonLog(t, &log, "已到启动时刻，执行 Task")
+	select {
+	case <-pin.slep:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Task 未进入 report 间隔等待")
+	}
+	cancel()
+	close(pin.release)
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("取消后 daemon 应正常退出（nil），got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("取消后 daemon 未退出")
+	}
+	if got := log.String(); !strings.Contains(got, "daemon 退出") {
+		t.Errorf("取消后应记录 daemon 退出日志:\n%s", got)
+	}
+	// 取消不写终态：重启前当天无 Terminal State（取消 = 正常退出，非业务失败）。
+	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
+	}
+
+	// 第 2 次运行（重启）：新的 App（全新 Fake 时钟）与 daemon（Capped 钉在次日
+	// 窗口前）；无终态 + 窗口内 → 立即执行，成功形成终态并排定次日。
+	restart := time.Date(2025, 9, 6, 10, 0, 30, 0, testTZ)
+	app2 := New(h.cfg, Deps{
+		Clock:         clock.NewFake(restart),
+		RNG:           h.rng,
+		WereadBaseURL: h.wereadURL,
+		Sessions:      session.NewFileStore(h.cfg.DataDir),
+		Terminal:      terminal.NewFileStore(h.cfg.DataDir),
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	var log2 daemonLog
+	d2 := scheduler.New(h.cfg, scheduler.Deps{
+		Clock:  clock.NewCapped(restart, time.Date(2025, 9, 7, 0, 30, 0, 0, testTZ), nil),
+		RNG:    h.rng,
+		Task:   app2,
+		Logger: slog.New(slog.NewTextHandler(&log2, nil)),
+	})
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	done2 := make(chan error, 1)
+	go func() { done2 <- d2.Run(ctx2) }()
+	waitDaemonLog(t, &log2, "已到启动时刻，执行 Task")
+	waitDaemonLog(t, &log2, "Task 完成，排定次日")
+	waitDaemonLog(t, &log2, "2025-09-07")
+	cancel2()
+	select {
+	case err := <-done2:
+		if err != nil {
+			t.Errorf("重启 daemon 取消后应返回 nil，got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("重启 daemon 未退出")
+	}
+
+	// 重启后重新执行并形成 success 终态（无终态异常启动规则）；通知恰 1 条。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("重启后应有 success 终态: has=%v err=%v", has, err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess || st.LastTaskDate != "2025-09-06" {
+		t.Errorf("终态 = %+v，期望 2025-09-06/success", st)
+	}
+	if n := len(h.bark.snapshot()); n != 1 {
+		t.Errorf("通知 = %d，期望 1（仅重启后的成功通知；取消不发通知）", n)
+	}
+	// 线上：第 1 次运行仅 enter（取消前），第 2 次完整 enter + 2×timed。
+	if n := h.weread.count("/web/book/read"); n != 4 {
+		t.Errorf("report 总数 = %d，期望 4（1 + enter + 2×timed）", n)
 	}
 }

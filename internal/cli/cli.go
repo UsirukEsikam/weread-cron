@@ -123,6 +123,11 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 		case errors.Is(err, app.ErrTaskRunning):
 			fmt.Fprintln(stderr, "weread-cron: 已有 Task 正在运行，拒绝并发启动")
 			return ExitRunRejected
+		case errors.Is(err, context.Canceled):
+			// ticket 18：取消不是业务最终失败——Task 已退出且未形成终态（可重新
+			// 运行）；以正常退出码结束（与 daemon"取消 = 正常退出"一致）。
+			fmt.Fprintln(stderr, "weread-cron: Task 已取消，未形成终态（可重新运行）")
+			return ExitOK
 		case err != nil:
 			fmt.Fprintf(stderr, "weread-cron: Task 失败: %v\n", err)
 			return ExitConfig

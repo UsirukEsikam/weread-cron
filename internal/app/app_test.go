@@ -121,9 +121,18 @@ type fakeWeread struct {
 	renewNoSucc       bool
 
 	// blockTimed 非 nil 时，下一笔 timed report 请求到达后等待 channel 关闭才响应
-	//（用于注入"响应期间时钟跳变"模拟 suspend）。
+	//（用于注入"响应期间时钟跳变"模拟 suspend）；挂起期间客户端断开（ctx 取消）经
+	// r.Context().Done() 感知返回——若 timedAbortNotify 非 nil，断开时向它发信号
+	// （缓冲 1；ticket 18 取消测试判别"在途请求以传输级错误失败"）。
 	blockTimed          chan struct{}
 	blockTimedTriggered chan struct{}
+	timedAbortNotify    chan struct{}
+
+	// blockReader 非 nil 时，下一笔 Reader 页请求到达后等待 channel 关闭才响应
+	// （blockReaderTriggered 为到达信号）；挂起期间客户端断开（ctx 取消）经
+	// r.Context().Done() 感知返回（ticket 18 选书取消测试用）。
+	blockReader          chan struct{}
+	blockReaderTriggered chan struct{}
 
 	// shelfBooks 是 /web/shelf/sync 返回的书架条目（默认 nil = 空书架）。
 	shelfBooks []fakeShelfBook
@@ -259,6 +268,21 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 		f.t.Errorf("reader 页 UA = %q", r.Header.Get("User-Agent"))
 	}
 	f.mu.Lock()
+	blockCh := f.blockReader
+	f.mu.Unlock()
+	if blockCh != nil {
+		if f.blockReaderTriggered != nil {
+			select {
+			case f.blockReaderTriggered <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-blockCh:
+		case <-r.Context().Done(): // 客户端在挂起期间断开（ctx 取消）
+		}
+	}
+	f.mu.Lock()
 	f.lastReaderEncoded = strings.TrimPrefix(r.URL.Path, "/web/reader/")
 	f.readerFetches++
 	n := f.readerFetches
@@ -370,7 +394,19 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 			default:
 			}
 		}
-		<-ch
+		select {
+		case <-ch:
+		case <-r.Context().Done():
+			// 客户端在挂起期间断开（ctx 取消）：在途请求以传输级错误失败。
+			f.mu.Lock()
+			if f.timedAbortNotify != nil {
+				select {
+				case f.timedAbortNotify <- struct{}{}:
+				default:
+				}
+			}
+			f.mu.Unlock()
+		}
 	}
 	// 与 koplugin 一致：report referer = Reader 页地址（同书）。
 	f.mu.Lock()
@@ -536,9 +572,11 @@ type testHarness struct {
 	weread *fakeWeread
 	bark   *fakeNotify
 	wecom  *fakeNotify
-	clk    *clock.Fake
+	clk    clock.Clock
 	rng    *rand.Rand
 	cfg    *config.Config
+	// wereadURL 是 fake 微信读书服务端地址（重启场景装配第二个 App 用）。
+	wereadURL string
 	// term 覆盖 Terminal State 存储（nil = 生产文件存储；#15 测试注入 Save 恒失败的
 	// 实现）。
 	term terminal.Store
@@ -580,6 +618,7 @@ func setup(t *testing.T, mutate func(h *testHarness)) *testHarness {
 	if h.term == nil {
 		h.term = terminal.NewFileStore(cfg.DataDir)
 	}
+	h.wereadURL = wereadSrv.URL
 	h.app = New(cfg, Deps{
 		Clock:         h.clk,
 		RNG:           h.rng,
@@ -589,6 +628,40 @@ func setup(t *testing.T, mutate func(h *testHarness)) *testHarness {
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	return h
+}
+
+// advance 推进测试时钟（Fake 家族；Capped 等包装也内嵌 Fake）。
+func (h *testHarness) advance(d time.Duration) {
+	h.clk.(interface{ Advance(time.Duration) }).Advance(d)
+}
+
+// pinClock 是测试注入时钟（ticket 18）：包装 Fake，Sleep 在 release 关闭前阻塞、
+// 每次进入向 slep 发信号（缓冲 1）。用于把 Task 钉在 report 间隔等待中，测试可
+// 确定地取消 ctx 后再释放。release 关闭后行为与底层 Fake 相同。
+//
+// 生产代码不感知 pinClock；它与 Fake/Capped 同类（ADR-0006：clock 是领域真实
+// 依赖，测试经构造器注入确定性实现）。
+type pinClock struct {
+	*clock.Fake
+	slep    chan struct{}
+	release chan struct{}
+}
+
+func newPinClock(start time.Time) *pinClock {
+	return &pinClock{
+		Fake:    clock.NewFake(start),
+		slep:    make(chan struct{}, 1),
+		release: make(chan struct{}),
+	}
+}
+
+func (p *pinClock) Sleep(d time.Duration) {
+	select {
+	case p.slep <- struct{}{}:
+	default: // 已有未消费信号（测试只关心首次进入）——不阻塞后续 Sleep
+	}
+	<-p.release
+	p.Fake.Sleep(d)
 }
 
 // runTask 执行 Task 并等待结果（带超时护栏）。
@@ -946,7 +1019,7 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 		t.Fatal("timed report 未在 10s 内到达")
 	}
 	// 模拟挂起噪声：响应期间时钟跳变 120s。
-	h.clk.Advance(120 * time.Second)
+	h.advance(120 * time.Second)
 	close(h.weread.blockTimed)
 
 	select {
@@ -1150,7 +1223,7 @@ func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
 		t.Fatal("timed report 未在 10s 内到达")
 	}
 	// 模拟挂起噪声：响应期间时钟跳变 1200s（越过异常阈值与 Context TTL）。
-	h.clk.Advance(1200 * time.Second)
+	h.advance(1200 * time.Second)
 	close(h.weread.blockTimed)
 
 	select {
@@ -1310,6 +1383,198 @@ func TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal(t *testing.T) {
 		if strings.Contains(string(msg), "完成") {
 			t.Errorf("%s 不得混入成功文案；body=%s", name, msg)
 		}
+	}
+}
+
+// TestRunCancelDuringReportWaitExitsWithoutTerminal：report 间隔等待期间 ctx 取消
+// （ticket 18 验收 1/2/3/5）——pinClock 把等待钉住：enter 后首个节奏等待进入 Sleep
+// 即阻塞，测试取消 ctx 后释放；waitUntil 下一轮醒来检查 ctx 直接返回。断言：退出
+// 在分片上界内（≤5s）、错误判别 context.Canceled、不写终态、不发通知、不产生
+// 额外 timed report（取消不是业务最终失败）。
+func TestRunCancelDuringReportWaitExitsWithoutTerminal(t *testing.T) {
+	start := time.Date(2025, 9, 6, 10, 0, 0, 0, testTZ)
+	pin := newPinClock(start)
+	h := setup(t, func(h *testHarness) { h.clk = pin })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	var res task.Result
+	go func() {
+		var err error
+		res, err = h.app.RunTask(ctx)
+		done <- err
+	}()
+
+	// 首个 Sleep = enter 后的节奏等待（renewal/选书/enter 均无 Sleep）。
+	select {
+	case <-pin.slep:
+	case <-time.After(10 * time.Second):
+		t.Fatal("未进入 report 间隔等待")
+	}
+	// 等待已挂起：enter 已发出、尚无 timed report。
+	if n := h.weread.count("/web/book/read"); n != 1 {
+		t.Fatalf("挂起时上报请求数 = %d，期望 1（仅 enter）", n)
+	}
+
+	cancel()
+	close(pin.release)
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后 Task 未在分片上界（5s）内退出")
+	}
+	if res != (task.Result{}) {
+		t.Errorf("取消退出不应返回 Result，got %+v", res)
+	}
+	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
+	}
+	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
+		t.Errorf("取消后不应发送通知，实际 %d 条", n)
+	}
+	if n := h.weread.count("/web/book/read"); n != 1 {
+		t.Errorf("取消后不应产生额外 timed report，上报数 = %d", n)
+	}
+}
+
+// TestRunCancelBeforeStartExitsWithoutTerminal：ctx 在 Task 启动前已取消（SIGINT/
+// SIGTERM 已到）——renewal 请求以 ctx 错误失败；取消识别先于统一 finalization
+// （ticket 18 验收 3）：不收敛为 failed 终态、不发通知（单次阶段的取消不再立即
+// 收敛为 failed）。
+func TestRunCancelBeforeStartExitsWithoutTerminal(t *testing.T) {
+	h := setup(t, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	res, err := h.runTask(ctx)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("退出错误 = %v，期望判别 context.Canceled", err)
+	}
+	if res != (task.Result{}) {
+		t.Errorf("取消退出不应返回 Result，got %+v", res)
+	}
+	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
+	}
+	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
+		t.Errorf("取消后不应发送通知，实际 %d 条", n)
+	}
+	if n := h.weread.count("/web/book/read"); n != 0 {
+		t.Errorf("取消后不应有任何上报，实际 %d", n)
+	}
+}
+
+// TestRunCancelDuringBookSelectionExitsWithoutTerminal：自动选书探测期间 ctx 取消
+// → 探测请求以传输级错误（context canceled）失败不是"书不可用"证据（ticket 18）：
+// 不写 failed 终态、不发通知（failBookSelection 入口的取消检查；区别于"书架无可用
+// 书"的正常失败收敛——后者写 failed 终态 + 失败通知）。
+func TestRunCancelDuringBookSelectionExitsWithoutTerminal(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.Books = nil // 自动选书
+		h.weread.shelfBooks = []fakeShelfBook{{BookID: testBookID, Title: testBookTitle}}
+		h.weread.blockReader = make(chan struct{})
+		h.weread.blockReaderTriggered = make(chan struct{}, 1)
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	var res task.Result
+	go func() {
+		var err error
+		res, err = h.app.RunTask(ctx)
+		done <- err
+	}()
+
+	// 首个选书探测已到达并被挂起（探测请求在途）。
+	select {
+	case <-h.weread.blockReaderTriggered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("选书探测未在 10s 内到达")
+	}
+	cancel()
+	// 不关闭 blockReader：在途探测请求被客户端取消，handler 经 r.Context().Done()
+	// 感知断开并返回。
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后 Task 未在 5s 内退出")
+	}
+	if res != (task.Result{}) {
+		t.Errorf("取消退出不应返回 Result，got %+v", res)
+	}
+	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
+	}
+	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
+		t.Errorf("取消后不应发送通知，实际 %d 条", n)
+	}
+}
+
+// TestRunCancelDuringTimedReportExitsWithoutTerminal：timed report 在途时 ctx 取消
+// → 在途请求以传输级错误（context canceled）失败；取消不得计入连续失败预算、不触发
+// finalizeTransient（ticket 18 验收 3）——不写 failed 终态、不发通知，错误判别
+// context.Canceled（区别于预算耗尽场景：后者收敛为 failed 终态 + 失败通知）。
+// timedAbortNotify 判别在途请求确实因客户端断开而失败（退出走"取消不累计失败"
+// 分支，而非循环顶部的兜底检查）。
+func TestRunCancelDuringTimedReportExitsWithoutTerminal(t *testing.T) {
+	h := setup(t, nil)
+	h.weread.blockTimed = make(chan struct{})
+	h.weread.blockTimedTriggered = make(chan struct{}, 1)
+	h.weread.timedAbortNotify = make(chan struct{}, 1)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	var res task.Result
+	go func() {
+		var err error
+		res, err = h.app.RunTask(ctx)
+		done <- err
+	}()
+
+	// 第一笔 timed report 到达并被挂起（enter 已接受、上报在途）。
+	select {
+	case <-h.weread.blockTimedTriggered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed report 未在 10s 内到达")
+	}
+	cancel()
+	// 不关闭 blockTimed：在途请求被客户端取消（handler 经 r.Context().Done() 感知
+	// 断开并返回），请求以传输级错误失败——恰好覆盖"取消的 HTTP 错误"分支。
+	select {
+	case <-h.weread.timedAbortNotify:
+	case <-time.After(5 * time.Second):
+		t.Fatal("在途 timed report 未被客户端取消")
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Errorf("退出错误 = %v，期望判别 context.Canceled", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("取消后 Task 未在 5s 内退出")
+	}
+	if res != (task.Result{}) {
+		t.Errorf("取消退出不应返回 Result，got %+v", res)
+	}
+	// 预算收敛测试的对照：取消不得形成 failed 终态、不得发失败通知。
+	if _, has, err := terminal.NewFileStore(h.cfg.DataDir).Load(); err != nil || has {
+		t.Fatalf("取消后不应有 Terminal State: has=%v err=%v", has, err)
+	}
+	if n := len(h.bark.snapshot()) + len(h.wecom.snapshot()); n != 0 {
+		t.Errorf("取消后不应发送通知，实际 %d 条", n)
+	}
+	// 线上：enter + 已被接收的在途 timed；取消退出后不再产生任何上报。
+	if n := h.weread.count("/web/book/read"); n != 2 {
+		t.Errorf("report 数 = %d，期望 2（enter + 在途 timed，取消后无后续上报）", n)
 	}
 }
 

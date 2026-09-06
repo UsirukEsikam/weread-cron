@@ -30,6 +30,11 @@
 // （跨午夜不转移日期归属）；手动 run 与自动 Task 使用同一 finalization。
 // timed report 单次传输级失败的会话内容错保留（跳过本节奏点、会话继续，连续失败
 // 超预算判失败）；Task 失败后由 `weread-cron run` 手动重试。
+// ticket 18 范围（本文件）：Task 的取消生命周期——report 间隔等待分片 + 每片检查
+// ctx（取消响应延迟 ≤2s，与 daemon 睡眠对齐）；取消在一切统一 finalization
+// （finalizeTransient / failBookSelection）之前被识别：不写 success/failed 终态、
+// 不发最终通知（取消不是业务最终失败），当天无终态，重启/手动 run 按"无 Terminal
+// State"规则重新执行。
 //
 // # rt 语义（ADR-0004）
 //
@@ -90,6 +95,11 @@ const (
 	// 传输级失败跳过本节奏点、会话继续；连续失败达到预算才判本 Task 最终失败
 	// （ticket 12/24：不因一次抖动丢失整个 Task，也不无限跳过）。
 	DefaultMaxConsecutiveReportFailures = 3
+	// reportWaitChunk 是 report 间隔等待的分片上限（内部默认，ADR-0005）。
+	// clock.Sleep 不感知 ctx（clock 抽象语义："ctx 取消不打断；Task 对取消的
+	// 响应在别的层"），分片 + 每片检查 ctx 把取消响应延迟约束在 ≤ reportWaitChunk
+	// （ticket 18：与 daemon 睡眠分片同级，2s 上下取平衡）。
+	reportWaitChunk = 2 * time.Second
 )
 
 // 失败阶段（notify.Failure.Stage；spec 决策 #10：失败通知含失败阶段）。
@@ -204,6 +214,11 @@ func New(opts Options) *Runner {
 // whole-Task 自动重排，任何失败都是最终失败）。已收敛的失败（report.ErrRejected
 // 恢复链耗尽 / weread.ErrLoginInvalid 登录失效）不重复收敛。终态与通知日期统一为
 // Task 开始日（taskDate）。
+//
+// 取消出口（ticket 18）：ctx 取消（SIGINT/SIGTERM 等）不是业务最终失败——等待
+// 分片 + 每片检查 ctx，取消（含任何阶段请求因 ctx 产生的失败）在统一 finalization
+// 之前被识别并直接返回：不写终态、不发通知、不累计失败预算；当天无终态，重启/
+// 手动 run 按"无 Terminal State"规则重新执行。
 func (r *Runner) Run(ctx context.Context) (Result, error) {
 	o := r.opts
 
@@ -269,8 +284,19 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	reports := 0
 	consecutiveFailures := 0
 	for accumulated < target {
+		// ticket 18：取消识别先于本轮一切动作——上一轮处理期间发生的取消（如
+		// Fetch/上报请求以 ctx 错误失败）在此直接退出：不写终态、不发通知
+		// （取消不是业务最终失败；当天无终态，重启/手动 run 按"无 Terminal
+		// State"规则重新执行）。
+		if err := ctx.Err(); err != nil {
+			return Result{}, cancelledExit(ctx)
+		}
 		if d := next.Sub(o.Clock.Now()); d > 0 {
-			o.Clock.Sleep(d)
+			// ticket 18：间隔等待分片 + 每片检查 ctx（与 daemon 睡眠同一形态）——
+			// 取消响应延迟 ≤ reportWaitChunk；正常 report 节奏与 rt 计算不受影响。
+			if err := waitUntil(ctx, o.Clock, next); err != nil {
+				return Result{}, cancelledExit(ctx)
+			}
 		}
 		now = o.Clock.Now()
 
@@ -284,6 +310,11 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		// retry（已覆盖该情形）。
 		fresh, err := r.opts.Reader.Fetch(ctx, bookID)
 		if err != nil {
+			// ticket 18：Fetch 因 ctx 取消失败不是暂时性故障——不沿用现有 Context
+			// 继续上报（取消的上报只会以传输级错误失败并误计失败预算），直接退出。
+			if ctx.Err() != nil {
+				return Result{}, cancelledExit(ctx)
+			}
 			o.Logger.Warn("Reader Context 刷新失败（沿用现有 Context，按暂时性处理）", "err", err)
 		} else {
 			st = *fresh
@@ -319,6 +350,12 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			// 不再重试（终态与通知已由恢复链/登录失效路径完成）。
 			if errors.Is(err, report.ErrRejected) || errors.Is(err, weread.ErrLoginInvalid) {
 				return Result{}, fmt.Errorf("timed report 失败: %w", err)
+			}
+			// ticket 18：取消期间的请求失败（传输级 context canceled）不是暂时性
+			// 故障——不得计入连续失败预算、不触发 finalizeTransient；直接退出，
+			// 当天无终态（与 #24 预算收敛路径明确区分）。
+			if ctx.Err() != nil {
+				return Result{}, cancelledExit(ctx)
 			}
 			// 暂时性失败（传输/HTTP/解析）：跳过本节奏点、Reading Session 继续，
 			// 被跳过的间隔并入下一次被接受上报的 rt（ADR-0004）——单次抖动不丢失
@@ -381,6 +418,35 @@ func rtSeconds(t, lastSent time.Time) int {
 		s = 1
 	}
 	return s
+}
+
+// cancelledExit 是取消（ctx 取消）退出的统一错误（ticket 18）：取消不是 Task 的
+// 业务最终失败——尽快返回、不写 success/failed 终态、不发最终通知（当天无终态，
+// 重启/手动 run 按"无 Terminal State"规则重新执行）。包装 ctx.Err() 保持
+// errors.Is(err, context.Canceled) 判别身份（daemon 凭自身 ctx.Err() 判定"取消 =
+// 正常退出"；CLI 判别"已取消"提示与正常退出码）。
+func cancelledExit(ctx context.Context) error {
+	return fmt.Errorf("Task 已取消（未形成终态）: %w", ctx.Err())
+}
+
+// waitUntil 阻塞到 until，以 reportWaitChunk 分片睡眠、每次醒来检查 ctx（ticket
+// 18；与 daemon 的 sleepUntil 同一形态）：ctx 取消 → 返回该错误（取消响应延迟
+// ≤ reportWaitChunk）；到点 → 返回 nil。clock.Sleep 本身不感知 ctx（clock 抽象
+// 文档），分片检查由本层承担。
+func waitUntil(ctx context.Context, c clock.Clock, until time.Time) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		d := until.Sub(c.Now())
+		if d <= 0 {
+			return nil
+		}
+		if d > reportWaitChunk {
+			d = reportWaitChunk
+		}
+		c.Sleep(d)
+	}
 }
 
 // fetchReaderState 抓取并解析 Reader 页（Task 建立时使用）。
@@ -512,6 +578,15 @@ func (e *chainStop) Unwrap() error { return e.err }
 // 身份保留），收敛与否只影响终态与通知；恢复链终止的错误经 errors.As 提取已尝试
 // 动作（chainStop）。终态持久化失败 → 返回持久化错误、不发通知（#15）。
 func (r *Runner) finalizeTransient(ctx context.Context, stage string, cause error, taskDate string) error {
+	// ticket 18：取消识别先于统一 finalization——ctx 已取消（SIGINT/SIGTERM 等）
+	// 时，一切"失败"都是取消的后果而非业务失败：不收敛为 failed 终态、不发通知，
+	// 直接退出（当天无终态；重启/手动 run 按"无 Terminal State"规则重新执行）。
+	// 该检查覆盖经本入口收敛的全部未形成终态失败（renewal / Shelf 抓取 /
+	// Reader Context / enter / timed 预算 / 恢复链暂时性终止）；不经本入口的
+	// 失败（选书"无可用书"）在 failBookSelection 入口做同样检查。
+	if ctx.Err() != nil {
+		return cancelledExit(ctx)
+	}
 	if errors.Is(cause, report.ErrRejected) || errors.Is(cause, weread.ErrLoginInvalid) {
 		return cause
 	}
@@ -637,7 +712,9 @@ func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error, ta
 // 与任务级恢复链的姿态一致：Shelf 抓取失败（传输/HTTP/解析）按暂时性处理（由调用方
 // 经 finalizeTransient 无条件收敛为 failed 终态 + 失败通知，ticket 24——不再于窗口内
 // 重排）；只有"Shelf 有数据但无可用书"才是本 Task 的失败（终态 + 失败通知——书可用性
-// 的数据问题，重跑大概率依旧失败）。taskDate 是 Task 开始日（finalizeTransient 与
+// 的数据问题，重跑大概率依旧失败）。取消（ticket 18）：ctx 已取消时探测请求以 ctx
+// 错误失败不是书不可用证据——probe 停止探测、failBookSelection 入口直接取消退出（不写
+// failed 终态、不发通知，当天无终态）。taskDate 是 Task 开始日（finalizeTransient 与
 // failBookSelection 的终态/通知日期用；见 Run）。
 func (r *Runner) selectFromShelf(ctx context.Context, taskDate string) (string, error) {
 	o := r.opts
@@ -671,6 +748,12 @@ func (r *Runner) selectFromShelf(ctx context.Context, taskDate string) (string, 
 				return "", false
 			}
 			if _, err := o.Reader.Fetch(ctx, b.BookID); err != nil {
+				// ticket 18：探测请求因 ctx 取消失败不是"书不可用"证据——停止探测，
+				// 由 failBookSelection 的取消检查统一退出（不写 failed 终态、
+				// 不发通知，当天无终态）。
+				if ctx.Err() != nil {
+					return "", false
+				}
 				o.Logger.Info("候选书探测不可用，换下一本", "book_id", b.BookID, "err", err)
 				continue
 			}
@@ -702,6 +785,12 @@ func shuffleTier(tier []weread.ShelfBook, rng *rand.Rand) {
 // 终态持久化失败 → 返回持久化错误、不发通知，#15）。返回的错误供调用方报告（最终
 // 由 CLI 以非零退出码呈现）。taskDate 是 Task 开始日（终态/通知日期用）。
 func (r *Runner) failBookSelection(ctx context.Context, taskDate string, shelfCount, unreadCount, finishedCount int) error {
+	// ticket 18：取消识别先于"无可用书"终态——ctx 已取消时（探测间取消、探测请求
+	// 以 ctx 错误失败后耗尽分层）不是书可用性数据问题：直接退出，不写 failed
+	// 终态、不发通知（不经 finalizeTransient 的失败出口在这里检查）。
+	if ctx.Err() != nil {
+		return cancelledExit(ctx)
+	}
 	o := r.opts
 	detail := fmt.Sprintf("书架 %d 本（未读完 %d 本、已读完 %d 本）均无法建立 Reader Context（探测上限 %d）",
 		shelfCount, unreadCount, finishedCount, DefaultMaxSelectionProbes)
