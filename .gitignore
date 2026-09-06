@@ -29,3 +29,8 @@ go.work.sum
 
 # env file
 .env
+
+# local deployment state（compose.yaml.example 复制后的本地部署文件；data/ 为
+# 运行时状态，内含完整持久化 Cookie 集合，不得入库）
+/compose.yaml
+/data/

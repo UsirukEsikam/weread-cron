@@ -6,7 +6,7 @@ data
 .env
 Dockerfile
 .dockerignore
-docker-compose.yml
+compose.yaml
 *.md
 coverage.out
 weread-cron
