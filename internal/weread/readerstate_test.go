@@ -77,6 +77,116 @@ func TestParseInitialStateProgressFieldFallback(t *testing.T) {
 	}
 }
 
+// TestParseInitialStateExplicitZeroChapterFields 断言 currentChapter 显式零值
+// （chapterIdx=0 / chapterOffset=0）按字面采用，不被 progress.book 的回退值覆盖；
+// 数字与字符串两种 JSON 形式均适用，且解析按字段独立（chapterUid 缺失时 chapterIdx
+// 显式 0 仍按字面采用、chapterUid 回退 progress.book）。
+func TestParseInitialStateExplicitZeroChapterFields(t *testing.T) {
+	cases := []struct {
+		name              string
+		cc                string // currentChapter 的 JSON
+		wantChapterUID    uint64
+		wantChapterIdx    int
+		wantChapterOffset int
+	}{
+		{
+			name:              "数字零值",
+			cc:                `{"chapterUid":112,"chapterIdx":0,"chapterOffset":0}`,
+			wantChapterUID:    112,
+			wantChapterIdx:    0,
+			wantChapterOffset: 0,
+		},
+		{
+			name:              "字符串零值",
+			cc:                `{"chapterUid":112,"chapterIdx":"0","chapterOffset":"0"}`,
+			wantChapterUID:    112,
+			wantChapterIdx:    0,
+			wantChapterOffset: 0,
+		},
+		{
+			name:              "uid 缺失时 idx/offset 显式零仍采用",
+			cc:                `{"chapterIdx":0,"chapterOffset":0}`,
+			wantChapterUID:    555, // chapterUid 缺失 → 回退 progress.book
+			wantChapterIdx:    0,
+			wantChapterOffset: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := `{"reader":{"psvts":"p1","token":"t","bookInfo":{"bookId":"9","title":"书"},` +
+				`"currentChapter":` + tc.cc + `,` +
+				`"progress":{"book":{"chapterUid":555,"chapterIdx":7,"chapterOffset":9,"progress":88,"summary":"s"}}}}`
+			st, err := ParseInitialState(samplePage(state))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := st.ReadingProgress("9")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.ChapterUID != tc.wantChapterUID || p.ChapterIdx != tc.wantChapterIdx || p.ChapterOffset != tc.wantChapterOffset {
+				t.Errorf("ReadingProgress = %+v（期望 uid=%d idx=%d offset=%d）", p, tc.wantChapterUID, tc.wantChapterIdx, tc.wantChapterOffset)
+			}
+		})
+	}
+}
+
+// TestParseInitialStateChapterUIDZeroMeansNoPosition 断言 chapterUid 的 0 仍视为
+// 无位置：currentChapter 显式 chapterUid=0（或 null）时回退 progress.book；两源皆无
+// （含显式 0）时维持"无法构造合法上报"的错误语义（现有错误判定不变）。
+func TestParseInitialStateChapterUIDZeroMeansNoPosition(t *testing.T) {
+	cases := []struct {
+		name    string
+		cc      string // currentChapter 的 JSON
+		pb      string // progress.book 的 JSON
+		want    uint64
+		wantErr bool
+	}{
+		{
+			name: "cc 显式 0 回退 pb",
+			cc:   `{"chapterUid":0,"chapterIdx":3,"chapterOffset":1}`,
+			pb:   `{"chapterUid":555,"chapterIdx":2,"chapterOffset":0,"progress":10,"summary":""}`,
+			want: 555,
+		},
+		{
+			name: "cc null 视为缺失回退 pb",
+			cc:   `{"chapterUid":null}`,
+			pb:   `{"chapterUid":555,"chapterIdx":2,"chapterOffset":0,"progress":10,"summary":""}`,
+			want: 555,
+		},
+		{
+			name:    "两源皆显式 0 报错",
+			cc:      `{"chapterUid":0,"chapterIdx":0,"chapterOffset":0}`,
+			pb:      `{"chapterUid":0,"chapterIdx":0,"chapterOffset":0}`,
+			wantErr: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			state := `{"reader":{"psvts":"p1","token":"t","bookInfo":{"bookId":"9","title":"书"},` +
+				`"currentChapter":` + tc.cc + `,` +
+				`"progress":{"book":` + tc.pb + `}}}`
+			st, err := ParseInitialState(samplePage(state))
+			if err != nil {
+				t.Fatal(err)
+			}
+			p, err := st.ReadingProgress("9")
+			if tc.wantErr {
+				if err == nil {
+					t.Errorf("应报无章节位置错误，得到 %+v", p)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if p.ChapterUID != tc.want {
+				t.Errorf("ChapterUID = %d（期望 %d）", p.ChapterUID, tc.want)
+			}
+		})
+	}
+}
+
 // TestParseInitialStateOffsetAsNumber 断言 chapterOffset 数字形式同样可解析。
 func TestParseInitialStateOffsetAsNumber(t *testing.T) {
 	state := `{"reader":{"psvts":"p1","token":"t","bookInfo":{"bookId":"9","title":"书"},` +

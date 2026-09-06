@@ -5,9 +5,10 @@
 //   - 页面包含 window.__INITIAL_STATE__ = <json>; (function ...)()；JSON 中 reader 子对象
 //     携带 psvts/pclts/token/bookInfo/currentChapter/progress；
 //   - ReadingProgress 字段优先级：章节位置以 currentChapter 优先、回退 progress.book；
-//     进度百分比与摘要取自 progress.book；
+//     chapterIdx/chapterOffset 区分"字段缺失"与"显式零值"——字段存在（含显式 0）时按字面
+//     采用，仅在字段缺失时回退；chapterUid 的 0 仍视为无位置（两源皆无时无法构造合法上报）；
 //   - 章节编号等字段在真实页面中可能是数字或字符串（chapterOffset 常见为 "0" 字符串），
-//     flexInt/flexUint64 兼容两者。
+//     flexInt/flexUint64 兼容两者并记录字段存在性。
 package weread
 
 import (
@@ -26,9 +27,9 @@ var initialStateMarker = regexp.MustCompile(`(?s)window\.__INITIAL_STATE__\s*=\s
 // InitialState 是解析后的 __INITIAL_STATE__（只保留本工具关心的字段）。
 type InitialState struct {
 	Reader struct {
-		Psvts string `json:"psvts"`
-		Pclts string `json:"pclts"`
-		Token string `json:"token"`
+		Psvts    string `json:"psvts"`
+		Pclts    string `json:"pclts"`
+		Token    string `json:"token"`
 		BookInfo struct {
 			BookID string `json:"bookId"`
 			Title  string `json:"title"`
@@ -70,7 +71,9 @@ func ParseInitialState(html string) (*InitialState, error) {
 func (s *InitialState) BookTitle() string { return s.Reader.BookInfo.Title }
 
 // ReadingProgress 按 koplugin apply_to_book 的优先级构造 ReadingProgress。
-// 找不到任何章节位置时返回错误（无法构造合法上报）。
+// chapterIdx/chapterOffset 区分"字段缺失"与"显式零值"：字段存在（含显式 0）时采用
+// currentChapter 值，仅在字段缺失时回退 progress.book；chapterUid 的 0 仍视为无位置
+// （显式 0 与缺失同样回退，两源皆无时报错——无法构造合法上报）。
 func (s *InitialState) ReadingProgress(bookID string) (ReadingProgress, error) {
 	cc := s.Reader.CurrentChapter
 	pb := s.Reader.Progress.Book
@@ -80,11 +83,11 @@ func (s *InitialState) ReadingProgress(bookID string) (ReadingProgress, error) {
 		chapterUID = pb.ChapterUID.Uint64()
 	}
 	chapterIdx := cc.ChapterIdx.Int()
-	if chapterIdx == 0 {
+	if !cc.ChapterIdx.Present() {
 		chapterIdx = pb.ChapterIdx.Int()
 	}
 	chapterOffset := cc.ChapterOffset.Int()
-	if chapterOffset == 0 {
+	if !cc.ChapterOffset.Present() {
 		chapterOffset = pb.ChapterOffset.Int()
 	}
 	if chapterUID == 0 {
@@ -111,14 +114,21 @@ func (s *InitialState) ReaderContext() ReaderContext {
 }
 
 // flexInt 解析 JSON 数字或数字字符串为 int（真实页面 chapterOffset 等字段两种形式都有）。
+// 记录字段存在性：present=false 表示字段缺失（或 JSON null），present=true 表示字段存在
+// （含显式零值）。
+//
+// flexInt 是值类型（结构体字段直接嵌入）；字段缺失时 UnmarshalJSON 不会被调用，
+// 零值 present=false 即"缺失"，JSON null 同样记为缺失。
 type flexInt struct {
-	n int
+	n       int
+	present bool
 }
 
 // UnmarshalJSON 接受数字字面量或带引号的数字字符串。
 func (f *flexInt) UnmarshalJSON(b []byte) error {
+	f.n = 0
+	f.present = false
 	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
-		f.n = 0
 		return nil
 	}
 	s := string(b)
@@ -130,21 +140,28 @@ func (f *flexInt) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	f.n = int(n)
+	f.present = true
 	return nil
 }
+
+// Present 返回字段是否存在于 JSON 中（显式零值也视为存在）。
+func (f flexInt) Present() bool { return f.present }
 
 // Int 返回数值。
 func (f flexInt) Int() int { return f.n }
 
 // flexUint64 解析 JSON 数字或数字字符串为 uint64（chapterUid 在大数场景需保持精度）。
+// 存在性语义同 flexInt：present=false 表示字段缺失（或 JSON null）。
 type flexUint64 struct {
-	n uint64
+	n       uint64
+	present bool
 }
 
 // UnmarshalJSON 接受数字字面量或带引号的数字字符串。
 func (f *flexUint64) UnmarshalJSON(b []byte) error {
+	f.n = 0
+	f.present = false
 	if len(b) == 0 || bytes.Equal(b, []byte("null")) {
-		f.n = 0
 		return nil
 	}
 	s := string(b)
@@ -156,8 +173,12 @@ func (f *flexUint64) UnmarshalJSON(b []byte) error {
 		return err
 	}
 	f.n = n
+	f.present = true
 	return nil
 }
+
+// Present 返回字段是否存在于 JSON 中（显式零值也视为存在）。
+func (f flexUint64) Present() bool { return f.present }
 
 // Uint64 返回数值。
 func (f flexUint64) Uint64() uint64 { return f.n }
