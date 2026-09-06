@@ -128,6 +128,14 @@ type fakeWeread struct {
 	blockTimedTriggered chan struct{}
 	timedAbortNotify    chan struct{}
 
+	// slowFailGate 非 nil 时，每一笔将返回 HTTP 500 的 timed report 在响应前经
+	// gate 从测试取一个释放 channel，等待其关闭后才返回 500（注入"慢失败"：失败
+	// 响应耗时推进墙钟，使下一次尝试落在异常间隔阈值之外；findings/07 H1 的"慢
+	// 失败 → 异常间隔 → 重建 → 再次失败"组合路径）。挂起期间客户端断开（ctx
+	// 取消）经 r.Context().Done() 感知返回。测试每次经 slowFailOnce 提供一个新
+	// 的释放 channel（ticket 27）。
+	slowFailGate chan chan struct{}
+
 	// blockReader 非 nil 时，下一笔 Reader 页请求到达后等待 channel 关闭才响应
 	// （blockReaderTriggered 为到达信号）；挂起期间客户端断开（ctx 取消）经
 	// r.Context().Done() 感知返回（ticket 18 选书取消测试用）。
@@ -441,6 +449,20 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Unlock()
 	if timedFail || enterFail {
+		// ticket 27（findings/07 H1）：慢失败注入——每笔将失败的 timed report 在
+		// 响应前经 slowFailGate 取一个释放 channel 并等待其关闭（测试在此期间推进
+		// 时钟模拟失败响应耗时），再返回 HTTP 500。
+		if timedFail && f.slowFailGate != nil {
+			select {
+			case release := <-f.slowFailGate:
+				select {
+				case <-release:
+				case <-r.Context().Done():
+					// 客户端在挂起期间断开（ctx 取消）：在途请求以传输级错误失败。
+				}
+			case <-r.Context().Done():
+			}
+		}
 		http.Error(w, "report unavailable", http.StatusInternalServerError)
 		return
 	}
@@ -634,6 +656,24 @@ func setup(t *testing.T, mutate func(h *testHarness)) *testHarness {
 // advance 推进测试时钟（Fake 家族；Capped 等包装也内嵌 Fake）。
 func (h *testHarness) advance(d time.Duration) {
 	h.clk.(interface{ Advance(time.Duration) }).Advance(d)
+}
+
+// slowFailOnce 让下一笔将返回 HTTP 500 的 timed report 在响应前推进 d 的墙钟
+// （ticket 27：注入"慢失败"——每笔 timed report 延迟后失败，把下一次尝试推过
+// 异常间隔阈值）。向 slowFailGate 发送一个释放 channel 并阻塞到该笔 report 到达
+// 且被挂起（确定性同步：Fake 时钟的 Sleep 瞬时推进，只能由测试在请求在途时
+// Advance 模拟耗时）；随后推进时钟 d、关闭释放 channel 使该笔 report 返回 500。
+// 若 report 未在超时内到达（如 Task 已收敛终止）则失败。
+func (h *testHarness) slowFailOnce(d time.Duration) {
+	h.t.Helper()
+	release := make(chan struct{})
+	select {
+	case h.weread.slowFailGate <- release:
+	case <-time.After(10 * time.Second):
+		h.t.Fatal("慢失败 timed report 未在 10s 内到达（Task 可能未按预期发送该笔上报）")
+	}
+	h.advance(d)
+	close(release)
 }
 
 // pinClock 是测试注入时钟（ticket 18）：包装 Fake，Sleep 在 release 关闭前阻塞、
@@ -1431,6 +1471,145 @@ func TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal(t *testing.T) {
 		if strings.Contains(string(msg), "完成") {
 			t.Errorf("%s 不得混入成功文案；body=%s", name, msg)
 		}
+	}
+}
+
+// TestRunSlowTimedFailuresWithRebuildConvergesToFailedTerminal 断言 findings/07 H1
+// 的确定性复现（ticket 27）：每笔 timed report 延迟后失败（慢失败注入，失败响应
+// 耗时 > 节奏 30s，把下一次尝试逐步推离计划节奏）、失败周期把下一次尝试推过异常
+// 间隔阈值 → 异常分支重建 Reading Session（重新 enter）——重建 enter 成功不得清零
+// 连续失败预算（只有被接受的 timed report 才清零），Task 在有界次数内收敛为 failed
+// 终态 + 失败通知，不无限重建。修复前：重建 enter 反复清零预算（2 失败 → 重建 →
+// 2 失败 → 重建……），Task 永不收敛（只能靠主动取消结束）。
+func TestRunSlowTimedFailuresWithRebuildConvergesToFailedTerminal(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedFailCount = 100                    // timed report 一律 HTTP 500（预算内耗尽）
+		h.weread.slowFailGate = make(chan chan struct{}) // 每笔失败 timed 响应前等待测试放行
+	})
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		_, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 慢失败节奏（每笔延迟 40s，> 节奏 30s 才产生漂移）：timed #1（t=30 发送，
+	// t=70 失败，cf=1）→ timed #2（t=70，t=110 失败，cf=2）→ t=110 越过异常阈值
+	// （>90s）→ 重建 enter（不清零预算）→ timed #3（t=140，t=180 失败）→ cf=3
+	// 预算耗尽 → 收敛为 failed 终态 + 失败通知。
+	for i := 0; i < 3; i++ {
+		h.slowFailOnce(40 * time.Second)
+	}
+
+	select {
+	case <-done:
+		if runErr == nil {
+			t.Fatal("慢失败 + 异常间隔重建后 Task 应收敛为失败")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Task 未在 30s 内收敛（重建 enter 可能仍在清零预算、永不收敛）")
+	}
+	if errors.Is(runErr, report.ErrRejected) {
+		t.Errorf("传输级失败不得归类为服务器拒绝: %v", runErr)
+	}
+	if !strings.Contains(runErr.Error(), "连续 3 次暂时性失败") {
+		t.Errorf("错误应说明连续失败预算；实际: %v", runErr)
+	}
+
+	// 线上：renewal → refresh → enter → timed ×2（失败）→ enter（重建）→ timed
+	// （失败 → 预算耗尽）；report 数有界（2 enter + 3 timed）、不无限重建。
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "timed", "enter", "timed")
+	if n := h.weread.count("/web/book/read"); n != 5 {
+		t.Errorf("report 数 = %d，期望 5（2 enter + 3 timed）", n)
+	}
+
+	// failed 终态已落盘（收敛）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}) {
+		t.Errorf("Terminal State = %+v，期望 2025-09-06/failed", st)
+	}
+
+	// 失败通知（Bark + 企业微信各 1 条）：失败阶段/主要错误/当天日期；无成功文案。
+	for name, nf := range map[string]*fakeNotify{"bark": h.bark, "wecom": h.wecom} {
+		recs := nf.snapshot()
+		if len(recs) != 1 {
+			t.Fatalf("%s 通知数 = %d，期望 1 条失败通知", name, len(recs))
+		}
+		msg, _ := json.Marshal(recs[0].Body)
+		for _, want := range []string{
+			"微信读书阅读任务失败",
+			"失败阶段：timed report",
+			"主要错误",
+			"连续 3 次暂时性失败",
+			"2025-09-06",
+		} {
+			if !strings.Contains(string(msg), want) {
+				t.Errorf("%s 失败通知缺少 %q；body=%s", name, want, msg)
+			}
+		}
+		if strings.Contains(string(msg), "完成") {
+			t.Errorf("%s 不得混入成功文案；body=%s", name, msg)
+		}
+	}
+}
+
+// TestRunSlowFailuresThenRebuildThenAcceptedReportsSucceed 断言重建边界预算语义的
+// 正向回归（ticket 27 验收 4）：前两笔 timed report 慢失败（漂移越过异常阈值）→
+// 重建 Reading Session（重建 enter 不清零预算、cf 保持 2）→ 重建后的第一笔 timed
+// report 被接受——被接受的 timed report 才是"timed report 路径已恢复"的确凿证据，
+// 此时才清零预算；Task 继续并成功（与修复前行为一致：重建后正常接受的报告继续
+// Task，success 终态 + 成功通知）。
+func TestRunSlowFailuresThenRebuildThenAcceptedReportsSucceed(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedFailCount = 2                      // 前 2 笔 timed 失败；之后接受
+		h.weread.slowFailGate = make(chan chan struct{}) // 失败 timed 响应前等待测试放行
+	})
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var res task.Result
+	var runErr error
+	go func() {
+		res, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 慢失败节奏（每笔延迟 40s，> 节奏 30s 产生漂移）：timed #1（t=30 → t=70 失败，
+	// cf=1）→ timed #2（t=70 → t=110 失败，cf=2）→ t=110 越过异常阈值 → 重建 enter
+	//（不清零预算）→ timed #3（t=140）被接受（cf=0）→ timed #4（t=170）接受满
+	// 60s → Task 成功。
+	h.slowFailOnce(40 * time.Second)
+	h.slowFailOnce(40 * time.Second)
+
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("重建后正常接受的报告应继续 Task: %v", runErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Task 未在 30s 内完成")
+	}
+
+	if res.Actual != time.Minute || res.Reports != 2 {
+		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次（重建后接受满目标）", res.Actual, res.Reports)
+	}
+
+	// 线上：renewal → refresh → enter → timed ×2（失败）→ enter（重建）→ timed ×2
+	// （接受）。重建 enter 后无第三次失败（预算由被接受的 timed report 清零）。
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "timed", "enter", "timed", "timed")
+
+	// success 终态 + 成功通知（仅 1 条，无失败通知）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultSuccess {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 success", st, has, err)
+	}
+	if got := len(h.bark.snapshot()); got != 1 || h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
 	}
 }
 

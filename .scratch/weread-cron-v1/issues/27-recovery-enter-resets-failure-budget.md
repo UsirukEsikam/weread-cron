@@ -6,7 +6,7 @@
 **Category:** bug
 **Blocked by:** None
 **Related:** ticket 12（timed report 传输容错预算）、ticket 24（统一 finalization / 有界收敛）、ADR-0004（异常间隔重建 Reading Session）、ticket 28 / ticket 29（同源 findings/07，各自独立）
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Agent Brief
 
@@ -33,11 +33,11 @@
 - 循环相关注释需同步（现注释声称"重建成功即传输已恢复"，与修复后行为不再一致）。
 
 **Acceptance criteria:**
-- [ ] 按 findings/07 H1 的确定性慢失败脚本（每笔 timed report 延迟后失败、每个失败周期把下一次尝试推过异常阈值）运行，Task 在有界次数的上报内收敛为 failed 终态 + 失败通知，不无限重建。
-- [ ] 连续失败预算绝不由"重建 enter 被接受"单独清零；只有被接受的 timed report 才清零预算。
-- [ ] 真实长间隔（无前置失败、时钟跳变）仍重建 Reading Session 且 Task 继续成功（`TestRunAbnormalIntervalRebuildsSession` 回归通过）。
-- [ ] 重建后正常接受的报告继续 Task，行为与修复前一致（回归）。
-- [ ] `go test -count=1 -race ./...` 全部通过。
+- [x] 按 findings/07 H1 的确定性慢失败脚本（每笔 timed report 延迟后失败、每个失败周期把下一次尝试推过异常阈值）运行，Task 在有界次数的上报内收敛为 failed 终态 + 失败通知，不无限重建。
+- [x] 连续失败预算绝不由"重建 enter 被接受"单独清零；只有被接受的 timed report 才清零预算。
+- [x] 真实长间隔（无前置失败、时钟跳变）仍重建 Reading Session 且 Task 继续成功（`TestRunAbnormalIntervalRebuildsSession` 回归通过）。
+- [x] 重建后正常接受的报告继续 Task，行为与修复前一致（回归）。
+- [x] `go test -count=1 -race ./...` 全部通过。
 
 **Out of scope:**
 - H2（恢复链大间隔未复查连续性）与 H4（终态持久化失败丢失错误身份）各自独立 ticket（28/29），不并入本票。
@@ -47,3 +47,19 @@
 ## 验证记录（triage）
 
 已对照 `internal/task/task.go` 确认机制：异常阈值分支（约 L342–357）中 `sendEnter` 成功后执行 `consecutiveFailures = 0`（约 L356），无任何条件；慢失败路径使下一次尝试越过阈值，导致预算在耗尽前反复被重建 enter 清零。测试缺口确认：`TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal` 使用瞬时 HTTP 500（`timedFailCount = 100`），不推进时间，未覆盖"慢失败 → 异常间隔 → 重建 → 再次失败"组合路径。
+
+## Answer
+
+全部验收通过。修复：`internal/task/task.go` 异常间隔重建分支删除 `consecutiveFailures = 0`（重建 enter 成功只证明 Reading Session 重建，不证明 timed report 路径恢复）；预算现在只在"一笔被接受的 timed report"出现时清零（成功分支），同步更新循环注释。
+
+1. **AC1（慢失败收敛）**：新增 `TestRunSlowTimedFailuresWithRebuildConvergesToFailedTerminal` —— fakeWeread 新增 `slowFailGate` 注入（每笔将失败的 timed report 在响应前由测试持有并推进墙钟，模拟"慢失败"）+ `slowFailOnce` 助手；每笔延迟 40s（> 节奏 30s 产生漂移）→ 2 失败后越异常阈值 → 重建 enter（不清零）→ 第 3 笔失败耗尽预算 → 收敛为 failed 终态 + 失败通知，不无限重建。已验证测试在修复前 30s 超时（永不收敛）、修复后通过。
+2. **AC2（预算清零条件）**：代码中 `consecutiveFailures = 0` 仅剩"被接受的 timed report"成功分支一处。
+3. **AC3（真实长间隔回归）**：`TestRunAbnormalIntervalRebuildsSession` 与 `TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext` 未改动且通过（无前置失败语义下重建行为不变）。
+4. **AC4（重建后正常接受继续）**：新增 `TestRunSlowFailuresThenRebuildThenAcceptedReportsSucceed` —— 2 失败 → 重建（cf 保留 2）→ 重建后首笔被接受的 timed report 清零预算 → Task 继续成功（success 终态 + 成功通知）。
+5. **AC5**：`go test -count=1 -race ./...` 全部通过。
+
+边界遵守：未动恢复链 5 步结构、内部默认数值、配置面与协议层（H2/H4 各自 ticket 28/29，未并入）。
+
+code-review（Standards + Spec 双轴）结论均为 OK with notes：无硬性违规；P2 判断项为 slowFailGate 与既有 blockTimed/pinClock 同为"请求挂起期间推进时钟"机制（本仓既有多注入旋钮风格，语义不同：仅失败 timed、逐笔放行），不修改。
+
+**Commit:** 待提交

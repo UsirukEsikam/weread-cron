@@ -351,9 +351,12 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 			}
 			st, lastSent = enterResult.st, enterResult.at
-			// 重建成功即传输已恢复：连续失败计数清零（ticket 12；前一轮的失败预算
-			// 不得延续到重建后的新会话）。
-			consecutiveFailures = 0
+			// ticket 27（findings/07 H1）：重建 enter 成功只证明 Reader Context /
+			// Reading Session 重新建立，不证明 timed report 路径已恢复——连续失败
+			// 预算只在"一笔被接受的 timed report"出现时清零（下方成功分支），重建
+			// enter 不清零。否则持续慢故障（每笔 timed report 延迟后失败、每次失败
+			// 把下一次尝试推过异常阈值）时，重建 enter 会反复清零预算，Task 永不
+			// 收敛为 failed 终态（有界收敛保证，spec 决策 #7/#9/#12）。
 			next = lastSent.Add(DefaultRhythm)
 			continue
 		}
