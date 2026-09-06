@@ -27,10 +27,12 @@ func NewSender(client *weread.Client) *Sender {
 }
 
 // Enter 发送 enter report（不带计时字段：rt/ts/rn/sg；见 protocol.EnterReportPayload）。
+// pc 是会话级 pc（issue 30：调用方在 Reading Session 建立时经 weread.ResolvePC 解析
+// 一次并传入，会话内 enter 与全部 timed reports 复用）。
 // 返回 nil = 被接受；服务器拒绝时返回包装 ErrRejected 的错误（非传输错误）。
 // 响应 Set-Cookie 只在被接受后并入会话（issue 16）。
-func (s *Sender) Enter(ctx context.Context, bookID string, p weread.ReadingProgress, rc weread.ReaderContext, now time.Time) error {
-	payload := weread.EnterReportPayload(p, rc, now, s.client.UserAgent)
+func (s *Sender) Enter(ctx context.Context, bookID string, p weread.ReadingProgress, rc weread.ReaderContext, pc string, now time.Time) error {
+	payload := weread.EnterReportPayload(p, rc, pc, now, s.client.UserAgent)
 	body, cookies, err := s.client.Report(ctx, payload, bookID)
 	if err != nil {
 		return err
@@ -47,10 +49,11 @@ func (s *Sender) Enter(ctx context.Context, bookID string, p weread.ReadingProgr
 }
 
 // Timed 发送 timed report（携带 rt/ts/rn/sg；rt 语义由调用方按 ADR-0004 传入）。
+// pc 是会话级 pc（同 Enter；issue 30）。
 // 返回 nil = 被接受；服务器拒绝时返回包装 ErrRejected 的错误（非传输错误）。
 // 响应 Set-Cookie 只在被接受后并入会话（issue 16）。
-func (s *Sender) Timed(ctx context.Context, bookID string, p weread.ReadingProgress, rc weread.ReaderContext, now time.Time, rtSec int, tsMs int64, rn int) error {
-	payload := weread.TimedReportPayload(p, rc, now, s.client.UserAgent, rtSec, tsMs, rn)
+func (s *Sender) Timed(ctx context.Context, bookID string, p weread.ReadingProgress, rc weread.ReaderContext, pc string, now time.Time, rtSec int, tsMs int64, rn int) error {
+	payload := weread.TimedReportPayload(p, rc, pc, now, s.client.UserAgent, rtSec, tsMs, rn)
 	body, cookies, err := s.client.Report(ctx, payload, bookID)
 	if err != nil {
 		return err

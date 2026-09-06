@@ -1,6 +1,7 @@
 package weread
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -213,7 +214,7 @@ func TestEnterReportPayloadFieldSet(t *testing.T) {
 		Progress: 74, Summary: "19聚会《三体》网友的聚会地点是一处僻静",
 	}
 	rc := ReaderContext{Psvts: "4ee326507a65a465g015fae", Pclts: "aab32e207a65a466g010615", Token: "tok"}
-	got := EnterReportPayload(pos, rc, now, testUA)
+	got := EnterReportPayload(pos, rc, ResolvePC(rc, now), now, testUA)
 
 	for _, k := range []string{"appId", "b", "c", "ci", "co", "sm", "pr", "ct", "ps", "pc", "s"} {
 		if _, ok := got[k]; !ok {
@@ -245,7 +246,7 @@ func TestTimedReportPayloadFieldSet(t *testing.T) {
 		Progress: 74, Summary: "19聚会《三体》网友的聚会地点是一处僻静",
 	}
 	rc := ReaderContext{Psvts: "4ee326507a65a465g015fae", Pclts: "aab32e207a65a466g010615", Token: "tok"}
-	got := TimedReportPayload(pos, rc, now, testUA, 15, 1744264311434, 466)
+	got := TimedReportPayload(pos, rc, ResolvePC(rc, now), now, testUA, 15, 1744264311434, 466)
 
 	for _, k := range []string{"appId", "b", "c", "ci", "co", "sm", "pr", "ct", "ps", "pc", "rt", "ts", "rn", "sg", "s"} {
 		if _, ok := got[k]; !ok {
@@ -264,7 +265,8 @@ func TestTimedReportPayloadFieldSet(t *testing.T) {
 }
 
 // TestPayloadPositionRules 验证位置字段规整规则：progress 夹取、偏移非负、
-// sm 截取 20 代码点、pc 缺失回退 e(now)、chapterUid=0 时 c=e("0")（官方 JS e(chapterUid||0)）。
+// sm 截取 20 代码点、pc 缺失时经 ResolvePC 回退 e(会话建立时刻)、chapterUid=0 时
+// c=e("0")（官方 JS e(chapterUid||0)）。
 func TestPayloadPositionRules(t *testing.T) {
 	now := time.Unix(1744264311, 0)
 	pos := ReadingProgress{
@@ -272,7 +274,8 @@ func TestPayloadPositionRules(t *testing.T) {
 		Progress: 150, Summary: "这是一段超过二十个字符的摘要文本用于验证截取行为是否正确生效",
 	}
 	rc := ReaderContext{Psvts: "", Pclts: ""} // ps 为空透传，pc 应回退
-	got := EnterReportPayload(pos, rc, now, testUA)
+	pc := ResolvePC(rc, now)
+	got := EnterReportPayload(pos, rc, pc, now, testUA)
 
 	if got["pr"] != "100" || got["ci"] != "0" || got["co"] != "0" {
 		t.Errorf("规整错误: pr=%s ci=%s co=%s", got["pr"], got["ci"], got["co"])
@@ -282,6 +285,9 @@ func TestPayloadPositionRules(t *testing.T) {
 	}
 	if got["pc"] != EncodeID("1744264311") {
 		t.Errorf("pc 回退错误: %s, want %s", got["pc"], EncodeID("1744264311"))
+	}
+	if pc != EncodeID("1744264311") {
+		t.Errorf("ResolvePC 回退错误: %s, want %s", pc, EncodeID("1744264311"))
 	}
 	if got["ps"] != "" {
 		t.Errorf("ps 应为空字符串透传, got %q", got["ps"])
@@ -294,13 +300,49 @@ func TestPayloadPositionRules(t *testing.T) {
 	}
 }
 
-// TestPcltsZeroFallback 验证 pc == "0" 也触发回退（参考实现 tonumber(pc)==0 语义）。
+// TestPcltsZeroFallback 验证 pc == "0" 也触发回退（参考实现 tonumber(pc)==0 语义），
+// 经 ResolvePC 在会话建立时解析为 e(会话建立时刻)。
 func TestPcltsZeroFallback(t *testing.T) {
 	now := time.Unix(1744264311, 0)
 	pos := ReadingProgress{BookID: "695233", ChapterUID: 1}
-	got := EnterReportPayload(pos, ReaderContext{Psvts: "ps", Pclts: "0"}, now, testUA)
+	pc := ResolvePC(ReaderContext{Psvts: "ps", Pclts: "0"}, now)
+	got := EnterReportPayload(pos, ReaderContext{Psvts: "ps", Pclts: "0"}, pc, now, testUA)
 	if got["pc"] != EncodeID("1744264311") {
-		t.Errorf("pc 应为 e(now), got %s", got["pc"])
+		t.Errorf("pc 应为 e(会话建立时刻), got %s", got["pc"])
+	}
+}
+
+// TestResolvePC 断言会话级 pc 的解析（issue 30）：Pclts 可用（非空、非 "0"，ticket
+// 25 语义）时返回 Reader Context 原值（与 issue 30 之前的行为一致）；为空或 "0" 时
+// 返回 e(会话建立时刻的秒级时间戳)——fallback pc 只在明确建立新的 Reading Session
+// 时生成，会话内（enter 与全部 timed reports）复用，与官方客户端"初始 pclts 为 0 的
+// 页面发送非零 pc、会话内复用"的口径一致。
+func TestResolvePC(t *testing.T) {
+	sessionAt := time.Unix(1744333820, 0) // e() golden 向量使用的秒级时间戳
+
+	// 可用 pclts（已编码串 / 非零数字时间戳串）：返回原值，与会话建立时刻无关。
+	for _, pclts := range []string{"aab32e207a65a466g010615", "1744333820"} {
+		if got := ResolvePC(ReaderContext{Pclts: pclts}, sessionAt); got != pclts {
+			t.Errorf("ResolvePC(%q) = %q, want 原值 %q", pclts, got, pclts)
+		}
+	}
+	if got := ResolvePC(ReaderContext{Pclts: "aab32e207a65a466g010615"}, sessionAt.Add(5*time.Minute)); got != "aab32e207a65a466g010615" {
+		t.Errorf("可用 pclts 不得受会话建立时刻影响, got %q", got)
+	}
+
+	// 空 / "0"：回退 e(会话建立时刻的秒级时间戳)。
+	for _, pclts := range []string{"", "0"} {
+		want := EncodeID(strconv.FormatInt(sessionAt.Unix(), 10))
+		if got := ResolvePC(ReaderContext{Pclts: pclts}, sessionAt); got != want {
+			t.Errorf("ResolvePC(%q) = %q, want fallback %q", pclts, got, want)
+		}
+	}
+
+	// 不同会话建立时刻产生不同的 fallback（重建不复用前一会话的值）。
+	a := ResolvePC(ReaderContext{}, sessionAt)
+	b := ResolvePC(ReaderContext{}, sessionAt.Add(time.Second))
+	if a == b {
+		t.Errorf("不同建立时刻的 fallback pc 应不同: %s", a)
 	}
 }
 

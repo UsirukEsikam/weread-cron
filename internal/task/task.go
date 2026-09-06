@@ -41,6 +41,14 @@
 // ErrLoginInvalid（errors.Is 贯通）：Timed 循环据此把"已形成终态决策但存储失败"
 // 判为终止而非可重试暂时性失败，绝不重入上报路径（否则存储恢复后后续上报可把
 // 该最终失败翻转为 success 终态）。
+// issue 30 范围（本文件 + protocol/report）：Reader Context 无可用的 pclts（为空
+// 或 "0"，真实 Reader 页可返回数字 0，ticket 25 已修解析）时，fallback pc 在
+// Reading Session 建立（enter）时经 weread.ResolvePC 生成一次（值 = e(建立时刻的
+// 秒级时间戳)），该会话的 enter 与全部 timed reports 复用——无论各报告构造时刻、
+// TTL 主动刷新或恢复链内 refresh Reader Context（均无 re-enter）如何；仅异常间隔
+// 重建（重新 enter）时生成新的 fallback pc（实证：fallback pc 每笔更换与长会话
+// 拒收关联，findings/08；本票不改动可用 pclts 路径与 TTL/-2012 recovery 是否
+// re-enter 的现状）。
 //
 // # rt 语义（ADR-0004）
 //
@@ -306,12 +314,16 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		"chapter_uid", initial.Progress.ChapterUID, "target", target.String())
 
 	// 6. enter report 建立 Reading Session（用户故事 #26）；被拒时按有界恢复链恢复。
+	//    issue 30：enter 建立点为会话级 pc 的解析点（fallback 场景 = e(建立时刻)，
+	//    可用 pclts 场景 = Reader Context 原值），会话内全部上报复用该 pc。
 	now := o.Clock.Now()
 	enterResult, err := r.sendEnter(ctx, bookID, *initial, now, taskDate)
 	if err != nil {
 		return Result{}, fmt.Errorf("enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 	}
 	st, lastSent := enterResult.st, enterResult.at
+	// issue 30：会话级 pc 随 Reading Session 携带（TTL/恢复链刷新不改变，仅重建时更新）。
+	sessionPC := enterResult.pc
 
 	// 7. 周期 timed report；rt 按 ADR-0004；本地累计达标即停止（用户故事 #27/#28）。
 	//    被拒时按有界恢复链恢复（spec 决策 #7），恢复成功后 Task 继续。
@@ -345,7 +357,8 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		// report 前经 Fetch 取 Context——TTL（readercontext.DefaultContextTTL，参考
 		// 默认 ≈15 分钟）内命中缓存零网络请求；到期时重新抓取 Reader 页刷新
 		// （新 token/psvts）。刷新不重置 rt 基准：Reading Session 继续，无 enter、
-		// 不中断（用户故事 #27/#30）。
+		// 不中断（用户故事 #27/#30）。issue 30：刷新同样不改变会话级 pc（fallback
+		// pc 只在重新 enter 时重新生成）。
 		// 刷新失败按暂时性处理（ticket 05 对链中 refresh 失败的先例）：沿用现有
 		// Context 继续，下次周期再试；若服务器因此拒绝上报，恢复链会先 refresh 再
 		// retry（已覆盖该情形）。
@@ -376,7 +389,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			if time.Duration(rt)*time.Second > DefaultAnomalyThreshold {
 				return 0, errIntervalOverThreshold
 			}
-			return rt, o.Sender.Timed(ctx, bookID, s.Progress, s.Context, t, rt, t.UnixMilli(), o.RNG.Intn(1000))
+			// issue 30：每笔上报携带会话级 pc（sessionPC 在 enter 建立时解析，
+			// fallback 场景会话内稳定，不随构造时刻/Context 刷新变化）。
+			return rt, o.Sender.Timed(ctx, bookID, s.Progress, s.Context, sessionPC, t, rt, t.UnixMilli(), o.RNG.Intn(1000))
 		}
 		newSt, rt, at, err := r.recoverSend(ctx, bookID, StageTimedReport, st, now, send, taskDate)
 		if errors.Is(err, errIntervalOverThreshold) {
@@ -406,6 +421,9 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 			}
 			st, lastSent = enterResult.st, enterResult.at
+			// issue 30：重建 = 明确建立新的 Reading Session → 解析新的会话级 pc
+			// （fallback 场景不复用前一会话的值，值 = e(重建时刻)）。
+			sessionPC = enterResult.pc
 			// ticket 27（findings/07 H1）：重建 enter 成功只证明 Reader Context /
 			// Reading Session 重新建立，不证明 timed report 路径已恢复——连续失败
 			// 预算只在"一笔被接受的 timed report"出现时清零（下方成功分支），重建
@@ -504,25 +522,32 @@ func (r *Runner) fetchReaderState(ctx context.Context, bookID string) (*readerco
 	return r.opts.Reader.Fetch(ctx, bookID)
 }
 
-// sendResult 是一次上报尝试的结果：被接受的 Reader 状态、被接受的 rt（enter 为 0）
-// 与发送时刻（恢复链重试时为重试时刻）。
+// sendResult 是一次上报尝试的结果：被接受的 Reader 状态、会话级 pc（issue 30：
+// Reading Session 建立时经 ResolvePC 解析一次，会话内全部上报复用）、被接受的 rt
+// （enter 为 0）与发送时刻（恢复链重试时为重试时刻）。
 type sendResult struct {
 	st readercontext.State
+	pc string
 	rt int
 	at time.Time
 }
 
 // sendEnter 发送 enter report（不含计时字段）；被拒时按有界恢复链恢复，返回刷新后的状态。
+// 同时解析该 Reading Session 的会话级 pc（issue 30）：Pclts 可用（非空、非 "0"）→
+// Reader Context 原值；空/"0" → fallback e(会话建立时刻的秒级时间戳)——会话内 enter
+// 与全部 timed reports 复用（含恢复链内 refresh Reader Context，无 re-enter 不改变），
+// 仅明确重新 enter（新会话）时重新解析。
 // taskDate 是 Task 开始日（恢复链耗尽的终态/通知日期用；见 Run）。
 func (r *Runner) sendEnter(ctx context.Context, bookID string, st readercontext.State, now time.Time, taskDate string) (sendResult, error) {
+	pc := weread.ResolvePC(st.Context, now)
 	send := func(s readercontext.State, t time.Time) (int, error) {
-		return 0, r.opts.Sender.Enter(ctx, bookID, s.Progress, s.Context, t)
+		return 0, r.opts.Sender.Enter(ctx, bookID, s.Progress, s.Context, pc, t)
 	}
 	newSt, rt, at, err := r.recoverSend(ctx, bookID, StageEnterReport, st, now, send, taskDate)
 	if err != nil {
 		return sendResult{}, err
 	}
-	return sendResult{st: newSt, rt: rt, at: at}, nil
+	return sendResult{st: newSt, pc: pc, rt: rt, at: at}, nil
 }
 
 // reportSend 发送一笔上报并返回被接受的 rt（enter 恒为 0）；err 为 nil 代表被接受。

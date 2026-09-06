@@ -56,11 +56,12 @@ func TestSenderMergesCookiesOnlyAfterAcceptance(t *testing.T) {
 				Progress: 35, Summary: "太空是无尽黑暗的",
 			}
 			rc := weread.ReaderContext{Psvts: "ps", Pclts: "pc", Token: "tok"}
+			pc := weread.ResolvePC(rc, now)
 			var err error
 			if tc.timed {
-				err = s.Timed(context.Background(), "695233", pos, rc, now, 15, 1744264311434, 466)
+				err = s.Timed(context.Background(), "695233", pos, rc, pc, now, 15, 1744264311434, 466)
 			} else {
-				err = s.Enter(context.Background(), "695233", pos, rc, now)
+				err = s.Enter(context.Background(), "695233", pos, rc, pc, now)
 			}
 			if tc.wantErr != (err != nil) {
 				t.Fatalf("发送 err = %v，wantErr = %v", err, tc.wantErr)
@@ -97,7 +98,7 @@ func TestSenderMergeFailurePreservesErrorSemantics(t *testing.T) {
 	now := time.Unix(1744264311, 0)
 	pos := weread.ReadingProgress{BookID: "695233", ChapterUID: 112}
 	rc := weread.ReaderContext{Psvts: "ps", Pclts: "pc", Token: "tok"}
-	err := s.Enter(context.Background(), "695233", pos, rc, now)
+	err := s.Enter(context.Background(), "695233", pos, rc, weread.ResolvePC(rc, now), now)
 	if err == nil {
 		t.Fatal("合并失败时 Enter 应报错")
 	}

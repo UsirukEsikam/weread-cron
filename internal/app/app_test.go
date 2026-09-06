@@ -19,6 +19,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -100,6 +101,10 @@ type fakeWeread struct {
 	// 上报 payload 使用的是新 Reader Context。
 	rotateReaderState bool
 	readerFetches     int
+
+	// pcltsZero 为 true 时 Reader 页携带数字 pclts 0（真实账号观察形态，ticket 25
+	// 数字解析；issue 30 的 fallback pc 会话内稳定场景——无可用的 pclts）。
+	pcltsZero bool
 
 	// readerFailAt > 0 时第 N 次 Reader 页抓取返回 HTTP 500（TTL 主动刷新失败的暂时性
 	// 场景；后续抓取恢复正常）。
@@ -311,6 +316,7 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	f.readerFetches++
 	n := f.readerFetches
 	rotate := f.rotateReaderState
+	pcltsZero := f.pcltsZero
 	fail := f.readerFailAt > 0 && n == f.readerFailAt
 	if f.readerFailFrom > 0 && n >= f.readerFailFrom {
 		fail = true
@@ -367,7 +373,9 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rotate {
-		io.WriteString(w, readerPageHTMLWithProgress(fmt.Sprintf("fake-reader-token-%d", n), fmt.Sprintf("fake-psvts-%d", n), progressOr(hasProgress, progressOverride, 35)))
+		io.WriteString(w, readerPageHTMLWithTitleProgressPclts(testBookTitle,
+			fmt.Sprintf("fake-reader-token-%d", n), fmt.Sprintf("fake-psvts-%d", n),
+			rotatedPclts(n, pcltsZero), progressOr(hasProgress, progressOverride, 35)))
 		return
 	}
 	if hasProgress || hasTitle {
@@ -375,10 +383,11 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 		if hasTitle {
 			title = titleOverride
 		}
-		io.WriteString(w, readerPageHTMLWithTitleProgress(title, testReaderToken, testPsvts, progressOr(hasProgress, progressOverride, 35)))
+		io.WriteString(w, readerPageHTMLWithTitleProgressPclts(title, testReaderToken, testPsvts,
+			pcltsValue(pcltsZero), progressOr(hasProgress, progressOverride, 35)))
 		return
 	}
-	io.WriteString(w, readerPageHTML())
+	io.WriteString(w, readerPageHTMLWithPclts(pcltsValue(pcltsZero)))
 }
 
 // progressOr 返回 v 或默认值（rotate 路径的进度覆盖合并）。
@@ -533,6 +542,25 @@ func readAll(r *http.Request) []byte {
 	return b
 }
 
+// pcltsValue 返回 Reader 页携带的 pclts 值（issue 30）：默认 testPclts（已编码串）；
+// pcltsZero 时返回数字 0（JSON 数字形态，真实账号观察值；ticket 25 数字解析路径）。
+func pcltsValue(zero bool) any {
+	if zero {
+		return 0
+	}
+	return testPclts
+}
+
+// rotatedPclts 返回第 n 次抓取的 pclts（rotateReaderState 场景）：与 token/psvts
+// 同步轮换（换页 = 新 pclts，真实页面形态，issue 30 可用 pclts 会话内稳定断言用）；
+// pcltsZero 时仍为数字 0。
+func rotatedPclts(n int, zero bool) any {
+	if zero {
+		return 0
+	}
+	return fmt.Sprintf("fake-pclts-%d", n)
+}
+
 // readerPageHTMLWith 用指定 token/psvts 生成 Reader 页（恢复链刷新断言用）。
 func readerPageHTMLWith(readerToken, psvts string) string {
 	return readerPageHTMLWithProgress(readerToken, psvts, 35)
@@ -547,10 +575,16 @@ func readerPageHTMLWithProgress(readerToken, psvts string, progress int) string 
 // readerPageHTMLWithTitleProgress 用指定书名/token/psvts/progress 生成 Reader 页
 // （自动选书生名断言与 progress 断言共用）。
 func readerPageHTMLWithTitleProgress(title, readerToken, psvts string, progress int) string {
+	return readerPageHTMLWithTitleProgressPclts(title, readerToken, psvts, testPclts, progress)
+}
+
+// readerPageHTMLWithTitleProgressPclts 用指定书名/token/psvts/pclts/progress 生成
+// Reader 页（issue 30：pclts 可为数字 0 等任意 JSON 值，由 pcltsValue 提供）。
+func readerPageHTMLWithTitleProgressPclts(title, readerToken, psvts string, pclts any, progress int) string {
 	state := map[string]any{
 		"reader": map[string]any{
 			"psvts": psvts,
-			"pclts": testPclts,
+			"pclts": pclts,
 			"token": readerToken,
 			"bookInfo": map[string]any{
 				"bookId": testBookID,
@@ -585,6 +619,12 @@ func readerPageHTMLWithTitleProgress(title, readerToken, psvts string, progress 
 // JSON 后跟 "); (function"，chapterOffset 为字符串演示 flexInt 兼容）。
 func readerPageHTML() string {
 	return readerPageHTMLWith(testReaderToken, testPsvts)
+}
+
+// readerPageHTMLWithPclts 用指定 pclts 值生成 Reader 页（默认形态的 pclts 变体；
+// issue 30 的 pclts=0 场景）。
+func readerPageHTMLWithPclts(pclts any) string {
+	return readerPageHTMLWithTitleProgressPclts(testBookTitle, testReaderToken, testPsvts, pclts, 35)
 }
 
 // notifyRecord 是 fake 通知端点记录的请求。
@@ -1330,6 +1370,14 @@ func TestRunContextTTLExpiryRefreshesWithoutEnter(t *testing.T) {
 			}
 		}
 	}
+	// issue 30（可用 pclts 路径也按会话建立时解析一次携带）：TTL 刷新换页带来新
+	// pclts（fake-pclts-2），但 enter 与全部 timed reports 的 pc 均为会话建立时的
+	// fake-pclts-1（换页不改变会话 pc；与官方客户端页面会话内 pc 稳定一致）。
+	for i, rec := range reports {
+		if pc := payloadFromWire(t, rec.Body)["pc"]; pc != "fake-pclts-1" {
+			t.Errorf("report[%d].pc = %s，期望会话建立时解析的可用 pclts（fake-pclts-1）", i, pc)
+		}
+	}
 }
 
 // TestRunContextTTLRefreshFailureContinuesWithExistingContext 断言 TTL 主动刷新失败
@@ -1367,6 +1415,144 @@ func TestRunContextTTLRefreshFailureContinuesWithExistingContext(t *testing.T) {
 			if p["ps"] != "fake-psvts-3" {
 				t.Errorf("timed[%d].ps = %s，期望重试刷新后的 Context（psvts-3）", i, p["ps"])
 			}
+		}
+	}
+}
+
+// --- issue 30（findings/08）：fallback pc 会话内稳定 ---
+
+// TestRunFallbackPCStableWithinSession 断言 Reader Context 无可用的 pclts（数字 0，
+// 真实账号观察形态；ticket 25 解析）时，fallback pc 在 Reading Session 建立时生成
+// 一次（值 = e(会话建立时刻的秒级时间戳)）并随会话复用：enter 与全部 timed reports
+// 携带同一个 pc，尽管各报告构造时刻（ct）不同；TTL 到期主动刷新 Reader Context
+// （无 re-enter，新 token/psvts）不改变所复用的 pc——与官方 Web Reader 页面会话内
+// 复用 pc 的口径一致（实证：fallback pc 每笔更换与长会话约 5 分钟拒收关联，
+// findings/08；修复前每笔上报按构造时刻重新生成 pc）。
+func TestRunFallbackPCStableWithinSession(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.pcltsZero = true
+		h.weread.rotateReaderState = true // TTL 刷新后 Context 变化可判别
+		h.cfg.ReadMinutesMin = 20         // 跨越 TTL（900s）：第 30 笔 timed 前主动刷新
+		h.cfg.ReadMinutesMax = 20
+	})
+
+	// enter 建立时刻 = Task 启动时刻（renewal/Reader 页抓取不消耗测试时钟）。
+	est := h.clk.Now()
+	reports := runTTLScenario(t, h) // 41 笔：1 enter + 40 timed，enter 恰 1 笔（无 re-enter）
+	want := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+
+	// ---- 全部报告的 pc 相同且等于 e(会话建立时刻)；各报告构造时刻不同。 ----
+	cts := map[string]bool{}
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		cts[p["ct"]] = true
+		if p["pc"] != want {
+			t.Errorf("report[%d].pc = %s，期望会话级 fallback pc %s（建立时刻 %s）", i, p["pc"], want, est.Format(time.RFC3339))
+		}
+	}
+	if len(cts) < 2 {
+		t.Errorf("报告构造时刻应不同（ct 集合大小 = %d），fallback pc 却保持同一值", len(cts))
+	}
+
+	// ---- TTL 刷新确实发生（索引 30 起 Context 切换为 psvts-2）且 pc 不变。 ----
+	if ps := payloadFromWire(t, reports[30].Body)["ps"]; ps != "fake-psvts-2" {
+		t.Errorf("timed[30].ps = %s，期望 TTL 刷新后的 Context（psvts-2）", ps)
+	}
+	if pc := payloadFromWire(t, reports[30].Body)["pc"]; pc != want {
+		t.Errorf("TTL 刷新后 timed[30].pc = %s，期望仍为同一 fallback pc %s", pc, want)
+	}
+}
+
+// TestRunRecoveryRefreshKeepsFallbackPC 断言恢复链内 refresh Reader Context（无
+// re-enter）后继续使用同一 fallback pc（issue 30 AC4）：首笔 timed report 被拒 →
+// 恢复链 refresh（新 Context，token-2/psvts-2）→ 重试接受；链内刷新不改变会话 pc。
+func TestRunRecoveryRefreshKeepsFallbackPC(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.pcltsZero = true
+		h.weread.timedRejects = 1         // 仅首笔 timed 拒绝 → 进入恢复链
+		h.weread.rotateReaderState = true // 链内 refresh 后 Context 变化可判别
+	})
+	est := h.clk.Now()
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("恢复链 refresh 后 Task 应继续完成: %v", err)
+	}
+	want := weread.EncodeID(strconv.FormatInt(est.Unix(), 10))
+
+	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh → timed(重试
+	//      接受) → timed；全部报告的 pc 相同且 = e(会话建立时刻)。 ----
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "timed", "timed")
+	reports := h.reportRecords()
+	if len(reports) != 4 {
+		t.Fatalf("report 数 = %d，期望 4（1 enter + 3 timed）", len(reports))
+	}
+	for i, rec := range reports {
+		if pc := payloadFromWire(t, rec.Body)["pc"]; pc != want {
+			t.Errorf("report[%d].pc = %s，期望同一 fallback pc %s", i, pc, want)
+		}
+	}
+	// 链内 refresh 确实发生：重试（索引 2）与后续 timed 使用新 Context（token-2）。
+	verifySG(t, payloadFromWire(t, reports[2].Body), "fake-reader-token-2")
+	verifySG(t, payloadFromWire(t, reports[3].Body), "fake-reader-token-2")
+	if res.Actual != time.Minute || res.Reports != 2 {
+		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次", res.Actual, res.Reports)
+	}
+}
+
+// TestRunAbnormalIntervalRebuildsNewFallbackPC 断言异常间隔重建（重新 enter）后
+// 新会话使用新的 fallback pc，不复用前一会话的值（issue 30 AC5）：首笔 timed 挂起
+// 期间时钟跳变 120s（> 异常阈值 90s）→ 重建 enter → 后续上报；两个会话的 pc 各自
+// 稳定且 = e(各自会话建立时刻)。
+func TestRunAbnormalIntervalRebuildsNewFallbackPC(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.pcltsZero = true
+	})
+	h.weread.blockTimed = make(chan struct{})
+	h.weread.blockTimedTriggered = make(chan struct{}, 1)
+	t0 := h.clk.Now()
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		_, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 等待第一笔 timed report（t=30，携会话 1 的 pc）到达并被挂起，模拟挂起噪声：
+	// 响应期间时钟跳变 120s（→ t=150）——间隔超阈值 → 重建 Reading Session。
+	select {
+	case <-h.weread.blockTimedTriggered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("timed report 未在 10s 内到达")
+	}
+	h.advance(120 * time.Second)
+	close(h.weread.blockTimed)
+
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("RunTask 失败: %v", runErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("RunTask 未在 30s 内完成")
+	}
+
+	// ---- 线上按序：enter#1(t=0，pc1) → timed#1(t=30，pc1) → 跳变 120s →
+	//      enter#2(t=150 重建，pc2) → timed#2(t=180，pc2)：pc1 = e(t=0)、
+	//      pc2 = e(t=150)，会话内稳定、重建后更新、不复用前值。 ----
+	want1 := weread.EncodeID(strconv.FormatInt(t0.Unix(), 10))
+	want2 := weread.EncodeID(strconv.FormatInt(t0.Add(150*time.Second).Unix(), 10))
+	if want1 == want2 {
+		t.Fatalf("两个会话建立时刻应产生不同 fallback pc: %s", t0.Format(time.RFC3339))
+	}
+	reports := h.reportRecords()
+	if len(reports) != 4 {
+		t.Fatalf("report 数 = %d，期望 4（2 enter + 2 timed）", len(reports))
+	}
+	for i, want := range []string{want1, want1, want2, want2} {
+		if pc := payloadFromWire(t, reports[i].Body)["pc"]; pc != want {
+			t.Errorf("report[%d].pc = %s，期望 %s（会话内稳定、重建后更新）", i, pc, want)
 		}
 	}
 }

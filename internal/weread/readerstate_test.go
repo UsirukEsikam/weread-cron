@@ -311,22 +311,24 @@ func TestParseInitialStatePcltsFlexibility(t *testing.T) {
 				t.Errorf("ReaderContext.Pclts = %q, want %q", rc.Pclts, tc.wantPclts)
 			}
 
-			// 验证下游 payload 构造中的 pc fallback 行为（EnterReportPayload 与 TimedReportPayload）
+			// 验证下游 payload 构造中的 pc 决策（issue 30）：ResolvePC 在 Reading
+			// Session 建立（fixedNow）时解析一次会话级 pc，构造层原样携带。
 			fixedNow := time.Unix(1744333820, 0)
 			progress, err := st.ReadingProgress("9")
 			if err != nil {
 				t.Fatalf("ReadingProgress 失败: %v", err)
 			}
-			enterPayload := EnterReportPayload(progress, rc, fixedNow, "test-ua")
-			timedPayload := TimedReportPayload(progress, rc, fixedNow, "test-ua", 30, fixedNow.UnixMilli(), 12345)
+			pc := ResolvePC(rc, fixedNow)
+			enterPayload := EnterReportPayload(progress, rc, pc, fixedNow, "test-ua")
+			timedPayload := TimedReportPayload(progress, rc, pc, fixedNow, "test-ua", 30, fixedNow.UnixMilli(), 12345)
 			expectedFallback := EncodeID("1744333820")
 
 			if tc.wantPclts == "" || tc.wantPclts == "0" {
 				if enterPayload["pc"] != expectedFallback {
-					t.Errorf("enterPayload pc = %q, 期望回退为 e(now) %q", enterPayload["pc"], expectedFallback)
+					t.Errorf("enterPayload pc = %q, 期望回退为 e(会话建立时刻) %q", enterPayload["pc"], expectedFallback)
 				}
 				if timedPayload["pc"] != expectedFallback {
-					t.Errorf("timedPayload pc = %q, 期望回退为 e(now) %q", timedPayload["pc"], expectedFallback)
+					t.Errorf("timedPayload pc = %q, 期望回退为 e(会话建立时刻) %q", timedPayload["pc"], expectedFallback)
 				}
 			} else {
 				if enterPayload["pc"] != tc.wantPclts {

@@ -78,10 +78,32 @@ type ReadingProgress struct {
 type ReaderContext struct {
 	// Psvts 是 e(服务器秒级时间戳)（官方 JS：psvts = e(serverTimestamp)）。
 	Psvts string
-	// Pclts 是 e(客户端秒级时间戳)；为空或 "0" 时按官方/参考实现回退为 e(当前秒)。
+	// Pclts 是 e(客户端秒级时间戳)；为空或 "0"（真实 Reader 页可返回数字 0，ticket 25
+	// 已修解析）时表示"无可用的 pclts"，pc 由 ResolvePC 在 Reading Session 建立时
+	// 生成会话级 fallback（issue 30：fallback pc 会话内稳定，与官方客户端一致）。
 	Pclts string
 	// Token 是 reader.token；为空时 SG 回退 DefaultReaderToken（兼容默认）。
 	Token string
+}
+
+// ResolvePC 在 Reading Session 建立时解析该会话的 pc（issue 30）：
+//   - Reader Context 提供可用 pclts（非空、非 "0"，ticket 25 语义）时，返回 Pclts
+//     原值——pc 来自 Reader Context（可用 pclts 路径的取值方式与 issue 30 之前
+//     一致，但解析时刻移到会话建立点）；
+//   - pclts 为空或 "0" 时，返回会话级 fallback pc = e(会话建立时刻的秒级时间戳)（与
+//     官方 Web Reader 对初始 pclts 为 0 的页面发送非零 pc、并在 enter/连续 timed
+//     reports/真实翻页间复用同一 pc 的口径一致）。
+//
+// 解析结果由调用方在该 Reading Session 内（enter 与全部 timed reports，含 TTL 主动
+// 刷新与有界恢复链内 refresh Reader Context）保持复用——可用 pclts 场景同样按会话
+// 建立时的值携带：刷新换页带来的新 pclts 不改变会话 pc（与官方客户端页面会话内
+// pc 稳定一致，ticket 30 语义；ps/psvts 仍逐笔跟随当前 Context）。仅明确建立新的
+// Reading Session（重新 enter）时重新解析，不复用前一会话的值。
+func ResolvePC(rc ReaderContext, sessionAt time.Time) string {
+	if rc.Pclts == "" || rc.Pclts == "0" {
+		return EncodeID(strconv.FormatInt(sessionAt.Unix(), 10))
+	}
+	return rc.Pclts
 }
 
 // EncodeID 实现微信读书的 _e 编码：
@@ -307,9 +329,11 @@ func succIsTrue(v any) bool {
 
 // EnterReportPayload 构造 enter report 参数（CONTEXT.md：阅读会话开始的上报）。
 // 字段集：appId, b, c, ci, co, sm, pr, ct, ps, pc, s（不含 rt/ts/rn/sg）。
-// ct = now 的秒数；pc 为空或 "0" 时回退 e(现秒)；s 由签名函数计算。
-func EnterReportPayload(p ReadingProgress, rc ReaderContext, now time.Time, userAgent string) map[string]string {
-	params := positionParams(p, rc, now, userAgent)
+// ct = now 的秒数；pc 是会话级 pc——由调用方在 Reading Session 建立时经 ResolvePC
+// 解析一次并传入（issue 30：fallback 场景下会话内稳定，不再随每次构造时刻回退）；
+// s 由签名函数计算。
+func EnterReportPayload(p ReadingProgress, rc ReaderContext, pc string, now time.Time, userAgent string) map[string]string {
+	params := positionParams(p, rc, pc, now, userAgent)
 	params["s"] = SignPayload(params)
 	return params
 }
@@ -318,8 +342,9 @@ func EnterReportPayload(p ReadingProgress, rc ReaderContext, now time.Time, user
 // 字段集：enter 全字段 + rt, ts, rn, sg, s。
 // rt 为本次上报的阅读时长秒数（语义由 ADR-0004 与 ticket 06 决定；官方 JS 为累计秒数，见包注释）；
 // ts 为毫秒时间戳；rn 为请求随机数；sg = sha256(ts+rn+token)，token 为空回退 DefaultReaderToken。
-func TimedReportPayload(p ReadingProgress, rc ReaderContext, now time.Time, userAgent string, rtSec int, tsMs int64, rn int) map[string]string {
-	params := positionParams(p, rc, now, userAgent)
+// pc 是会话级 pc（同 EnterReportPayload：调用方在 Reading Session 建立时解析一次）。
+func TimedReportPayload(p ReadingProgress, rc ReaderContext, pc string, now time.Time, userAgent string, rtSec int, tsMs int64, rn int) map[string]string {
+	params := positionParams(p, rc, pc, now, userAgent)
 	params["rt"] = strconv.Itoa(rtSec)
 	tsStr := strconv.FormatInt(tsMs, 10)
 	rnStr := strconv.Itoa(rn)
@@ -332,11 +357,13 @@ func TimedReportPayload(p ReadingProgress, rc ReaderContext, now time.Time, user
 
 // positionParams 构造 enter/timed 共用的位置字段，并按 koplugin 的规整处理边界
 // （官方 JS 直接透传 store 值，对合法输入两者等价）：ci/co 取非负整数、pr 截断为 0–100 整数、
-// sm 截取至 SummaryMaxChars 个代码点、c 对应 e(chapterUid||0)、pc 缺失（空或 "0"）回退 e(now 秒)。
+// sm 截取至 SummaryMaxChars 个代码点、c 对应 e(chapterUid||0)。
+// pc 不在此处决策：由调用方在 Reading Session 建立时经 ResolvePC 解析一次并传入
+// （issue 30：fallback pc 会话内稳定，pc 决策点是会话建立、不是每笔构造）。
 //
 // 注意：本层返回 map[string]string 供签名使用；线上 JSON 中 ci/co/pr/rt/ct/ts/rn 为数字
 // （官方 JS 与 wxread 抓包均如此），传输层序列化时需按数字输出。
-func positionParams(p ReadingProgress, rc ReaderContext, now time.Time, userAgent string) map[string]string {
+func positionParams(p ReadingProgress, rc ReaderContext, pc string, now time.Time, userAgent string) map[string]string {
 	ci := p.ChapterIdx
 	if ci < 0 {
 		ci = 0
@@ -351,10 +378,6 @@ func positionParams(p ReadingProgress, rc ReaderContext, now time.Time, userAgen
 	}
 	if pr > 100 {
 		pr = 100
-	}
-	pc := rc.Pclts
-	if pc == "" || pc == "0" {
-		pc = EncodeID(strconv.FormatInt(now.Unix(), 10))
 	}
 	return map[string]string{
 		"appId": AppID(userAgent),
