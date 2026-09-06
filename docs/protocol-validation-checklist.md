@@ -56,3 +56,8 @@ Verified:
 - Real Reader state can return reader.pclts as JSON number.
 - Observed value: pclts = 0.
 - reader.psvts was a JSON string.
+- 5-minute Task on a previously read book completed successfully and real account reading time increased.
+- Longer manual Tasks reproducibly received an empty-object server rejection after approximately 5–5.5 minutes.
+- The same failure occurred with a newly added unread book, a completed book, and an ordinary unfinished book.
+- Recreating the container/volume and supplying a fresh initial Cookie did not change the behavior.
+- Therefore book completion/unread status is not yet independently validated; those cases are blocked by the broader long-session report rejection.
