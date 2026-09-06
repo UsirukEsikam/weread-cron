@@ -78,4 +78,4 @@ Review 输入 F8 已对当前代码确认：
 - 回归保持：`TestRunHappyPath`（节奏/rt）、`TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal`（预算收敛与取消明确区分）、`TestRunAbnormalIntervalRebuildsSession` / `TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext`（挂起跳变）、`TestDaemonStopsOnCancel` / `TestDaemonExecutesTaskAndSchedulesNextDay`（daemon 取消/闭环）等全部通过。
 - 全部验证：`go test ./...`、`go vet ./...`、gofmt（本票文件）通过；`internal/weread/protocol.go` 的 gofmt 差异为存量问题（改动前已存在，不在本票范围）。取消相关测试 `-count=5` 重复运行稳定。
 
-**Commits:** b4f44f3（fix）· 待提交（docs）
+**Commits:** b4f44f3（fix）· 4ad6788（refactor：评审跟进——clock.WaitUntil 抽共、取消断言助手、术语对齐）· 71c2b63（docs）
