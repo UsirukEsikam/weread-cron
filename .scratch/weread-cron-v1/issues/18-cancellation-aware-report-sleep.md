@@ -11,27 +11,38 @@
 
 ## Current behavior
 
-Reading Session 循环用 Clock.Sleep 等待下一个 report 时刻；生产实现为 time.Sleep，不观察 ctx 取消。关停信号（SIGINT/SIGTERM）在该睡眠期间要等 report 间隔结束才退出 Task。
+Reading Session 循环用 Clock.Sleep 等待下一个 report 时刻；生产实现为 time.Sleep，不观察 ctx 取消。Task 编排层与 clock 抽象全链路无 ctx 检查（clock.Clock 文档明确"ctx 取消不打断"）：取消只能经 HTTP 请求的 ctx 错误被发现。关停信号（SIGINT/SIGTERM）在睡眠期间不中断等待，要等 report 间隔结束才进入下一轮。
+
+#24 之后的实际后果比"等一个 report 间隔才退出"更严重：取消的 ctx 使后续 timed report 请求以传输级错误（非拒绝）失败；循环没有 ctx 检查，每轮失败计入 consecutiveFailures，连续 3 次（最多约 90s）后经 #24 的无条件 finalizeTransient 收敛为 failed 终态（终态落盘；失败通知的发送因 ctx 已取消而失败，仅 Warn 日志）。单次阶段（renewal / 选书 / enter）的取消请求失败则立即收敛。即当前行为不是"取消 = 正常退出、不形成终态"，而是"取消 → 当天被标记 failed、无最终通知"。
 
 ## Desired behavior
 
-timed report 等待感知 ctx 取消：取消后及时退出（响应延迟有上界，如 ≤2s 或 ≤report 节奏的合理分片），与 daemon 睡眠的分片 + ctx 检查对齐。正常 report 节奏不受影响。本票为 lifecycle/shutdown 完善，可作为较低优先级处理。
+- timed report 等待感知 ctx 取消：取消后及时退出（响应延迟有上界，如 ≤2s 或 ≤report 节奏的合理分片），与 daemon 睡眠的分片 + ctx 检查对齐。正常 report 节奏不受影响。
+- 取消语义（明确决定，非"保持现状"）：正常的 process shutdown / context cancellation 不属于 Task 的业务最终失败。cancellation 发生时若 Task 尚未形成 Terminal State，应尽快退出，不写 success/failed 终态、不发送最终 Task notification。
+- cancellation 必须在 #24 的统一 failed finalization（finalizeTransient）之前被识别：不得因 ctx 已取消而累计 timed-report transport failures，最终把当天错误标记为 failed。
+- 取消退出后当天无终态 → 后续 daemon 重启由"无 Terminal State"的异常启动规则（#24：窗口内立即执行 / 窗口已过排次日）决定是否重新执行；手动 `run` 按无终态规则正常执行。daemon 侧取消 = 正常退出（现有行为）保持。
+- 本票为 lifecycle/shutdown 完善（等待 + cancellation 生命周期），可作为较低优先级处理；不引入新的 shutdown framework。
 
 ## Key interfaces
 
 - Task 编排层的 report 间隔等待：从"不可打断的 Clock.Sleep"改为"分片 + 每次醒来检查 ctx 取消"（与 daemon 睡眠实现对齐），或 Clock 抽象提供可取消等待。
 - Clock 抽象现有语义（"ctx 取消不打断"）与本需求的兼容处理：若改为可取消，需明确 daemon 与 Task 两处语义统一。
+- 取消识别先于 #24 的统一 finalization：等待分片 + 每片检查 ctx，取消即直接返回（不写终态、不通知）；不得让取消的 HTTP 错误计入 timed-report transport failures 预算后经 finalizeTransient 收敛。
 
 ## Acceptance criteria
 
-- [ ] report 间隔等待期间 ctx 取消 → Task 在约定上界内退出
+- [ ] report 间隔等待期间 ctx 取消 → Task 在约定上界内退出（如 ≤2s 分片或等价上界）
+- [ ] 取消退出不写 success/failed Terminal State、不发最终 Task notification（取消不是业务最终失败）
+- [ ] 取消路径不累计 timed-report transport failures、不触发 finalizeTransient，当天不被错误标记为 failed
+- [ ] 取消退出后当天无终态：daemon 重启按"无 Terminal State"异常启动规则（窗口内立即执行）重新执行（回归与新增覆盖）
 - [ ] 正常 report 节奏与 rt 计算不回归（回归测试保持）
 - [ ] 取消不产生额外的 timed report
 - [ ] daemon 侧取消响应保持现有行为
 
 ## Out of scope
 
-- 取消后的终态/通知行为（保持现状：取消 = 正常退出，不形成终态）
+- 终态/通知规则本身不改动（finalizeTransient / #24 的统一 finalization 语义保持）：本票只保证取消在统一 finalization 之前被识别并直接返回，使"取消 = 正常退出、当天无终态"成为可达状态（重启后的重新执行由"无 Terminal State"异常启动规则决定，属现有规则）。
+- 不引入新的 shutdown framework、持久化状态或 retry 机制：本票只处理等待/cancellation 生命周期（等待分片 + ctx 检查 + 取消即返回）。
 - 其它 Clock.Sleep 调用点的改造（如确实需要，属本票范围讨论）
 
 ## 验证记录
@@ -40,3 +51,9 @@ Review 输入 F8 已对当前代码确认：
 
 - Task timed report 循环用 Clock.Sleep 等待；生产实现为 time.Sleep，不感知 ctx（Clock 接口文档明确"ctx 取消不打断；Task 对取消的响应在别的层"）。
 - daemon 睡眠是分片 + 每片检查 ctx（响应延迟有上界），两处响应度不一致。
+
+2026-09（#24 后有效性复查）补充确认：
+
+- #24 未改动 clock / task 的等待路径：`task.Run` 的 timed report 循环仍 `Clock.Sleep`（生产 time.Sleep）等待，全链路无 `ctx.Err()` 检查。
+- 取消的 ctx 使 report 请求以传输级错误失败并计入 consecutiveFailures；#24 起 finalizeTransient 无条件收敛（不再检查窗口截止时刻），达预算（3 次，最多约 90s）后写入 failed 终态、失败通知因 ctx 已取消而发送失败。单次阶段（renewal / 选书 / enter）的取消即立即收敛。
+- "取消 = 正常退出、不形成终态"在 #24 后不再是现状描述，已按本 brief 的语义决定改写 Current behavior / Desired behavior / Acceptance criteria / Out of scope。
