@@ -25,10 +25,10 @@ Status: ready-for-agent
 11. 作为部署者，我希望 Run Window 只约束开始时间（启动后读满目标时长、允许越过窗口结束点），以便阅读时长优先于窗口边界。
 12. 作为部署者，我希望 `start == end` 的窗口表示固定启动时刻，以便需要固定时间时可以表达。
 13. 作为部署者，我希望错过整天的执行不补跑，以便行为可预期、无历史欠账。
-14. 作为部署者，我希望服务启动时若当天窗口尚未结束且当天尚无终态，在 `[now, 窗口结束]` 内随机安排一次，以便部署/重启不浪费当天。
+14. 作为部署者，我希望服务启动或重启时若当天尚无终态：窗口尚未开始则按正常规则在 Run Window 内随机安排；已经进入 Run Window 则立即执行一次 Task；窗口已过则当天不再自动执行，以便恢复行为明确且不浪费当天的有效运行机会。
 15. 作为部署者，我希望当天已形成终态后不再自动执行，以便成功或失败都不会被重复执行（除非手动 `run`）。
 16. 作为部署者，我希望每条 Task 开始时生成当天独立的 Target Duration（在配置范围内随机），以便每日时长有适度变化。
-17. 作为部署者，我希望 Task 运行中进程异常退出后，重启可在当天剩余窗口内重新随机安排（无终态时），以便崩溃不丢整天。
+17. 作为部署者，我希望 Task 运行中进程异常退出后，重启时若当天尚无终态且当前仍处于 Run Window 内就立即执行全新 Task（无需 checkpoint）；若窗口已过则当天不再自动执行，以便崩溃恢复简单且可预期。
 18. 作为微信读书账号持有者，我希望指定多本候选书、每天随机取一本完成当天阅读，以便控制阅读对象。
 19. 作为微信读书账号持有者，我希望未指定书籍时从真实 Shelf 自动选书，以便无需手动维护书单。
 20. 作为微信读书账号持有者，我希望自动选书优先"未读完且能建立 Reader Context"的书，以便优先正常的阅读对象。
@@ -77,11 +77,11 @@ Status: ready-for-agent
    - Reader Context TTL 默认 ≈15 分钟：**仅参考实现默认值，不是已确认的服务器协议常量**，正式复核可修正（表述同 ADR-0004）。
 6. **Task 编排**：renew → 选书（指定集合随机；自动 = Shelf 元数据过滤优先未读完 → 有界探测 Reader Context → 回退已读完可用书）→ 读真实进度（位置不推进）→ 建/刷新 Reader Context → enter report → 循环 timed report（节奏 ~30s 内部默认；`rt` = 距上次成功接受的实际间隔；异常间隔超内部阈值 → 重建 Reading Session，Task 继续、累计保留）→ 本地汇总有效 `rt` 达标 → 终态落盘 → 通知 → 排次日。
 7. **恢复链（有界）**：report 被拒 → refresh Reader Context → retry → 仍败则 renewal → refresh Reader Context → retry → 仍败 → failed 终态。Login Session 失效仅凭明确证据判定（如 renewal 失败），判别特征清单实施时实测确认；判定失效后从初始 Cookie 重建一次，仍失败 → 登录失效终态，通知明确提示更新初始 Cookie。
-8. **调度（ADR-0001/0002）**：`nextStart(now, window, lastTerminal, tz)` 纯决策函数：窗口只约束开始时间；存在终态 → 明天；无终态且窗口未过 → `[now, 窗口结束]` 随机；窗口已过 → 明天；不补跑；`start==end` 固定时刻。daemon 在任务实际启动前再次校验当天终态。
-9. **持久化（/data）**：Login Session 序列化（Cookie 属性完整保存）+ Terminal State `{last_task_date, last_task_result}`；均原子写（临时文件 + rename）；终态先落盘、再发通知。
+8. **调度（ADR-0001/0002）**：窗口只约束 Task 开始时间；存在当天终态 → 排明天；不补跑；`start == end` 表示固定启动时刻。正常常驻 daemon 每天在完整 Run Window 内随机选择一次启动时刻。daemon 启动/重启时当天无终态：窗口尚未开始 → 按正常规则在完整 Run Window 内随机安排；当前已进入 Run Window → 立即执行；窗口已过 → 当天不再自动执行。Task 一旦启动，调度层不再进行 whole-Task 自动重排。
+9. **持久化（/data）**：Login Session 序列化（Cookie 属性完整保存）+ Terminal State `{last_task_date, last_task_result}`；均原子写（临时文件 + rename）；终态成功落盘后才发送最终 success/failure 通知（落盘失败 → 不发通知、Task 返回持久化错误）。Task 日期在 Task 启动时确定（开始日），success 与全部失败结果的终态与通知使用同一日期；Task 越过午夜不转移日期归属。
 10. **通知内容**：成功 = 完成、计划时长、实际累计时长（本地汇总 `rt`）、report 次数、书名；失败 = 失败阶段、主要错误、已尝试恢复（refresh/renewal）；登录失效 = 明确提示更新初始 Cookie 的固定文案。通知发送失败不影响 Task 结果；渠道互不影响。
 11. **并发**：同一 deployment（同一 /data）内单 Task 互斥：daemon 与 run/books 跨进程互斥（/data 锁文件 + flock，锁随持有进程退出/崩溃自动释放，ADR-0008），进程内守卫零 I/O 先行；已有 Task 运行时第二个 Task（自动或手动）被拒绝（非阻塞、不中断运行中的 Task）。不同 deployment/多实例防重不在 V1 范围。
-12. **CLI 行为**：`run` 不受 Run Window 限制、复用正常 Task 逻辑与终态规则（无终态 → 执行并形成终态；failed → 可重试更新为 success；success → 拒绝，无 force）；`books` 只读查询（可 renewal 并持久化 Login Session，不碰终态、不产生 Task、不通知）。
+12. **CLI 行为**：`run` 不受 Run Window 限制、复用正常 Task 逻辑与终态规则（无终态 → 执行并形成终态；failed → 可重试更新为 success；success → 拒绝，无 force），且与自动 Task 使用相同 finalization 语义（最终失败同样形成 failed 终态 + 失败通知）；`books` 只读查询（可 renewal 并持久化 Login Session，不碰终态、不产生 Task、不通知）。
 13. **内部默认值清单（不暴露配置）**：report 节奏 ~30s、异常间隔阈值（~90s）、重试次数、renewal 节流、Reader Context TTL 默认、UA、HTTP 超时、日志级别、通知重试。
 
 ## Testing Decisions

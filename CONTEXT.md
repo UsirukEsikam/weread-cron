@@ -5,7 +5,7 @@
 ## Language
 
 **Task**（任务）:
-一天的完整工作单元：在运行窗口内随机启动（或由 `weread-cron run` 手动触发）、选书、建立阅读会话、周期上报直至达成目标时长、通知、排定次日。一天最多一个终态；终态形成后当天不再自动执行。
+一天的完整工作单元：正常自动执行在 Run Window 内随机启动，异常恢复时可按调度规则立即启动，也可由 `weread-cron run` 手动触发；选书、建立 Reading Session、周期上报直至达成 Target Duration 或最终失败。Task 启动后 Run Window 不再约束，可越过窗口结束点并跨午夜。Task 日期在启动时确定，success 与全部 failed 结果使用同一日期。每天持久化一份当前 Terminal State；自动 Task 形成终态后当天不再自动执行，failed 可由手动 `run` 重试。调度层不做 whole-Task 自动重排。
 _Avoid_: job、run、定时任务
 
 **Terminal State**（终态）:
