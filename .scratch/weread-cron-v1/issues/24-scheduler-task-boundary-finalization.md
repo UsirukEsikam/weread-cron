@@ -6,7 +6,7 @@
 **Category:** bug
 **Blocked by:** None
 **Related:** 吸收 #15（failed 终态持久化为通知严格前置，不再独立实施）；保留 ticket 12 的 timed-report 有限传输容错（预算内跳过）；#17/#18 保持各自独立 ticket
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 按 findings/04 澄清的产品模型收敛调度层与 Task 终结的边界：
 
@@ -55,17 +55,17 @@
 
 ## Acceptance criteria
 
-- [ ] 常驻 daemon 每日仍从完整 Run Window 内随机一次（既有随机调度测试回归）
-- [ ] 异常启动/重启在窗口内且无终态 → 立即执行（注入 clock 断言 Task 在启动后立即执行，而非窗口内随机点）
-- [ ] 窗口已过后启动 → 当天不自动跑（回归）
-- [ ] 无 whole-Task 重排：任何一次暂时性失败（renewal / Reader Context / enter / timed 预算耗尽）都以 failed 终态结束，daemon 不再于窗口内重排第二个完整 Task
-- [ ] 手动 `run` 的暂时性失败与自动 Task 相同：failed 终态 + 失败通知（CLI seam 断言）
-- [ ] timed report 单次传输失败跳过、会话继续（回归）；连续失败达预算 → failed 终态 + 通知
-- [ ] 全部终态与通知日期 = Task 开始日：跨午夜 success（23:50 开始、次日 00:40 完成 → 归属开始日）；跨午夜 failed 覆盖统一收敛出口与至少一个既有失败出口，证明统一 `taskDate` invariant（不要求每个失败出口机械复制完整测试）
-- [ ] 终态成功落盘后才发最终通知：任一出口 Save 失败 → 不发通知、Task 返回错误；不存在"已发通知无终态"可达状态（= #15 验收并入）
-- [ ] failed 终态下 `weread-cron run` 重试成功更新为 success（回归）
-- [ ] 崩溃无终态：重启在窗口内 → 立即开始全新 Task（无 checkpoint）；窗口已过 → 当天不跑
-- [ ] spec 用户故事 #14/#17、决策 #8/#9/#12 与 CONTEXT.md 文案已同步
+- [x] 常驻 daemon 每日仍从完整 Run Window 内随机一次（既有随机调度测试回归）
+- [x] 异常启动/重启在窗口内且无终态 → 立即执行（注入 clock 断言 Task 在启动后立即执行，而非窗口内随机点）
+- [x] 窗口已过后启动 → 当天不自动跑（回归）
+- [x] 无 whole-Task 重排：任何一次暂时性失败（renewal / Reader Context / enter / timed 预算耗尽）都以 failed 终态结束，daemon 不再于窗口内重排第二个完整 Task
+- [x] 手动 `run` 的暂时性失败与自动 Task 相同：failed 终态 + 失败通知（CLI seam 断言）
+- [x] timed report 单次传输失败跳过、会话继续（回归）；连续失败达预算 → failed 终态 + 通知
+- [x] 全部终态与通知日期 = Task 开始日：跨午夜 success（23:50 开始、次日 00:40 完成 → 归属开始日）；跨午夜 failed 覆盖统一收敛出口与至少一个既有失败出口，证明统一 `taskDate` invariant（不要求每个失败出口机械复制完整测试）
+- [x] 终态成功落盘后才发最终通知：任一出口 Save 失败 → 不发通知、Task 返回错误；不存在"已发通知无终态"可达状态（= #15 验收并入）
+- [x] failed 终态下 `weread-cron run` 重试成功更新为 success（回归）
+- [x] 崩溃无终态：重启在窗口内 → 立即开始全新 Task（无 checkpoint）；窗口已过 → 当天不跑
+- [x] spec 用户故事 #14/#17、决策 #8/#9/#12 与 CONTEXT.md 文案已同步
 
 ## Out of scope
 
@@ -85,3 +85,21 @@ Triage 时已对代码确认 findings/04 的六条冲突（详见 findings/04 �
 2. #15 并入本票（"终态成功落盘后才发最终通知"属于统一 finalization 的同一条不变式，避免在旧多出口模型上先修一次又被 #24 重收敛）。
 
 Timed-report 传输容错（#12）、#17/#18 独立保留、崩溃无终态异常启动规则均属本票范围边界，见 Out of scope。
+## Answer
+
+按 findings/04 澄清模型收敛调度层与 Task 终结边界，全部验收通过。（spec 用户故事 #14/#17、决策 #8/#9/#12 与 CONTEXT.md 文案已随 triage 提交同步，本票未再改动。）
+
+1. **移除 `FinalFailureAfter` / 窗口截止收敛**：`task.Options.FinalFailureAfter`、`TaskRunner.RunTask` 的 `finalFailureAfter` 参数（interface / App 实现 / CLI seam / daemon 调用点）、`scheduler.finalFailureDeadline` 全部删除。暂时性失败的统一出口 `finalizeTransient` 改为无条件收敛：任何未形成终态的失败（renewal / Reader Context / enter / timed 预算耗尽 / 恢复链暂时性终止）都收敛为 failed 终态 + 失败通知（不再检查截止时刻；手动 run 与自动 Task 同一 finalization）。
+2. **统一 finalization（吸收 #15）**：新增 `Runner.finalize` —— 一切最终结果（success 与各 failed 出口：统一收敛、恢复链耗尽、登录失效、自动选书失败）先持久化对应 Terminal State；持久化成功后才发送对应通知；持久化失败 → 不发通知、Task 返回持久化错误（不存在"已发通知但持久化无对应终态"的可达状态）。`finalizeTransient` / `failRecoveryExhausted` / `failLoginInvalid` / `failBookSelection` 与 success 路径全部改走同一流程。
+3. **稳定 Task 日期**：`taskDate`（开始日的 TZ 日期）在 Run 起点取一次，success 终态与通知、全部失败出口的终态与通知（含 `Result.Date` 摘要）一律使用；Task 越过午夜不转移日期归属。
+4. **无 whole-Task 自动重排**：daemon 失败分支不再"未形成终态则窗口内重排"——Task 失败 → 记日志 → 经 `nextDayStart` 直接排定次日窗口内随机点（不再依赖 schedule 的当日分支：终态持久化失败等存储级错误无终态时，NextStart 的"窗口内立即执行"——异常启动/重启恢复语义，仅在进程启动/重启时适用——不得把失败误判为重启而再次启动当天第二个完整 Task）；`ErrTaskRunning` 跳过 + 最短间隔重试守卫保留（replanMinGap 现仅用于该守卫）。
+5. **`NextStart` 立即执行**：无终态且 now 已在窗口内 → 返回 now（异常启动/重启的恢复语义；不再从 `[now, 结束]` 随机）；窗口尚未开始仍完整窗口随机（常驻 daemon 每日调度不变）；终态门控、窗口已过排次日、不补跑、start==end 固定时刻不变。
+6. **timed-report 传输容错保留（ticket 12）**：单次传输失败跳过节奏点、会话继续（回归测试不变）；连续失败达预算 → Task 级最终失败（failed 终态 + 通知，不再是窗口内重排触发）。
+
+### 测试覆盖（应用 seam + 调度层，ADR-0006）
+
+- 新增：`TestNextStartImmediateInsideWindow`（窗口内无终态 → 任意种子立即返回 now；窗口前仍完整随机；有终态门控优先）、`TestDaemonStartsImmediatelyInsideWindowAtStartup`（daemon 层：排定日志 at=启动时刻 23:40:00）、`TestDaemonSchedulesNextDayAfterTransientFailure`（窗口内只执行一次、失败后排次日）、`TestDaemonNoSecondTaskWhenFailureLeavesNoTerminal`（存储级错误无终态 → 失败后排次日，不得启动当天第二个 Task）、`TestRunSuccessAcrossMidnightUsesTaskStartDate`（跨午夜 success → 开始日）、`TestRunRecoveryExhaustedAcrossMidnightUsesTaskStartDate`（既有失败出口跨午夜 → 开始日）、`TestRunTerminalPersistFailureSuppressesNotification`（success + 四个 failed 出口的 Save 失败 → 不发通知、返回持久化错误）、`TestRunReaderContextAndEnterTransientFailureConverge`（Reader Context / enter 两阶段暂时性失败收敛；fake 服务端新增 enterFailCount 注入）。
+- 更新：`TestRunTimedReportConsecutiveFailuresFailTransient` → `TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal`（预算耗尽收敛为 failed 终态 + 通知）；`TestRunManualTransientFailureConvergesSameAsAuto`（手动 run 与自动 Task 同 finalization）；`TestRunTransientRenewalFailureDoesNotTriggerRebuild` / `TestRunRenewalNoSuccIsNotLoginInvalid` / `TestRunAutoSelectShelfTransientFailureNoTerminal` → 收敛语义（failed 终态 + 普通失败通知，仍不套登录失效文案）；删除窗口截止相关的 `TestRunTimedReportFailuresConvergeAtWindowEnd` 与 `TestDaemonConvergesTransientFailureAtWindowEnd`（机制已移除，语义并入上文测试）；`TestDaemonReplansWithinWindowAfterTransientFailure` → 无重排语义。
+- 回归保持：每日完整窗口随机（`NextStart` 窗口前分支）、错过不补跑、启动前终态再校验、`ErrTaskRunning` 跳过 + 重试守卫、并发守卫、failed 终态 run 重试更新 success、timed 单次传输失败会话继续、恢复链全部场景、终态/通知渠道独立性、跨进程锁。
+
+**Commit:** c208629
