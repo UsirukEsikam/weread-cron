@@ -305,7 +305,8 @@ func TestPcltsZeroFallback(t *testing.T) {
 }
 
 // TestIsAccepted 验证成功判定：succ==1（bool/数值/字符串）或 synckey 存在即接受；
-// 其余情况拒绝（checklist #9 边界未经实测，本测试只断言本包实现的参考项目共识）。
+// 其余情况拒绝（与 weread.koplugin 一致；wxread 更严格需两者兼备，两者非共识；
+// checklist #9 边界未经实测，本测试断言本包与 koplugin 一致的 OR 判定）。
 func TestIsAccepted(t *testing.T) {
 	truthy := []map[string]any{
 		{"succ": true},

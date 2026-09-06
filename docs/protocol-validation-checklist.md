@@ -16,7 +16,7 @@
 | 6 | `s` 签名的边界行为：payload 大小、特殊字符、URL encoding 细节与排序规则 | T2 协议核心 | 排序 key=urlencode 串 + 0x15051505 滚动哈希（与两参考实现一致） | 待验证 |
 | 7 | Reader Context 刷新（重新抓取 Reader 页）后是否必须重新 enter report | T6 Reading Session 维护 | 本设计：TTL 到期主动刷新后 Reading Session 继续（不重新 enter）；参考实现刷新后 re-enter——两者冲突，需实测裁决 | 待验证 |
 | 8 | Reader Context 的生命周期：服务端何时拒收旧 Context；约 15 分钟 TTL 是否成立 | T6 Reading Session 维护 | 15 分钟仅参考实现默认值，非协议常量 | 待验证 |
-| 9 | 成功判定边界：响应含 `succ==1` 但无 `synckey`、或有 `synckey` 但无 `succ` 时分别意味着什么 | T2、T3 | `succ==1` 或 `synckey` 存在即接受 | 待验证 |
+| 9 | 成功判定边界：响应含 `succ==1` 但无 `synckey`、或有 `synckey` 但无 `succ` 时分别意味着什么 | T2、T3 | `succ==1` 或 `synckey` 存在即接受（与 weread.koplugin 一致；wxread 更严格需两者兼备；两者非共识） | 待验证 |
 | 10 | enter report 的必要性：服务器是否接受直接开始 timed report（无 enter） | T3、T6 | enter report 先行（两参考实现均如此） | 待验证 |
 | 11 | `rt` interval 语义的真实计时效果：Timed report 的 `rt` 是否按真实墙钟间隔计时；大间隔被折叠/合并还是拒收；间隔异常后重建 Reading Session（重新 enter）是否被服务端接受 | T6 Reading Session 维护 · ADR-0004 | rt = 距上次被接受上报的实际墙钟间隔；大缺口不合并为一次 rt，重建会话（ADR-0004 设计选择，非已确认协议事实） | 待验证 |
 | 12 | 完全未阅读过的 Shelf 书的 Reader Context：`__INITIAL_STATE__` 是否含当前章节与位置；最小可建 Context 的状态 | T9 自动选书 | 未打开过的书可取得当前章节与位置；参考实现含章节信息 fallback，是否必需未实测 | 待验证 |

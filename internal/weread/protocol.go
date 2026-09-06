@@ -32,7 +32,9 @@
 //     本包按"token 优先 reader.token，空值回退 DefaultReaderToken（兼容默认，非核心协议假设）"实现。
 //   - #6 s 签名的服务器端校验行为（算法与官方 JS 一致，但服务器接受边界未经实测）。
 //   - #9 成功判定边界（succ==1 但无 synckey / 有 synckey 但无 succ 的服务器语义）：
-//     IsAccepted 按两参考项目的共识实现（succ==1 或 synckey 存在即视为接受），不写死服务器语义断言。
+//     IsAccepted 与 weread.koplugin 行为一致（succ==1 或 synckey 存在即视为接受，OR 逻辑）；
+//     wxread 更严格（succ 与 synckey 需同时存在才推进进度，AND 逻辑），两者不构成共识。
+//     真实服务端 success boundary 仍属 protocol validation gap，本包不写死服务器语义断言。
 //
 // # 与 ADR-0004 的相关发现
 //
@@ -262,8 +264,10 @@ func SG(ts, rn, token string) string {
 
 // IsAccepted 判定 /web/book/read 响应被接受：succ==1（bool true / 数值 1 / 字符串 "1"）
 // 或存在非空 synckey 字段。
-// 两参考项目共识：succ==1 或 synckey 存在即视为接受（checklist #9 的边界语义未经实测，
-// 本函数不写死服务器语义断言，仅实现参考项目共识）。
+// 参考项目行为分歧：本实现与 weread.koplugin 一致（succ 成功或 synckey 存在即接受，OR 逻辑）；
+// wxread（findmover/wxread）更严格（succ 与 synckey 均需存在才推进进度，AND 逻辑），
+// 两者并不构成共识。真实服务端边界未经实测（protocol validation gap，checklist #9），
+// 本函数不写死服务器语义断言，保持当前 OR 行为。
 func IsAccepted(body map[string]any) bool {
 	if body == nil {
 		return false
