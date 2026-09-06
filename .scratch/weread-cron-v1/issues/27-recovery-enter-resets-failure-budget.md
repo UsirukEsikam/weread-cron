@@ -62,4 +62,4 @@
 
 code-review（Standards + Spec 双轴）结论均为 OK with notes：无硬性违规；P2 判断项为 slowFailGate 与既有 blockTimed/pinClock 同为"请求挂起期间推进时钟"机制（本仓既有多注入旋钮风格，语义不同：仅失败 timed、逐笔放行），不修改。
 
-**Commit:** 待提交
+**Commit:** 790ab72
