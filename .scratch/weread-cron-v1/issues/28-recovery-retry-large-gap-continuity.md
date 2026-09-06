@@ -65,4 +65,4 @@
 
 code-review（Standards + Spec 双轴）结论均为 OK with notes：Standards 轴 P2 为既有整秒边界在 (90s, 91s) 区间与 ADR 字面表述的差异（本票按"不改动边界"要求保留，注释按既有整秒边界措辞）；Spec 轴 P2 为上述收敛补充（已实现 + 组合测试）。
 
-**Commit:** 待提交
+**Commit:** cc4dad5
