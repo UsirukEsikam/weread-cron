@@ -14,8 +14,8 @@
 | 4 | renewal 返回的 Cookie 集合与 Set-Cookie 属性：`wr_skey`/`wr_gid` 凭证偏好、expires/domain/path/httpOnly；哪些 Cookie 被返回/删除/过期；失效 renewal 是否返回有意义的 Set-Cookie；发送侧简化匹配（不分域/路径）是否充分 | T4 会话持久化 | Go Cookie Jar 全套属性持久化可恢复；发送侧简化匹配足够（V1 假设） | 待验证 |
 | 5 | `reader.token` 的来源、轮换与有效期；固定 fallback token 是否仍被接受 | T2 协议核心、T3 payload | reader.token 来自 `__INITIAL_STATE__`，优先使用；固定值仅兼容 fallback | 待验证 |
 | 6 | `s` 签名的边界行为：payload 大小、特殊字符、URL encoding 细节与排序规则 | T2 协议核心 | 排序 key=urlencode 串 + 0x15051505 滚动哈希（与两参考实现一致） | 待验证 |
-| 7 | Reader Context 刷新（重新抓取 Reader 页）后是否必须重新 enter report | T6 Reading Session 维护 | 本设计：TTL 到期主动刷新后 Reading Session 继续（不重新 enter）；参考实现刷新后 re-enter——两者冲突，需实测裁决 | 待验证 |
-| 8 | Reader Context 的生命周期：服务端何时拒收旧 Context；约 15 分钟 TTL 是否成立 | T6 Reading Session 维护 | 15 分钟仅参考实现默认值，非协议常量 | 待验证 |
+| 7 | Reader Context 刷新（重新抓取 Reader 页）后是否必须重新 enter report | T6 Reading Session 维护 | 本设计：TTL 到期主动刷新后 Reading Session 继续（不重新 enter）；参考实现刷新后 re-enter——两者冲突，需实测裁决 | 必须重新 enter（2026-09-06 晚间会话实测确认）：TTL 刷新后不 re-enter 的首笔 timed report 被拒，恢复链（refresh→retry→renewal→refresh→retry，全为 timed）耗尽、Task 失败；对照官方 Web Reader 重建页面上下文后 re-enter、weread.koplugin 每次 Context 重建清 entered 状态先 enter 再 timed（findings/09） |
+| 8 | Reader Context 的生命周期：服务端何时拒收旧 Context；约 15 分钟 TTL 是否成立 | T6 Reading Session 维护 | 15 分钟仅参考实现默认值，非协议常量 | 约 15 分钟 TTL 边界成立（2026-09-06 实测首证）：长会话约 15 分钟处首次被拒（Task 19:36:55 起、首笔被拒 19:51:56）；TTL 过期后旧 Context 不被接受，需刷新 + 重新 enter（findings/09） |
 | 9 | 成功判定边界：响应含 `succ==1` 但无 `synckey`、或有 `synckey` 但无 `succ` 时分别意味着什么 | T2、T3 | `succ==1` 或 `synckey` 存在即接受（与 weread.koplugin 一致；wxread 更严格需两者兼备；两者非共识） | 待验证 |
 | 10 | enter report 的必要性：服务器是否接受直接开始 timed report（无 enter） | T3、T6 | enter report 先行（两参考实现均如此） | 待验证 |
 | 11 | `rt` interval 语义的真实计时效果：Timed report 的 `rt` 是否按真实墙钟间隔计时；大间隔被折叠/合并还是拒收；间隔异常后重建 Reading Session（重新 enter）是否被服务端接受 | T6 Reading Session 维护 · ADR-0004 | rt = 距上次被接受上报的实际墙钟间隔；大缺口不合并为一次 rt，重建会话（ADR-0004 设计选择，非已确认协议事实） | 待验证 |
@@ -93,6 +93,13 @@ Current validation status:
 - Whether recovery requires re-entering the Reading Session is not yet established.
 - Newly unread books and completed books remain unvalidated independently because both tests were blocked by the same long-session failure.
 
-另一拨手动测试的一些记录：
 - Official Web Reader capture confirmed that `pc` and `ps` remain stable across consecutive timed reports and real page turns. During the same session, `ct`, `rt`, `rn`, `sg`, `s`, and reading-position fields changed as expected.
 - For a Reader page whose initial `reader.pclts` was numeric `0`, the official client sent a non-zero `pc` value and reused that same value for subsequent timed reports.
+
+- After the session-stable fallback `pc` fix, a 20-minute manual Task on an ordinary book was accepted continuously until the Reader Context TTL boundary.
+- The first rejection occurred approximately 15 minutes after Task start:
+  - Task start: 19:36:55
+  - first rejected timed report: 19:51:56
+- The configured/default Reader Context TTL is 15 minutes.
+- The bounded recovery chain could not recover and the Task ended in failure.
+- This strongly confirms that refreshing Reader Context without re-entering the Reading Session is incompatible with the real service.
