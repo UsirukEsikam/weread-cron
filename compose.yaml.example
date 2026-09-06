@@ -1,9 +1,6 @@
-# weread-cron 部署模板
-# 复制为 compose.yaml 后使用。
-
 services:
   weread-cron:
-    image: ghcr.io/UsirukEsikam/weread-cron:latest
+    image: ghcr.io/usirukesikam/weread-cron:latest
     restart: unless-stopped
     env_file:
       - .env
@@ -14,5 +11,4 @@ services:
 
 volumes:
   weread-cron-data:
-    # 固定数据卷名称，避免因目录变动导致新建卷而丢失数据
     name: weread-cron-data
