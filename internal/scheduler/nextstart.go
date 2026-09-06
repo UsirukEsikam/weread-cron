@@ -34,7 +34,11 @@ func (w Window) String() string {
 //   - Run Window 只约束开始时刻；"窗口已过"按 now 与当天窗口起始点的关系判定；
 //   - 当天已有终态（success 或 failed，按 last.LastTaskDate 与天名匹配）→
 //     明天窗口内随机一次（终态门控，ADR-0002：当天不再自动执行）；
-//   - 无终态且窗口未过 → [now, 窗口结束] 内随机一次；窗口尚未开始则 [开始, 结束]；
+//   - 无终态且窗口尚未开始 → [开始, 结束] 内随机一次（正常每日调度与窗口前的
+//     异常启动同规则）；
+//   - 无终态且 now 已在窗口内 → 立即返回 now（异常启动/重启的恢复语义，ticket 24：
+//     不再从 [now, 结束] 随机——Task 一旦启动不再 whole-Task 自动重排，窗口内重排
+//     语义已不存在）；
 //   - 窗口已过 → 明天窗口内随机（错过整天不补跑）；
 //   - start==end → 固定启动时刻（常量窗口退化为一个时间点）。
 //
@@ -71,8 +75,10 @@ func NextStart(now time.Time, win Window, last terminal.State, tz *time.Location
 		// 窗口已过：明天窗口内随机（错过不补跑）。
 		return randomInWindow(tomorrow, win, rng), nil
 	default:
-		// 窗口未过（含恰在开始/结束点）：[now, 结束] 内随机，今天再排一次。
-		return randomInRange(now, end, rng), nil
+		// 无终态且 now 已在窗口内（含恰在开始/结束点）：立即执行（异常启动/重启的
+		// 恢复语义，ticket 24；用户故事 #14/#17）——不改变常驻 daemon 的每日随机
+		// （窗口前启动仍走完整窗口随机；Task 完成后终态门控排次日）。
+		return now, nil
 	}
 }
 

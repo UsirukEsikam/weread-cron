@@ -1,8 +1,10 @@
 // 本文件实现 daemon 主循环。
 //
 // 跨重启无状态（ADR-0002）：调度不持久化任何"已排定"状态，每次迭代都从 Terminal
-// State 现况出发重新计算——重启后若当天无终态且窗口未过，自然在剩余窗口内重排；
-// 已有终态则排次日。错过的整天不补跑。
+// State 现况出发重新计算——重启后若当天无终态且窗口未过，按异常启动规则立即执行
+// （ticket 24：不再从剩余窗口随机）；已有终态则排次日。错过的整天不补跑。
+// ticket 24：无 whole-Task 自动重排——实际开始执行的 Task 以对应终态结束，
+// daemon 在 Task 失败后不再于窗口内启动另一个完整 Task。
 package scheduler
 
 import (
@@ -20,9 +22,10 @@ import (
 	"weread-cron/internal/terminal"
 )
 
-// replanMinGap 是暂时性失败后的最短重排间隔（内部默认，不暴露为配置，ADR-0005）。
-// 失败 Task 通常至少耗时数秒～数分钟，间隔避免窗口末尾 next==now 的紧循环
-// （[now, 结束] 随机可能再次指回 now，sleepUntil 立即返回 → 背靠背重跑）。
+// replanMinGap 是 ErrTaskRunning 并发拒绝后重试守卫的最短间隔（内部默认，不暴露为
+// 配置，ADR-0005）。ticket 24 起 daemon 不再 whole-Task 重排（Task 失败直接排次日），
+// 本间隔只用于并发拒绝后的再次尝试：NextStart 的"窗口内立即执行"会马上指回 now，
+// 间隔避免 sleepUntil 立即返回 → 背靠背重试的紧循环。
 const replanMinGap = time.Minute
 
 // sleepChunk 是 sleepUntil 的分片上限。clock.Sleep 不感知 ctx（clock 抽象对 Task
@@ -32,11 +35,10 @@ const sleepChunk = 2 * time.Second
 
 // TaskRunner 执行一次 Task（生产 = internal/app.App；测试注入 fake；ADR-0006）。
 // daemon 只负责"到点执行"，Task 内部的终态落盘/通知由 Task 自身完成（spec 决策 #9）。
-// finalFailureAfter 是暂时性失败的收敛截止时刻（ticket 12）：失败时刻晚于该时刻
-// 且未形成终态时，Task 把最后一次暂时性失败收敛为 failed 终态 + 失败通知（窗口内
-// 已无法再重排，当天不静默空过）；零值 = 不收敛（手动 run 等不受窗口约束的调用）。
+// ticket 24：实际开始执行的 Task 必然形成对应终态（success → success 终态；最终失败
+// → failed 终态）；调度层不再进行 whole-Task 自动重排。
 type TaskRunner interface {
-	RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Result, error)
+	RunTask(ctx context.Context) (task.Result, error)
 }
 
 // Deps 是 daemon 的注入点（ADR-0006）；零值字段使用生产默认。
@@ -135,12 +137,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 
 		d.log.Info("已到启动时刻，执行 Task",
 			"at", d.clk.Now().In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
-		// 收敛截止时刻（ticket 12）：当天窗口结束前 replanMinGap。失败发生在此之后
-		// 时，最短重排间隔（睡 replanMinGap 后重排）会越过窗口结束点、下次调度必然
-		// 落在次日——本次失败是当天最后一次尝试，Task 将其收敛为 failed 终态 +
-		// 失败通知（当天不静默空过）。
-		deadline := d.finalFailureDeadline(d.clk.Now())
-		if _, err := d.task.RunTask(ctx, deadline); err != nil {
+		if _, err := d.task.RunTask(ctx); err != nil {
 			// Task 失败但被取消：正常退出。
 			if ctx.Err() != nil {
 				d.log.Info("daemon 退出")
@@ -148,20 +145,30 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			// 并发守卫拒绝（ticket 11/ADR-0008）：另一进程（手动 run/books 或其他
 			// daemon）持有同一 /data 的 Task 锁。这不是失败——本次自动执行被跳过，
-			// 循环重排（窗口未过则在剩余窗口内再随机一次；运行中的 Task 不受影响）。
+			// 最短重排间隔后重试；运行中的 Task 不受影响。
 			if errors.Is(err, task.ErrTaskRunning) {
-				d.log.Info("另一进程正在运行 Task，本次自动执行被拒绝（窗口内继续排定）")
+				d.log.Info("另一进程正在运行 Task，本次自动执行被拒绝（最短间隔后重试）")
 				if err := sleepUntil(ctx, d.clk, d.clk.Now().Add(replanMinGap)); err != nil {
 					d.log.Info("daemon 退出")
 					return nil
 				}
 				continue
 			}
-			// 未形成终态（暂时性失败）→ 循环重排：窗口未过则在剩余窗口内再随机
-			// 一次（用户故事 #17）；窗口已过或已形成 failed 终态 → 排次日。
-			d.log.Warn("Task 执行失败（未形成终态则窗口内重排；已形成终态则排次日）", "err", err)
-			// 最短重排间隔：防止窗口末尾 next 再次指回 now 的紧循环。
-			if err := sleepUntil(ctx, d.clk, d.clk.Now().Add(replanMinGap)); err != nil {
+			// 无 whole-Task 自动重排（ticket 24）：实际开始执行的 Task 以对应终态
+			// 结束——正常失败已写 failed 终态，当天不再自动执行，排定次日；
+			// 也不存在"未形成终态则窗口内重排"的分支。
+			d.log.Warn("Task 执行失败（当天不再自动重排，排定次日）", "err", err)
+			// 防御（终态持久化失败等存储级错误不会留下终态）：直接排定次日窗口内的
+			// 随机启动点再进入循环——NextStart 的"窗口内立即执行"（异常启动/重启恢复
+			// 语义，ticket 24）只在进程启动/重启时适用，不得把本次失败误判为重启而
+			// 再次启动当天第二个完整 Task。
+			next, err := d.nextDayStart()
+			if err != nil {
+				return err
+			}
+			d.log.Info("Task 失败后下次启动排定于次日",
+				"at", next.In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
+			if err := sleepUntil(ctx, d.clk, next); err != nil {
 				d.log.Info("daemon 退出")
 				return nil
 			}
@@ -171,19 +178,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 }
 
-// finalFailureDeadline 计算暂时性失败的收敛截止时刻（ticket 12）：当天窗口结束前
-// replanMinGap 的时刻。窗口只约束开始时刻（ADR-0001），失败时刻晚于该时刻时，
-// daemon 的最短重排间隔会越过窗口结束（replanMinGap 睡眠后 nextStart 必然排次日）
-// ——该失败即当日最后一次尝试；此前失败的仍可窗口内重排（用户故事 #17）。
-func (d *Daemon) finalFailureDeadline(now time.Time) time.Time {
-	t := now.In(d.cfg.TZ)
-	day := time.Date(t.Year(), t.Month(), t.Day(), 0, 0, 0, 0, d.cfg.TZ)
-	end := day.Add(time.Duration(d.cfg.WindowEnd) * time.Minute)
-	return end.Add(-replanMinGap)
+// nextDayStart 计算次日窗口内随机启动点（Task 失败后"排定次日"用，ticket 24）：
+// 以次日 00:00 为基准走 NextStart 的"窗口前"分支 → 完整窗口内随机（与正常每日随机
+// 同一规则）。不经过 schedule() 的当日分支——终态持久化失败等存储级错误不会留下
+// 终态，此时 NextStart 的"窗口内立即执行"（异常启动/重启恢复语义）只适用于进程
+// 启动/重启，不得把失败误判为重启而再次启动当天第二个完整 Task。
+func (d *Daemon) nextDayStart() (time.Time, error) {
+	t := d.clk.Now().In(d.cfg.TZ)
+	tomorrow := time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, d.cfg.TZ)
+	next, err := NextStart(tomorrow, Window{Start: d.cfg.WindowStart, End: d.cfg.WindowEnd}, terminal.State{}, d.cfg.TZ, d.rng)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("计算次日启动时刻失败: %w", err)
+	}
+	return next, nil
 }
 
 // schedule 读取 Terminal State 并计算下次启动；同时输出决策依据日志
-// （当天已有终态 → 跳过今日；无终态 → 今日剩余窗口/明天窗口）。
+// （当天已有终态 → 跳过今日；无终态 → 今日立即/今日窗口/明天窗口）。
 func (d *Daemon) schedule() (time.Time, error) {
 	now := d.clk.Now()
 	st, has, err := d.term.Load()

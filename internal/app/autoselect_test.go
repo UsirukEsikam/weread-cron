@@ -276,7 +276,10 @@ func TestRunAutoSelectEmptyShelfFailsWithNotification(t *testing.T) {
 // TestRunAutoSelectShelfTransientFailureNoTerminal 断言 Shelf 抓取失败（HTTP 500）
 // 按暂时性处理：Task 失败但不写终态、不通知（当日可再次调度——与 Reader 页抓取
 // 失败同一姿态）；错误为普通错误（非登录失效）。
-func TestRunAutoSelectShelfTransientFailureNoTerminal(t *testing.T) {
+// TestRunAutoSelectShelfTransientFailureConvergesToFailedTerminal 断言 Shelf 抓取失败
+// （HTTP 500）按暂时性处理并经统一收敛（ticket 24）：Task 失败、failed 终态 + 失败
+// 通知（阶段 = 自动选书）；不是登录失效；不再于窗口内重排。
+func TestRunAutoSelectShelfTransientFailureConvergesToFailedTerminal(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.cfg.Books = nil
 		h.weread.shelfStatus = 500
@@ -288,11 +291,16 @@ func TestRunAutoSelectShelfTransientFailureNoTerminal(t *testing.T) {
 	if !strings.Contains(err.Error(), "抓取 Shelf 失败") {
 		t.Errorf("错误应说明 Shelf 抓取失败: %v", err)
 	}
-	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
-		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
+	// 无条件收敛：failed 终态 + 失败通知（阶段 = 自动选书）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed（暂时性失败统一收敛）", st, has, err)
 	}
-	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
-		t.Errorf("不得发送任何通知，实际 %d 条", got)
+	msg, _ := json.Marshal(h.bark.snapshot()[0].Body)
+	for _, want := range []string{"微信读书阅读任务失败", "失败阶段：自动选书"} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
+		}
 	}
 }
 

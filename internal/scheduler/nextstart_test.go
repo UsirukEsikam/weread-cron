@@ -52,15 +52,15 @@ func TestNextStartWindowConstrainsStartOnly(t *testing.T) {
 			wantDayTZ: "2025-09-06",
 		},
 		{
-			name:      "窗口内：随机在 [now, 结束]",
+			name:      "窗口内：立即执行（异常启动/重启恢复语义，ticket 24）",
 			now:       at(2025, 9, 6, 1, 30),
 			window:    win(60, 180),
 			wantFrom:  at(2025, 9, 6, 1, 30),
-			wantTo:    at(2025, 9, 6, 3, 0),
+			wantTo:    at(2025, 9, 6, 1, 30),
 			wantDayTZ: "2025-09-06",
 		},
 		{
-			name:      "恰在窗口结束：含边界（end 时刻仍可开始）",
+			name:      "恰在窗口结束：立即执行（不再含边界随机）",
 			now:       at(2025, 9, 6, 3, 0),
 			window:    win(60, 180),
 			wantFrom:  at(2025, 9, 6, 3, 0),
@@ -240,5 +240,38 @@ func TestNextStartHonorsTZ(t *testing.T) {
 	wantSH := time.Date(2025, 9, 7, 9, 0, 0, 0, testLoc)
 	if !nextSH.Equal(wantSH) {
 		t.Errorf("UTC+8 下 next = %v，期望 %v", nextSH, wantSH)
+	}
+}
+
+// TestNextStartImmediateInsideWindow 验证异常启动/重启语义（ticket 24；用户故事
+// #14/#17）：当天无终态且 now 已在窗口内 → 立即返回 now（与 RNG 种子无关），不再
+// 从 [now, 结束] 随机；窗口尚未开始仍为完整窗口内随机（常驻 daemon 每日随机调度
+// 不变）；已有终态时仍排次日（终态门控优先）。
+func TestNextStartImmediateInsideWindow(t *testing.T) {
+	inside := at(2025, 9, 6, 23, 40) // 窗口 [23:30, 23:59] 内
+	for _, seed := range []int64{1, 2, 3, 42, 99} {
+		next, err := NextStart(inside, win(23*60+30, 23*60+59), terminal.State{}, testLoc, rand.New(rand.NewSource(seed)))
+		if err != nil {
+			t.Fatalf("NextStart 返回错误: %v", err)
+		}
+		if !next.Equal(inside) {
+			t.Errorf("窗口内无终态应立即执行：next = %v，期望 %v（RNG 种子 %d）", next, inside, seed)
+		}
+	}
+
+	// 窗口前启动仍为完整窗口内随机（常驻 daemon 每日随机保持不变）。
+	next, err := NextStart(at(2025, 9, 6, 0, 30), win(60, 180), terminal.State{}, testLoc, rand.New(rand.NewSource(7)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertInRange(t, next, at(2025, 9, 6, 1, 0), at(2025, 9, 6, 3, 0))
+
+	// 窗口内但有终态：终态门控优先 → 排次日（立即执行仅限无终态的异常恢复）。
+	next, err = NextStart(inside, win(23*60+30, 23*60+59), terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}, testLoc, rand.New(rand.NewSource(7)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := next.In(testLoc).Format(terminal.DayLayout); got != "2025-09-07" {
+		t.Errorf("有终态时窗口内不得立即执行，应排次日；next = %v", next)
 	}
 }

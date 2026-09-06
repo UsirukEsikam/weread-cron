@@ -21,11 +21,15 @@
 // ticket 13 范围（本文件）：自动选书的候选随机化——探测前对未读完层与已读完回退层
 // 各自洗牌（注入 RNG），稳定 Shelf 下多日执行不再固定选中同一本（用户故事 #10 的
 // 随机化意图）；分层语义、每层有界探测上限、无可用书失败姿态均不变。
-// ticket 12 范围（本文件）：暂时性失败与最终失败的收敛边界（spec 决策 #7 的
-// 调和）——daemon 注入收敛截止时刻 FinalFailureAfter（窗口结束 - 最短重排间隔）：
-// 失败时刻晚于该时刻的暂时性失败收敛为 failed 终态 + 失败通知（当天不静默空过），
-// 之前仍按暂时性处理（窗口内可再次调度）；timed report 单次传输级失败不再终止
-// 整个 Task（跳过本节奏点、会话继续，连续失败超预算才判失败）。
+// ticket 24 范围（本文件）：Task 终结语义收敛（findings/04；spec 决策 #7/#9/#12）——
+// 移除 FinalFailureAfter / 窗口截止收敛机制：一切暂时性失败（renewal / Reader
+// Context / enter / timed 预算耗尽）无条件收敛为 failed 终态 + 失败通知（Task 一旦
+// 启动即无 whole-Task 自动重排，窗口不再参与 Task 失败判定）；全部最终结果先持久化
+// 对应终态、持久化成功后才发送对应通知（吸收 #15：终态成功落盘才发最终通知，
+// 落盘失败 → 不发通知、Task 返回持久化错误）；终态与通知日期统一为 Task 开始日
+// （跨午夜不转移日期归属）；手动 run 与自动 Task 使用同一 finalization。
+// timed report 单次传输级失败的会话内容错保留（跳过本节奏点、会话继续，连续失败
+// 超预算判失败）；Task 失败后由 `weread-cron run` 手动重试。
 //
 // # rt 语义（ADR-0004）
 //
@@ -42,10 +46,11 @@
 // 恢复链按固定有界序列执行 5 步：refresh Reader Context → retry → renewal →
 // refresh Reader Context → retry。任何一步成功即视为恢复成功、Task 继续；
 // 最后一步重试仍被拒绝 → 恢复链耗尽 → failed 终态先落盘、再发失败通知。
-// 链中步骤的非拒绝失败（传输/HTTP/解析）按暂时性失败处理：不写终态、不发通知
-// （当日可再次调度）——与 ticket 04 对 renewal 暂时性失败的姿态一致；
-// renewal 的登录失效明确证据仍走 ticket 04 的判别与路径（重建一次 → 仍失败 →
-// 登录失效终态 + 登录失效通知，不混入普通失败文案）。
+// 链中步骤的非拒绝失败（传输/HTTP/解析）按暂时性失败处理（ticket 24：经
+// finalizeTransient 无条件收敛为 failed 终态 + 失败通知，不再检查窗口截止时刻）——
+// 与 ticket 04 对 renewal 暂时性失败收敛为失败终态的姿态一致；renewal 的登录失效
+// 明确证据仍走 ticket 04 的判别与路径（重建一次 → 仍失败 → 登录失效终态 +
+// 登录失效通知，不混入普通失败文案）。
 package task
 
 import (
@@ -82,8 +87,8 @@ const (
 	// DefaultMaxSelectionProbes 是自动选书的有界探测上限（每个候选层：未读完 / 已读完）。
 	DefaultMaxSelectionProbes = 20
 	// DefaultMaxConsecutiveReportFailures 是 timed report 连续暂时性失败预算：单次
-	// 传输级失败跳过本节奏点、会话继续；连续失败达到预算才判本 Task 暂时性失败
-	// （ticket 12：不因一次抖动丢失整个 Task，也不无限跳过）。
+	// 传输级失败跳过本节奏点、会话继续；连续失败达到预算才判本 Task 最终失败
+	// （ticket 12/24：不因一次抖动丢失整个 Task，也不无限跳过）。
 	DefaultMaxConsecutiveReportFailures = 3
 )
 
@@ -95,10 +100,10 @@ const (
 	StageTimedReport = "timed report"
 	// StageBookSelection 是自动选书失败的阶段（书架无可建立 Reader Context 的书）。
 	StageBookSelection = "自动选书"
-	// StageRenewal 是登录 renewal 失败的阶段（ticket 12 的暂时性失败收敛用）。
+	// StageRenewal 是登录 renewal 失败的阶段（ticket 24 的暂时性失败统一收敛用）。
 	StageRenewal = "renewal"
 	// StageReaderContext 是读取 Reading Progress / 抓取 Reader Context 失败的阶段
-	// （ticket 12 的暂时性失败收敛用）。
+	// （ticket 24 的暂时性失败统一收敛用）。
 	StageReaderContext = "Reader Context"
 )
 
@@ -141,12 +146,6 @@ type Options struct {
 	// 从初始 Cookie 重建 Login Session（覆盖持久化会话）并让客户端使用新会话。
 	// 由 App 装配层提供；nil 表示无重建能力（防御：证据出现时按重建失败处理）。
 	RebuildLoginSession func() error
-
-	// FinalFailureAfter 是暂时性失败收敛的截止时刻（ticket 12）：失败时刻晚于该
-	// 时刻且未形成终态时，最后一次暂时性失败收敛为 failed 终态 + 失败通知（窗口
-	// 内已无法再重排，当天不静默空过）。由 daemon 注入（当天窗口结束 - 最短重排
-	// 间隔）；零值 = 不收敛（手动 run：用户在场，失败由 CLI 呈现）。
-	FinalFailureAfter time.Time
 
 	// Books 是候选 bookId（cfg.Books）；空 = 自动从 Shelf 选书（ticket 09）。
 	Books []string
@@ -200,10 +199,11 @@ func New(opts Options) *Runner {
 
 // Run 完整执行一次 Task（spec 决策 #6 的流程）。
 //
-// 失败出口（ticket 12）：一切未形成终态的失败都经 finalizeTransient 统一出口——
-// 收敛截止时刻（opts.FinalFailureAfter）已过且未形成终态时，最后一次暂时性失败
-// 收敛为 failed 终态 + 失败通知；之前原样返回（窗口内可再次调度）。已收敛的失败
-// （report.ErrRejected 恢复链耗尽 / weread.ErrLoginInvalid 登录失效）不重复收敛。
+// 失败出口（ticket 24）：一切未形成终态的失败都经 finalizeTransient 统一出口——
+// 无条件收敛为 failed 终态 + 失败通知（不再检查窗口截止时刻：Task 一旦启动即无
+// whole-Task 自动重排，任何失败都是最终失败）。已收敛的失败（report.ErrRejected
+// 恢复链耗尽 / weread.ErrLoginInvalid 登录失效）不重复收敛。终态与通知日期统一为
+// Task 开始日（taskDate）。
 func (r *Runner) Run(ctx context.Context) (Result, error) {
 	o := r.opts
 
@@ -218,15 +218,15 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	// 2. Target Duration：每次 Task 只生成一次（用户故事 #16；seeded RNG 下确定性）。
 	target := time.Duration(o.TargetMinMinutes+o.RNG.Intn(o.TargetMaxMinutes-o.TargetMinMinutes+1)) * time.Minute
 
-	// 2.5 Task 所属日期：以 Task 开始时刻的 TZ 日期为准（窗口所属日）。窗口末尾的
-	//     Task 可越过午夜（用户故事 #11：允许越过窗口结束点），失败时刻的日期可能
-	//     已是次日——收敛路径（ticket 12）的终态与通知用开始日，避免窗口日静默空过
-	//     且次日的自动执行被误抑制。成功路径与既有失败出口仍用完成时刻日期（不改）。
+	// 2.5 Task 所属日期（ticket 24）：在 Task 启动时确定一次（开始日的 TZ 日期，窗口
+	//     所属日）、对 success 与全部 failed 路径恒稳定。窗口末尾的 Task 可越过午夜
+	//     （用户故事 #11：允许越过窗口结束点），完成/失败时刻的日期可能已是次日——
+	//     终态与通知一律用开始日：窗口日不静默空过、次日的自动执行不被误抑制。
 	taskDate := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
 
 	// 3. Task 开始时即 renewal（spec 决策 #6；新 Cookie 经客户端回调并入会话并持久化）。
 	//    ticket 04：明确证据判定登录失效时从初始 Cookie 重建一次并重试。
-	if err := r.renew(ctx); err != nil {
+	if err := r.renew(ctx, taskDate); err != nil {
 		return Result{}, r.finalizeTransient(ctx, StageRenewal, err, taskDate)
 	}
 
@@ -252,7 +252,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 
 	// 6. enter report 建立 Reading Session（用户故事 #26）；被拒时按有界恢复链恢复。
 	now := o.Clock.Now()
-	enterResult, err := r.sendEnter(ctx, bookID, *initial, now)
+	enterResult, err := r.sendEnter(ctx, bookID, *initial, now, taskDate)
 	if err != nil {
 		return Result{}, fmt.Errorf("enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 	}
@@ -260,9 +260,10 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 
 	// 7. 周期 timed report；rt 按 ADR-0004；本地累计达标即停止（用户故事 #27/#28）。
 	//    被拒时按有界恢复链恢复（spec 决策 #7），恢复成功后 Task 继续。
-	//    ticket 12：单次传输级失败（非拒绝）不再终止 Task——跳过本节奏点、Reading
+	//    ticket 12/24：单次传输级失败（非拒绝）不再终止 Task——跳过本节奏点、Reading
 	//    Session 继续，被跳过的间隔自然并入下一次被接受上报的 rt；连续失败达到
-	//    DefaultMaxConsecutiveReportFailures 预算才判定本 Task 暂时性失败。
+	//    DefaultMaxConsecutiveReportFailures 预算才判定本 Task 最终失败（收敛为
+	//    failed 终态 + 失败通知）。
 	next := lastSent.Add(DefaultRhythm)
 	var accumulated time.Duration
 	reports := 0
@@ -295,7 +296,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			// 上方 Fetch 给出的 Context（跳变越过 TTL 时即为刚重抓的新 Context；
 			// 未越 TTL 时命中缓存，无需额外请求），同样走恢复链。
 			o.Logger.Warn("异常间隔，重建 Reading Session", "rt_sec", rtSec)
-			enterResult, err := r.sendEnter(ctx, bookID, st, now)
+			enterResult, err := r.sendEnter(ctx, bookID, st, now, taskDate)
 			if err != nil {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 			}
@@ -312,7 +313,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			rt := rtSeconds(t, lastSent)
 			return rt, o.Sender.Timed(ctx, bookID, s.Progress, s.Context, t, rt, t.UnixMilli(), o.RNG.Intn(1000))
 		}
-		newSt, rt, at, err := r.recoverSend(ctx, bookID, StageTimedReport, st, now, send)
+		newSt, rt, at, err := r.recoverSend(ctx, bookID, StageTimedReport, st, now, send, taskDate)
 		if err != nil {
 			// 已收敛的终态失败（服务器拒绝且恢复链耗尽 / 登录失效）：Task 终止，
 			// 不再重试（终态与通知已由恢复链/登录失效路径完成）。
@@ -321,8 +322,8 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			}
 			// 暂时性失败（传输/HTTP/解析）：跳过本节奏点、Reading Session 继续，
 			// 被跳过的间隔并入下一次被接受上报的 rt（ADR-0004）——单次抖动不丢失
-			// 整个 Task；连续失败达预算 → 本 Task 暂时性失败（调度层窗口内重排，
-			// 窗口耗尽时经 finalizeTransient 收敛为终态 + 通知）。
+			// 整个 Task；连续失败达预算 → 本 Task 最终失败（ticket 24：经
+			// finalizeTransient 无条件收敛为 failed 终态 + 失败通知）。
 			consecutiveFailures++
 			if consecutiveFailures >= DefaultMaxConsecutiveReportFailures {
 				err = fmt.Errorf("timed report 连续 %d 次暂时性失败: %w", consecutiveFailures, err)
@@ -340,33 +341,30 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 		next = lastSent.Add(DefaultRhythm)
 	}
 
-	// 8. success 终态先落盘，再发成功通知（spec 决策 #9/#10；用户故事 #39）。
-	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
-	if err := o.Terminal.Save(terminal.State{
-		LastTaskDate:   date,
+	// 8. success 终态先落盘，再发成功通知（spec 决策 #9/#10；用户故事 #39）；终态与
+	//    通知日期用 Task 开始日（taskDate；ticket 24——跨午夜完成不转移日期归属）。
+	if err := r.finalize(ctx, terminal.State{
+		LastTaskDate:   taskDate,
 		LastTaskResult: terminal.ResultSuccess,
-	}); err != nil {
-		return Result{}, fmt.Errorf("写入 Terminal State 失败: %w", err)
-	}
-
-	// 通知失败不影响 Task 结果与终态（用户故事 #38）。
-	if o.Notify != nil {
-		if err := o.Notify.NotifySuccess(ctx, notify.Success{
-			Date:      date,
+	}, func(ctx context.Context) error {
+		return o.Notify.NotifySuccess(ctx, notify.Success{
+			Date:      taskDate,
 			BookTitle: bookTitle,
 			BookID:    bookID,
 			Planned:   target,
 			Actual:    accumulated,
 			Reports:   reports,
-		}); err != nil {
-			o.Logger.Warn("成功通知发送失败（不影响 Task 结果）", "err", err)
-		}
+		})
+	}); err != nil {
+		// 终态持久化失败：不发成功通知、Task 返回持久化错误（#15：不存在"已发通知
+		// 但持久化无对应终态"的可达状态）。
+		return Result{}, err
 	}
 
 	o.Logger.Info("Task 完成",
 		"book_id", bookID, "target", target.String(), "actual", accumulated.String(), "reports", reports)
 	return Result{
-		Date:      date,
+		Date:      taskDate,
 		BookID:    bookID,
 		BookTitle: bookTitle,
 		Planned:   target,
@@ -399,11 +397,12 @@ type sendResult struct {
 }
 
 // sendEnter 发送 enter report（不含计时字段）；被拒时按有界恢复链恢复，返回刷新后的状态。
-func (r *Runner) sendEnter(ctx context.Context, bookID string, st readercontext.State, now time.Time) (sendResult, error) {
+// taskDate 是 Task 开始日（恢复链耗尽的终态/通知日期用；见 Run）。
+func (r *Runner) sendEnter(ctx context.Context, bookID string, st readercontext.State, now time.Time, taskDate string) (sendResult, error) {
 	send := func(s readercontext.State, t time.Time) (int, error) {
 		return 0, r.opts.Sender.Enter(ctx, bookID, s.Progress, s.Context, t)
 	}
-	newSt, rt, at, err := r.recoverSend(ctx, bookID, StageEnterReport, st, now, send)
+	newSt, rt, at, err := r.recoverSend(ctx, bookID, StageEnterReport, st, now, send, taskDate)
 	if err != nil {
 		return sendResult{}, err
 	}
@@ -420,9 +419,12 @@ type reportSend func(st readercontext.State, now time.Time) (rtSec int, err erro
 //   - 首次尝试被拒绝 → 按 spec 决策 #7 执行有界序列：refresh Reader Context → retry →
 //     renewal → refresh Reader Context → retry。任何一步成功即恢复；
 //     最后一步重试仍被拒绝 → failRecoveryExhausted（failed 终态 + 失败通知）；
-//     链中步骤的非拒绝失败按暂时性失败处理（不写终态、不发通知）；
+//     链中步骤的非拒绝失败按暂时性失败处理（ticket 24：由调用方经 finalizeTransient
+//     收敛为 failed 终态 + 失败通知）；
 //     renewal 的登录失效明确证据经 r.renew 走 ticket 04 路径（登录失效终态 + 通知）。
-func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st readercontext.State, now time.Time, send reportSend) (readercontext.State, int, time.Time, error) {
+//
+// taskDate 是 Task 开始日（终态/通知日期用；见 Run）。
+func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st readercontext.State, now time.Time, send reportSend, taskDate string) (readercontext.State, int, time.Time, error) {
 	o := r.opts
 
 	rt, err := send(st, now)
@@ -466,13 +468,13 @@ func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st reade
 				}
 			}
 			if step == recoverySteps-1 {
-				return current, 0, now, r.failRecoveryExhausted(ctx, stage, lastErr, actions)
+				return current, 0, now, r.failRecoveryExhausted(ctx, stage, lastErr, actions, taskDate)
 			}
 		case 2:
 			// renewal：ticket 04 语义内嵌（明确证据 → 从初始 Cookie 重建一次 → 重试；
 			// 仍失败 → 登录失效终态 + 登录失效通知，错误在此返回不进入普通失败路径）。
 			actions = append(actions, ActionRenewal)
-			if rerr := r.renew(ctx); rerr != nil {
+			if rerr := r.renew(ctx, taskDate); rerr != nil {
 				return current, 0, now, &chainStop{
 					actions: append([]string(nil), actions...),
 					err:     fmt.Errorf("%s 恢复链终止（renewal 失败）: %w", stage, rerr),
@@ -484,7 +486,7 @@ func (r *Runner) recoverSend(ctx context.Context, bookID, stage string, st reade
 	return current, 0, now, fmt.Errorf("%s 恢复链耗尽: %w", stage, lastErr)
 }
 
-// chainStop 是恢复链因暂时性失败终止的错误的载体（ticket 12）：携带链中已尝试的
+// chainStop 是恢复链因暂时性失败终止的错误的载体（ticket 12/24）：携带链中已尝试的
 // 恢复动作（失败通知的 notify.Failure.Actions 数据源）。errors.As 提取；包装链
 // 保留（errors.Is 贯通——恢复链从不携带 ErrRejected，携带的收敛错误
 // ErrLoginInvalid 经 errors.Is 判别跳过重复收敛）。
@@ -496,66 +498,76 @@ type chainStop struct {
 func (e *chainStop) Error() string { return e.err.Error() }
 func (e *chainStop) Unwrap() error { return e.err }
 
-// finalizeTransient 是暂时性失败的统一出口（ticket 12："暂时性失败可重排"与
-// "最终失败必收敛"的边界）：
+// finalizeTransient 是暂时性失败的统一收敛出口（ticket 24）：一切未形成终态的失败
+// （传输/HTTP/解析失败、timed report 预算耗尽、恢复链因暂时性失败终止）无条件收敛
+// 为 failed 终态 + 失败通知（spec 决策 #7/#9/#12）。不再检查窗口截止时刻——Task 一旦
+// 启动即无 whole-Task 自动重排，任何失败都是最终失败；手动 run 与自动 Task 同一
+// finalization。
 //
-//   - 收敛截止时刻未到（或未注入：手动 run 为零值）→ 原样返回：暂时性失败，
-//     窗口内可再次调度（用户故事 #17 语义不变）；
-//   - 失败时刻已过截止时刻 → 窗口内已无法再排出下一次尝试：最后一次暂时性失败
-//     收敛为 failed 终态 + 失败通知（失败阶段、主要错误、已尝试恢复动作），
-//     当天不静默空过；
-//   - 已收敛的错误（report.ErrRejected 恢复链耗尽 / weread.ErrLoginInvalid 登录
-//     失效）原样返回：终态与通知已由各自路径完成，不重复收敛。
+// 已收敛的错误（report.ErrRejected 恢复链耗尽 / weread.ErrLoginInvalid 登录失效）
+// 原样返回：终态与通知已由各自路径完成，不重复收敛。
 //
-// taskDate 是 Task 开始日（窗口所属日）：终态与通知的日期用窗口日而非失败时刻
-// 的日期（窗口末尾的 Task 可越过午夜，用户故事 #11）。cause 保持包装链不变
-// （errors.Is 判别身份保留），收敛与否只影响终态与通知；恢复链终止的错误经
-// errors.As 提取已尝试动作（chainStop）。
+// taskDate 是 Task 开始日（ticket 24）：终态与通知的日期一律用开始日而非失败时刻
+// 的日期（Task 可越过午夜，用户故事 #11）。cause 保持包装链不变（errors.Is 判别
+// 身份保留），收敛与否只影响终态与通知；恢复链终止的错误经 errors.As 提取已尝试
+// 动作（chainStop）。终态持久化失败 → 返回持久化错误、不发通知（#15）。
 func (r *Runner) finalizeTransient(ctx context.Context, stage string, cause error, taskDate string) error {
-	o := r.opts
-	if o.FinalFailureAfter.IsZero() || !o.Clock.Now().After(o.FinalFailureAfter) {
-		return cause
-	}
 	if errors.Is(cause, report.ErrRejected) || errors.Is(cause, weread.ErrLoginInvalid) {
 		return cause
 	}
-	// 收敛：failed 终态先落盘、再发失败通知（spec 决策 #9/#10；通知失败不影响
-	// Task 结果——用户故事 #38，与其它失败出口同一姿态）。
 	f := notify.Failure{Date: taskDate, Stage: stage, Error: cause.Error()}
 	var stop *chainStop
 	if errors.As(cause, &stop) {
 		f.Actions = stop.actions // 恢复链中已尝试的动作（若有）
 	}
-	if err := o.Terminal.Save(terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}); err != nil {
-		o.Logger.Warn("窗口耗尽收敛时写入 failed 终态失败", "err", err)
+	o := r.opts
+	if err := r.finalize(ctx, terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}, func(ctx context.Context) error {
+		return o.Notify.NotifyFailure(ctx, f)
+	}); err != nil {
+		// 终态持久化失败：不发失败通知、返回持久化错误（#15）。
+		return err
 	}
-	if o.Notify != nil {
-		if err := o.Notify.NotifyFailure(ctx, f); err != nil {
-			o.Logger.Warn("失败通知发送失败（不影响 Task 结果）", "err", err)
-		}
-	}
-	o.Logger.Info("窗口耗尽：暂时性失败收敛为 failed 终态（当日不再自动重排）", "stage", stage, "err", cause)
+	o.Logger.Info("暂时性失败收敛为 failed 终态（Task 不再自动重排）", "stage", stage, "err", cause)
 	return cause
 }
 
-// failRecoveryExhausted 输出恢复链耗尽的失败结果：failed 终态先落盘、再发失败通知
-// （spec 决策 #9/#10：失败阶段、主要错误、已尝试恢复动作；通知失败不影响 Task 结果）。
-// 返回的错误供调用方报告，包装最终拒绝错误（errors.Is(err, report.ErrRejected)）。
-func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause error, actions []string) error {
+// finalize 是全部最终结果（success 与各 failed 出口）的统一收敛流程（spec 决策
+// #9/#10；ticket 24）：先持久化对应的 Terminal State（success/failed），持久化成功
+// 后才发送对应的最终通知；持久化失败 → 不发送通知、返回持久化错误（#15：不存在
+// "已发通知但持久化无对应终态"的可达状态）。所有最终结果路径（成功、各失败出口、
+// 统一收敛以及登录失效）都经由本方法。
+//
+// notify 为 nil（nil Notifier 或出口无需通知）时跳过发送；通知发送失败不影响 Task
+// 结果与终态（用户故事 #38），仅记日志。
+func (r *Runner) finalize(ctx context.Context, st terminal.State, notify func(context.Context) error) error {
 	o := r.opts
-	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
-	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
-		o.Logger.Warn("恢复链耗尽时写入 failed 终态失败", "err", err)
+	if err := o.Terminal.Save(st); err != nil {
+		return fmt.Errorf("写入 Terminal State 失败: %w", err)
 	}
-	if o.Notify != nil {
-		if err := o.Notify.NotifyFailure(ctx, notify.Failure{
-			Date:    date,
+	if o.Notify == nil || notify == nil {
+		return nil
+	}
+	if err := notify(ctx); err != nil {
+		o.Logger.Warn("最终通知发送失败（不影响 Task 结果）", "err", err)
+	}
+	return nil
+}
+
+// failRecoveryExhausted 输出恢复链耗尽的失败结果：failed 终态先落盘、再发失败通知
+// （spec 决策 #9/#10：失败阶段、主要错误、已尝试恢复动作；通知失败不影响 Task 结果；
+// 终态持久化失败 → 返回持久化错误、不发通知，#15）。返回的错误供调用方报告，包装
+// 最终拒绝错误（errors.Is(err, report.ErrRejected)）。taskDate 是 Task 开始日。
+func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause error, actions []string, taskDate string) error {
+	o := r.opts
+	if err := r.finalize(ctx, terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}, func(ctx context.Context) error {
+		return o.Notify.NotifyFailure(ctx, notify.Failure{
+			Date:    taskDate,
 			Stage:   stage,
 			Error:   cause.Error(),
 			Actions: actions,
-		}); err != nil {
-			o.Logger.Warn("失败通知发送失败（不影响 Task 结果）", "err", err)
-		}
+		})
+	}); err != nil {
+		return err
 	}
 	return fmt.Errorf("%s 被服务器拒绝且恢复链耗尽: %w", stage, cause)
 }
@@ -567,10 +579,11 @@ func (r *Runner) failRecoveryExhausted(ctx context.Context, stage string, cause 
 //   - 重建失败或重试仍失败 → failed 终态先落盘、再发登录失效通知（用户故事 #34），
 //     返回包装 ErrLoginInvalid 的错误（含更新初始 Cookie 的明确提示）。
 //
-// 无明确证据的失败（传输错误、HTTP 非 200、响应解析失败）不重建、不写终态——
-// 暂时性失败，当日可再次调度（用户故事 #17；判别特征见 client.go 的 ErrLoginInvalid）。
-// 恢复链的 renewal 步骤复用本方法（有界恢复链 ≠ 无限重试：重建机会仍只消耗一次）。
-func (r *Runner) renew(ctx context.Context) error {
+// 无明确证据的失败（传输错误、HTTP 非 200、响应解析失败）不重建——由调用方经
+// finalizeTransient 收敛为 failed 终态 + 失败通知（ticket 24：与其它暂时性失败同一
+// 最终收敛；不再于窗口内重排）。恢复链的 renewal 步骤复用本方法（有界恢复链 ≠
+// 无限重试：重建机会仍只消耗一次）。taskDate 是 Task 开始日（终态/通知日期用）。
+func (r *Runner) renew(ctx context.Context, taskDate string) error {
 	o := r.opts
 	err := o.Client.Renewal(ctx)
 	if err == nil {
@@ -582,31 +595,28 @@ func (r *Runner) renew(ctx context.Context) error {
 
 	o.Logger.Warn("检测到登录失效（renewal 明确拒绝），从初始 Cookie 重建 Login Session", "err", err)
 	if o.RebuildLoginSession == nil {
-		return r.failLoginInvalid(ctx, err, errors.New("未配置从初始 Cookie 重建 Login Session 的入口"))
+		return r.failLoginInvalid(ctx, err, errors.New("未配置从初始 Cookie 重建 Login Session 的入口"), taskDate)
 	}
 	if rerr := o.RebuildLoginSession(); rerr != nil {
-		return r.failLoginInvalid(ctx, err, rerr)
+		return r.failLoginInvalid(ctx, err, rerr, taskDate)
 	}
 	if err2 := o.Client.Renewal(ctx); err2 != nil {
 		// 已消耗唯一一次重建机会；重试失败（无论是否再次证据）即重建失败。
-		return r.failLoginInvalid(ctx, err, err2)
+		return r.failLoginInvalid(ctx, err, err2, taskDate)
 	}
 	return nil
 }
 
 // failLoginInvalid 输出登录失效的失败结果：failed 终态先落盘、再发送登录失效通知
-// （spec 决策 #7/#9/#10；通知失败不影响结果——用户故事 #38）。返回的错误供调用方
-// 报告，包装 weread.ErrLoginInvalid 并含更新初始 Cookie 的明确提示。
-func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error) error {
+// （spec 决策 #7/#9/#10；通知失败不影响结果——用户故事 #38；终态持久化失败 →
+// 返回持久化错误、不发通知，#15）。返回的错误供调用方报告，包装 weread.ErrLoginInvalid
+// 并含更新初始 Cookie 的明确提示。taskDate 是 Task 开始日。
+func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error, taskDate string) error {
 	o := r.opts
-	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
-	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
-		o.Logger.Warn("登录失效时写入 failed 终态失败", "err", err)
-	}
-	if o.Notify != nil {
-		if err := o.Notify.NotifyLoginInvalid(ctx, notify.LoginInvalid{Date: date, Cause: cause.Error()}); err != nil {
-			o.Logger.Warn("登录失效通知发送失败（不影响 Task 结果）", "err", err)
-		}
+	if err := r.finalize(ctx, terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}, func(ctx context.Context) error {
+		return o.Notify.NotifyLoginInvalid(ctx, notify.LoginInvalid{Date: taskDate, Cause: cause.Error()})
+	}); err != nil {
+		return err
 	}
 	return fmt.Errorf("%w: 从初始 Cookie 重建 Login Session 后 renewal 仍失败。证据: %v；重建: %v。%s",
 		weread.ErrLoginInvalid, evidence, cause, notify.LoginInvalidPrompt)
@@ -624,11 +634,11 @@ func (r *Runner) failLoginInvalid(ctx context.Context, evidence, cause error) er
 //     缓存（随后 fetchReaderState 零额外请求，进入上报即用探测时的 Context）；
 //  5. 全部不可用 → failBookSelection（failed 终态 + 失败通知）。
 //
-// 与任务级恢复链的姿态一致：Shelf 抓取失败（传输/HTTP/解析）按暂时性失败处理
-// （不写终态、不通知，窗口内当日可再次调度；ticket 12：窗口耗尽时经
-// finalizeTransient 收敛为 failed 终态 + 失败通知）；只有"Shelf 有数据但无可用书"
-// 才是本 Task 的失败（终态 + 失败通知——书可用性的数据问题，重跑大概率依旧失败）。
-// taskDate 是 Task 开始日（finalizeTransient 收敛用；见 Run）。
+// 与任务级恢复链的姿态一致：Shelf 抓取失败（传输/HTTP/解析）按暂时性处理（由调用方
+// 经 finalizeTransient 无条件收敛为 failed 终态 + 失败通知，ticket 24——不再于窗口内
+// 重排）；只有"Shelf 有数据但无可用书"才是本 Task 的失败（终态 + 失败通知——书可用性
+// 的数据问题，重跑大概率依旧失败）。taskDate 是 Task 开始日（finalizeTransient 与
+// failBookSelection 的终态/通知日期用；见 Run）。
 func (r *Runner) selectFromShelf(ctx context.Context, taskDate string) (string, error) {
 	o := r.opts
 	shelf, err := o.Client.Shelf(ctx)
@@ -676,7 +686,7 @@ func (r *Runner) selectFromShelf(ctx context.Context, taskDate string) (string, 
 	if id, ok := probe(finished); ok {
 		return id, nil
 	}
-	return "", r.failBookSelection(ctx, len(shelf), len(unread), len(finished))
+	return "", r.failBookSelection(ctx, taskDate, len(shelf), len(unread), len(finished))
 }
 
 // shuffleTier 对候选层就地 Fisher-Yates 随机化（ticket 13）：使用注入 RNG（决策
@@ -688,25 +698,22 @@ func shuffleTier(tier []weread.ShelfBook, rng *rand.Rand) {
 }
 
 // failBookSelection 输出自动选书失败的失败结果：failed 终态先落盘、再发失败通知
-// （spec 决策 #9/#10：失败阶段、主要错误、已尝试动作；通知失败不影响 Task 结果）。
-// 返回的错误供调用方报告（最终由 CLI 以非零退出码呈现）。
-func (r *Runner) failBookSelection(ctx context.Context, shelfCount, unreadCount, finishedCount int) error {
+// （spec 决策 #9/#10：失败阶段、主要错误、已尝试动作；通知失败不影响 Task 结果；
+// 终态持久化失败 → 返回持久化错误、不发通知，#15）。返回的错误供调用方报告（最终
+// 由 CLI 以非零退出码呈现）。taskDate 是 Task 开始日（终态/通知日期用）。
+func (r *Runner) failBookSelection(ctx context.Context, taskDate string, shelfCount, unreadCount, finishedCount int) error {
 	o := r.opts
-	date := o.Clock.Now().In(o.TZ).Format(terminal.DayLayout)
 	detail := fmt.Sprintf("书架 %d 本（未读完 %d 本、已读完 %d 本）均无法建立 Reader Context（探测上限 %d）",
 		shelfCount, unreadCount, finishedCount, DefaultMaxSelectionProbes)
-	if err := o.Terminal.Save(terminal.State{LastTaskDate: date, LastTaskResult: terminal.ResultFailed}); err != nil {
-		o.Logger.Warn("自动选书失败时写入 failed 终态失败", "err", err)
-	}
-	if o.Notify != nil {
-		if err := o.Notify.NotifyFailure(ctx, notify.Failure{
-			Date:    date,
+	if err := r.finalize(ctx, terminal.State{LastTaskDate: taskDate, LastTaskResult: terminal.ResultFailed}, func(ctx context.Context) error {
+		return o.Notify.NotifyFailure(ctx, notify.Failure{
+			Date:    taskDate,
 			Stage:   StageBookSelection,
 			Error:   detail,
 			Actions: []string{ActionShelfFilter, ActionProbeReaderContext},
-		}); err != nil {
-			o.Logger.Warn("失败通知发送失败（不影响 Task 结果）", "err", err)
-		}
+		})
+	}); err != nil {
+		return err
 	}
 	return fmt.Errorf("自动选书失败：%s", detail)
 }

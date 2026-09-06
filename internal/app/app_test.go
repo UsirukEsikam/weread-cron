@@ -73,12 +73,15 @@ type fakeWeread struct {
 	// timedFailCount > 0 时前 N 笔 timed report 返回 HTTP 500（传输级暂时性故障
 	// 注入，ticket 12：单次失败会话继续 / 连续失败预算场景）。注意与 timedRejects
 	// 的区分：后者是服务器明确拒绝（errCode 信封），前者是 HTTP 级故障。
+	// enterFailCount > 0 时前 N 笔 enter report 返回 HTTP 500（enter 阶段传输级
+	// 故障注入，ticket 24：enter 阶段暂时性失败的统一收敛场景）。
 	reportRejected bool
 	timedRejectAll bool
 	timedRejects   int
 	enterRejects   int
 	renewNoCookies bool
 	timedFailCount int
+	enterFailCount int
 
 	// rotateReaderState 为 true 时每次 Reader 页抓取返回不同的 token/psvts
 	//（第 N 次抓取 = fake-reader-token-N / fake-psvts-N），用于断言恢复链刷新后
@@ -351,6 +354,7 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 	f.mu.Lock()
 	reject := f.reportRejected
 	timedFail := false
+	enterFail := false
 	if isTimed {
 		if f.timedRejectAll {
 			reject = true
@@ -361,13 +365,16 @@ func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 			timedFail = true
 			f.timedFailCount--
 		}
+	} else if f.enterFailCount > 0 {
+		enterFail = true
+		f.enterFailCount--
 	} else if f.enterRejects > 0 {
 		reject = true
 		f.enterRejects--
 	}
 	f.mu.Unlock()
-	if timedFail {
-		http.Error(w, "timed report unavailable", http.StatusInternalServerError)
+	if timedFail || enterFail {
+		http.Error(w, "report unavailable", http.StatusInternalServerError)
 		return
 	}
 	if reject {
@@ -499,6 +506,9 @@ type testHarness struct {
 	clk    *clock.Fake
 	rng    *rand.Rand
 	cfg    *config.Config
+	// term 覆盖 Terminal State 存储（nil = 生产文件存储；#15 测试注入 Save 恒失败的
+	// 实现）。
+	term terminal.Store
 }
 
 // setup 装配：fake weread/通知端点（mutate 后可改行为）、fake clock
@@ -534,11 +544,15 @@ func setup(t *testing.T, mutate func(h *testHarness)) *testHarness {
 	cfg.BarkURL = barkSrv.URL
 	cfg.WeComWebhookURL = wecomSrv.URL
 
+	if h.term == nil {
+		h.term = terminal.NewFileStore(cfg.DataDir)
+	}
 	h.app = New(cfg, Deps{
 		Clock:         h.clk,
 		RNG:           h.rng,
 		WereadBaseURL: wereadSrv.URL,
 		Sessions:      session.NewFileStore(cfg.DataDir),
+		Terminal:      h.term,
 		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 	})
 	return h
@@ -553,7 +567,7 @@ func (h *testHarness) runTask(ctx context.Context) (task.Result, error) {
 	}
 	ch := make(chan outcome, 1)
 	go func() {
-		res, err := h.app.RunTask(ctx, time.Time{})
+		res, err := h.app.RunTask(ctx)
 		ch <- outcome{res, err}
 	}()
 	select {
@@ -888,7 +902,7 @@ func TestRunAbnormalIntervalRebuildsSession(t *testing.T) {
 	var res task.Result
 	var runErr error
 	go func() {
-		res, runErr = h.app.RunTask(ctx, time.Time{})
+		res, runErr = h.app.RunTask(ctx)
 		close(done)
 	}()
 
@@ -1092,7 +1106,7 @@ func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
 	var res task.Result
 	var runErr error
 	go func() {
-		res, runErr = h.app.RunTask(ctx, time.Time{})
+		res, runErr = h.app.RunTask(ctx)
 		close(done)
 	}()
 
@@ -1155,7 +1169,7 @@ func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
 	}
 }
 
-// --- ticket 12：timed report 暂时性失败容错与窗口末收敛 ---
+// --- ticket 12/24：timed report 暂时性失败容错与无条件收敛 ---
 
 // TestRunTimedReportTransientFailureContinuesSession 断言单笔 timed report 传输级
 // 失败（HTTP 500）不再终止整个 Task（ticket 12 验收 3）：跳过该节奏点、Reading
@@ -1194,41 +1208,14 @@ func TestRunTimedReportTransientFailureContinuesSession(t *testing.T) {
 	}
 }
 
-// TestRunTimedReportConsecutiveFailuresFailTransient 断言连续暂时性失败达到预算
-// （DefaultMaxConsecutiveReportFailures = 3）时本 Task 判定暂时性失败（ticket 12）：
-// 不写终态、不通知（窗口内当日可再次调度）；错误为普通错误（非 ErrRejected）。
-func TestRunTimedReportConsecutiveFailuresFailTransient(t *testing.T) {
+// TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal 断言连续暂时性失败达到
+// 预算（DefaultMaxConsecutiveReportFailures = 3）时本 Task 最终失败并无条件收敛
+// （ticket 24：不再检查窗口截止时刻——Task 一旦启动即无 whole-Task 重排）：failed
+// 终态（先落盘）+ 失败通知（失败阶段 = timed report、主要错误 = 连续失败原因、日期
+// = 当天）。错误为普通错误（非 ErrRejected）。
+func TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.timedFailCount = 100 // timed report 一律 HTTP 500：预算内耗尽
-	})
-	_, err := h.runTask(context.Background())
-	if err == nil {
-		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
-	}
-	if errors.Is(err, report.ErrRejected) {
-		t.Errorf("传输级失败不得归类为服务器拒绝: %v", err)
-	}
-	if !strings.Contains(err.Error(), "连续 3 次暂时性失败") {
-		t.Errorf("错误应说明连续失败预算；实际: %v", err)
-	}
-	// 请求数有界：enter + 恰好 3 笔 timed（预算），之后立即停止、不无限重试。
-	if n := h.weread.count("/web/book/read"); n != 4 {
-		t.Errorf("report 数 = %d，期望 4（enter + 3 timed）", n)
-	}
-	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
-		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
-	}
-	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
-		t.Errorf("不得发送任何通知，实际 %d 条", got)
-	}
-}
-
-// TestRunTimedReportFailuresConvergeAtWindowEnd 断言窗口末尾（收敛截止时刻已过）的
-// 暂时性失败收敛为 failed 终态并发失败通知（ticket 12 验收 1/4）：失败阶段 =
-// timed report、主要错误 = 连续失败原因、日期 = 当天。
-func TestRunTimedReportFailuresConvergeAtWindowEnd(t *testing.T) {
-	h := setup(t, func(h *testHarness) {
-		h.weread.timedFailCount = 100
 	})
 	// 收敛的失败通知请求到达时，failed 终态必须已落盘（spec 决策 #9/#10）。
 	h.bark.Check = func() error {
@@ -1245,12 +1232,19 @@ func TestRunTimedReportFailuresConvergeAtWindowEnd(t *testing.T) {
 		}
 		return nil
 	}
-	// 收敛截止时刻 = 09:59（早于假时钟 10:00）：窗口内已无法再重排，本次失败即当日
-	// 最后一次尝试 → 收敛（与真实 daemon 注入"窗口结束 - 最短重排间隔"同构）。
-	deadline := time.Date(2025, 9, 6, 9, 59, 0, 0, testTZ)
-	_, err := h.app.RunTask(context.Background(), deadline)
+	_, err := h.runTask(context.Background())
 	if err == nil {
 		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
+	}
+	if errors.Is(err, report.ErrRejected) {
+		t.Errorf("传输级失败不得归类为服务器拒绝: %v", err)
+	}
+	if !strings.Contains(err.Error(), "连续 3 次暂时性失败") {
+		t.Errorf("错误应说明连续失败预算；实际: %v", err)
+	}
+	// 请求数有界：enter + 恰好 3 笔 timed（预算），之后立即停止、不无限重试。
+	if n := h.weread.count("/web/book/read"); n != 4 {
+		t.Errorf("report 数 = %d，期望 4（enter + 3 timed）", n)
 	}
 
 	// failed 终态已落盘（收敛；先落盘再通知）。
@@ -1286,7 +1280,7 @@ func TestRunTimedReportFailuresConvergeAtWindowEnd(t *testing.T) {
 	}
 }
 
-// TestRunConvergedChainTerminationIncludesActions 断言窗口末收敛的失败通知包含
+// TestRunConvergedChainTerminationIncludesActions 断言统一收敛的失败通知包含
 // 已尝试恢复动作（ticket 12 验收 4）：恢复链中某步传输级失败导致链终止时，错误
 // 载体 chainStop 携带的动作序列进入通知的 notify.Failure.Actions——每周期首试被拒
 // → 链中刷新连番 HTTP 500（transport 级）→ 连续 3 次链终止达预算 → 收敛，通知含
@@ -1296,8 +1290,7 @@ func TestRunConvergedChainTerminationIncludesActions(t *testing.T) {
 		h.weread.timedRejectAll = true // 每笔 timed 首试被拒 → 进入恢复链
 		h.weread.readerFailFrom = 2    // 恢复链的刷新（第 2 次 Reader 页抓取起）一律 500
 	})
-	deadline := time.Date(2025, 9, 6, 9, 59, 0, 0, testTZ)
-	_, err := h.app.RunTask(context.Background(), deadline)
+	_, err := h.runTask(context.Background())
 	if err == nil {
 		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
 	}
@@ -1333,30 +1326,29 @@ func TestRunConvergedChainTerminationIncludesActions(t *testing.T) {
 	}
 }
 
-// TestRunConvergenceAcrossMidnightUsesTaskStartDate 断言窗口末尾 Task 越过午夜后的
-// 收敛仍归属 Task 开始日（ticket 12；用户故事 #11 允许越过窗口结束点）：失败时刻
-// 已是次日，但 failed 终态与失败通知的日期用窗口日——窗口日不静默空过、次日的
-// 自动执行不被误抑制。
+// TestRunConvergenceAcrossMidnightUsesTaskStartDate 断言 Task 越过午夜后的统一收敛
+// 仍归属 Task 开始日（ticket 24；用户故事 #11 允许越过窗口结束点）：失败时刻已是
+// 次日，但 failed 终态与失败通知的日期用开始日——窗口日不静默空过、次日的自动执行
+// 不被误抑制。
 func TestRunConvergenceAcrossMidnightUsesTaskStartDate(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.timedFailCount = 100
-		// Task 开始 23:59:55（窗口日 09-06）；3 笔 timed 失败后预算耗尽于 00:01:25
+		// Task 开始 23:59:55（开始日 09-06）；3 笔 timed 失败后预算耗尽于 00:01:25
 		//（次日）。
 		h.clk = clock.NewFake(time.Date(2025, 9, 6, 23, 59, 55, 0, testTZ))
 	})
-	deadline := time.Date(2025, 9, 6, 23, 58, 0, 0, testTZ)
-	_, err := h.app.RunTask(context.Background(), deadline)
+	_, err := h.runTask(context.Background())
 	if err == nil {
 		t.Fatal("连续暂时性失败达到预算时 Task 应失败")
 	}
 
-	// failed 终态归属窗口日（09-06），而非失败时刻的次日。
+	// failed 终态归属开始日（09-06），而非失败时刻的次日。
 	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
 	if err != nil || !has {
 		t.Fatalf("终态应存在: has=%v err=%v", has, err)
 	}
 	if st != (terminal.State{LastTaskDate: "2025-09-06", LastTaskResult: terminal.ResultFailed}) {
-		t.Errorf("Terminal State = %+v，期望 2025-09-06/failed（窗口日）", st)
+		t.Errorf("Terminal State = %+v，期望 2025-09-06/failed（开始日）", st)
 	}
 	recs := h.bark.snapshot()
 	if len(recs) != 1 {
@@ -1364,23 +1356,175 @@ func TestRunConvergenceAcrossMidnightUsesTaskStartDate(t *testing.T) {
 	}
 	msg, _ := json.Marshal(recs[0].Body)
 	if !strings.Contains(string(msg), "2025-09-06") {
-		t.Errorf("失败通知日期应为窗口日 2025-09-06；body=%s", msg)
+		t.Errorf("失败通知日期应为开始日 2025-09-06；body=%s", msg)
 	}
 	if strings.Contains(string(msg), "2025-09-07") {
 		t.Errorf("失败通知不得用失败时刻的次日日期；body=%s", msg)
 	}
 }
 
-// TestRunTransientFailureConvergesAfterDeadline 断言窗口末尾的 renewal 传输级失败
-// 同样收敛（ticket 12）：failed 终态 + 失败通知（失败阶段 = renewal、主要错误 =
-// 登录 renewal 失败）；与登录失效路径区分（无登录失效文案、错误不包装
-// ErrLoginInvalid）。
-func TestRunTransientFailureConvergesAfterDeadline(t *testing.T) {
+// TestRunSuccessAcrossMidnightUsesTaskStartDate 断言成功路径的终态与通知日期 = Task
+// 开始日（ticket 24；spec 决策 #9）：Task 23:50 开始、20 分钟目标越过午夜于次日
+// 00:10 完成——success 终态与成功通知归属开始日（09-06），不转移日期归属。
+func TestRunSuccessAcrossMidnightUsesTaskStartDate(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.ReadMinutesMin = 20
+		h.cfg.ReadMinutesMax = 20
+		h.clk = clock.NewFake(time.Date(2025, 9, 6, 23, 50, 0, 0, testTZ))
+	})
+	res, err := h.runTask(context.Background())
+	if err != nil {
+		t.Fatalf("Task 失败: %v", err)
+	}
+	if res.Date != "2025-09-06" {
+		t.Errorf("Result.Date = %q，期望开始日 2025-09-06（越过午夜不转移归属）", res.Date)
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultSuccess {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 success", st, has, err)
+	}
+	if st.LastTaskDate != "2025-09-06" {
+		t.Errorf("Terminal State 日期 = %q，期望开始日 2025-09-06", st.LastTaskDate)
+	}
+	msg, _ := json.Marshal(h.bark.snapshot()[0].Body)
+	if !strings.Contains(string(msg), "2025-09-06") {
+		t.Errorf("成功通知日期应为开始日 2025-09-06；body=%s", msg)
+	}
+	if strings.Contains(string(msg), "2025-09-07") {
+		t.Errorf("成功通知不得用完成时刻的次日日期；body=%s", msg)
+	}
+}
+
+// TestRunRecoveryExhaustedAcrossMidnightUsesTaskStartDate 断言既有失败出口（恢复链
+// 耗尽）的终态与通知日期同样 = Task 开始日（ticket 24 的统一 taskDate invariant）：
+// Task 23:59:31 开始，首笔 timed report 于次日 00:00:01 到达并被拒，恢复链 5 步耗尽
+// ≈ 次日凌晨——failed 终态与失败通知用开始日 09-06（证明各失败出口共享同一日期规则）。
+func TestRunRecoveryExhaustedAcrossMidnightUsesTaskStartDate(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true // enter 接受；timed 一律拒绝 → 恢复链耗尽
+		h.clk = clock.NewFake(time.Date(2025, 9, 6, 23, 59, 31, 0, testTZ))
+	})
+	_, err := h.runTask(context.Background())
+	if err == nil {
+		t.Fatal("恢复链耗尽时 Task 应失败")
+	}
+	if !errors.Is(err, report.ErrRejected) {
+		t.Errorf("错误应包装 report.ErrRejected，实际: %v", err)
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed", st, has, err)
+	}
+	if st.LastTaskDate != "2025-09-06" {
+		t.Errorf("Terminal State 日期 = %q，期望开始日 2025-09-06", st.LastTaskDate)
+	}
+	msg, _ := json.Marshal(h.bark.snapshot()[0].Body)
+	if !strings.Contains(string(msg), "2025-09-06") {
+		t.Errorf("失败通知日期应为开始日 2025-09-06；body=%s", msg)
+	}
+	if strings.Contains(string(msg), "2025-09-07") {
+		t.Errorf("失败通知不得用失败时刻的次日日期；body=%s", msg)
+	}
+}
+
+// failTerminalStore 是 Save 恒失败的 Terminal Store（#15/24：终态持久化失败 → 不发
+// 最终通知、Task 返回持久化错误；Load 正常（终态门控可判））。
+type failTerminalStore struct {
+	err error
+}
+
+func (f failTerminalStore) Save(terminal.State) error { return f.err }
+func (f failTerminalStore) Load() (terminal.State, bool, error) {
+	return terminal.State{}, false, nil
+}
+
+// TestRunReaderContextAndEnterTransientFailureConverge 断言 Reader Context 阶段与
+// enter 阶段的传输级暂时性失败同样无条件收敛为 failed 终态 + 失败通知（ticket 24：
+// renewal / Reader Context / enter / timed 各阶段暂时性失败都以最终失败结束，daemon
+// 不再于窗口内重排第二个完整 Task；阶段只影响通知文案，收敛流程同一）。
+func TestRunReaderContextAndEnterTransientFailureConverge(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(h *testHarness)
+	}{
+		{
+			name: "Reader Context 阶段（读取 Reading Progress）",
+			mutate: func(h *testHarness) {
+				h.weread.readerFailByBook = map[string]bool{shelfID(testBookID): true}
+			},
+		},
+		{
+			name: "enter report 阶段（传输级 HTTP 500）",
+			mutate: func(h *testHarness) {
+				h.weread.enterFailCount = 5
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := setup(t, tc.mutate)
+			_, err := h.runTask(context.Background())
+			if err == nil {
+				t.Fatal("阶段暂时性失败时 Task 应失败")
+			}
+			st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+			if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+				t.Fatalf("终态 = %+v has=%v err=%v，期望 failed（暂时性失败统一收敛）", st, has, err)
+			}
+			if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 2 {
+				t.Errorf("应发送失败通知（Bark + 企业微信各 1 条），实际 %d 条", got)
+			}
+		})
+	}
+}
+
+// TestRunTerminalPersistFailureSuppressesNotification 断言任一出口的 Terminal State
+// 持久化失败 → 不发最终通知、Task 返回持久化错误（#15 验收并入 ticket 24）：success
+// 路径与全部 failed 出口（统一收敛 / 恢复链耗尽 / 登录失效 / 自动选书失败）都经同一
+// finalize 流程——先持久化终态、持久化成功后才发通知；不存在"已发通知但持久化无对应
+// 终态"的可达状态。
+func TestRunTerminalPersistFailureSuppressesNotification(t *testing.T) {
+	cases := []struct {
+		name   string
+		mutate func(h *testHarness)
+	}{
+		{name: "success 路径", mutate: func(h *testHarness) {}},
+		{name: "renewal 暂时性失败统一收敛", mutate: func(h *testHarness) { h.weread.renewStatus = 500 }},
+		{name: "恢复链耗尽", mutate: func(h *testHarness) { h.weread.timedRejectAll = true }},
+		{name: "登录失效", mutate: func(h *testHarness) { h.weread.renewReject = 5 }},
+		{name: "自动选书失败", mutate: func(h *testHarness) { h.cfg.Books = nil }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := setup(t, func(h *testHarness) {
+				h.term = failTerminalStore{err: errors.New("disk full")}
+				tc.mutate(h)
+			})
+			_, err := h.runTask(context.Background())
+			if err == nil {
+				t.Fatal("终态持久化失败时 Task 应返回错误")
+			}
+			if !strings.Contains(err.Error(), "写入 Terminal State 失败") {
+				t.Errorf("错误应指明终态持久化失败；实际: %v", err)
+			}
+			// 不发最终通知（#15）：不存在"已发通知但持久化无对应终态"的可达状态。
+			if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
+				t.Errorf("终态落盘失败时不得发送任何通知，实际 %d 条", got)
+			}
+		})
+	}
+}
+
+// TestRunManualTransientFailureConvergesSameAsAuto 断言手动 run（runTask 无任何窗口
+// 参数）与自动 Task 使用同一 finalization（ticket 24；spec 决策 #12）：renewal HTTP
+// 500（暂时性失败）无条件收敛为 failed 终态 + 失败通知（失败阶段 = renewal、主要
+// 错误 = 登录 renewal 失败、日期 = 开始日）；与登录失效路径区分（无登录失效文案、
+// 错误不包装 ErrLoginInvalid）。
+func TestRunManualTransientFailureConvergesSameAsAuto(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.renewStatus = 500
 	})
-	deadline := time.Date(2025, 9, 6, 9, 59, 0, 0, testTZ)
-	_, err := h.app.RunTask(context.Background(), deadline)
+	_, err := h.runTask(context.Background())
 	if err == nil {
 		t.Fatal("renewal HTTP 500 时 Task 应失败")
 	}
@@ -1388,7 +1532,7 @@ func TestRunTransientFailureConvergesAfterDeadline(t *testing.T) {
 		t.Errorf("非明确证据不得归类为登录失效: %v", err)
 	}
 
-	// failed 终态 + 失败通知（阶段 = renewal）。
+	// failed 终态 + 失败通知（阶段 = renewal），与自动 Task 相同。
 	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
 	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
 		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed", st, has, err)
@@ -1408,25 +1552,6 @@ func TestRunTransientFailureConvergesAfterDeadline(t *testing.T) {
 		if !strings.Contains(string(msg), want) {
 			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
 		}
-	}
-}
-
-// TestRunTransientFailureBeforeDeadlineStaysTransient 断言收敛截止时刻未到（窗口内
-// 仍可重排）时暂时性失败维持原语义（ticket 12 验收 2 回归）：不写终态、不通知。
-func TestRunTransientFailureBeforeDeadlineStaysTransient(t *testing.T) {
-	h := setup(t, func(h *testHarness) {
-		h.weread.renewStatus = 500
-	})
-	deadline := time.Date(2025, 9, 6, 11, 0, 0, 0, testTZ) // 11:00 > 假时钟 10:00：仍可重排
-	_, err := h.app.RunTask(context.Background(), deadline)
-	if err == nil {
-		t.Fatal("renewal HTTP 500 时 Task 应失败")
-	}
-	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
-		t.Errorf("截止时刻未到的暂时性失败不得写终态（窗口内可再次调度）")
-	}
-	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
-		t.Errorf("不得发送任何通知，实际 %d 条", got)
 	}
 }
 
@@ -2081,7 +2206,9 @@ func TestRunLoginInvalidRebuildFailsWritesFailedTerminalAndNotifies(t *testing.T
 }
 
 // TestRunTransientRenewalFailureDoesNotTriggerRebuild 断言无明确证据的失败
-// （HTTP 非 200：传输/服务端故障）不触发重建、不写 failed 终态、不发登录失效通知。
+// （HTTP 非 200：传输/服务端故障）不触发重建、不发登录失效通知（ticket 04/24）：
+// 无证据的暂时性失败经统一收敛为 failed 终态 + 普通失败通知（阶段 = renewal），
+// 不混入登录失效文案。
 func TestRunTransientRenewalFailureDoesNotTriggerRebuild(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.renewStatus = 500
@@ -2097,11 +2224,23 @@ func TestRunTransientRenewalFailureDoesNotTriggerRebuild(t *testing.T) {
 	if n := h.weread.count("/web/login/renewal"); n != 1 {
 		t.Errorf("renewal 数 = %d，期望 1（无证据不重建、不重试）", n)
 	}
-	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
-		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
+	// 无条件收敛：failed 终态 + 失败通知（阶段 = renewal）。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed（暂时性失败统一收敛）", st, has, err)
 	}
-	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
-		t.Errorf("不得发送任何通知，实际 %d 条", got)
+	recs := h.bark.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("Bark 通知数 = %d，期望 1 条失败通知", len(recs))
+	}
+	msg, _ := json.Marshal(recs[0].Body)
+	for _, want := range []string{"微信读书阅读任务失败", "失败阶段：renewal", "登录 renewal 失败"} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
+		}
+	}
+	if strings.Contains(string(msg), "登录已失效") {
+		t.Errorf("无证据失败不得套登录失效文案；body=%s", msg)
 	}
 }
 
@@ -2138,7 +2277,8 @@ func TestRunLoginInvalidRebuildWithoutInitialCookieFails(t *testing.T) {
 }
 
 // TestRunRenewalNoSuccIsNotLoginInvalid 断言 200 响应不含 succ 字段（如 errCode
-// 错误体）不是"明确拒绝"的证据形态：不重建、不写终态、不发登录失效通知。
+// 错误体）不是"明确拒绝"的证据形态：不重建、不发登录失效通知；无证据的暂时性失败
+// 经统一收敛为 failed 终态 + 普通失败通知（阶段 = renewal）。
 func TestRunRenewalNoSuccIsNotLoginInvalid(t *testing.T) {
 	h := setup(t, func(h *testHarness) {
 		h.weread.renewNoSucc = true
@@ -2154,11 +2294,23 @@ func TestRunRenewalNoSuccIsNotLoginInvalid(t *testing.T) {
 	if n := h.weread.count("/web/login/renewal"); n != 1 {
 		t.Errorf("renewal 数 = %d，期望 1（无证据不重建、不重试）", n)
 	}
-	if _, statErr := os.Stat(filepath.Join(h.cfg.DataDir, terminal.FileName)); !os.IsNotExist(statErr) {
-		t.Errorf("暂时性失败不得写终态（当日可再次调度）")
+	// 无条件收敛：failed 终态 + 失败通知。
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed（暂时性失败统一收敛）", st, has, err)
 	}
-	if got := len(h.bark.snapshot()) + len(h.wecom.snapshot()); got != 0 {
-		t.Errorf("不得发送任何通知，实际 %d 条", got)
+	recs := h.bark.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("Bark 通知数 = %d，期望 1 条失败通知", len(recs))
+	}
+	msg, _ := json.Marshal(recs[0].Body)
+	for _, want := range []string{"微信读书阅读任务失败", "失败阶段：renewal"} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
+		}
+	}
+	if strings.Contains(string(msg), "登录已失效") {
+		t.Errorf("不含 succ 的失败不得套登录失效文案；body=%s", msg)
 	}
 }
 
@@ -2339,7 +2491,7 @@ func TestRunConcurrentSecondTaskRejected(t *testing.T) {
 	done := make(chan struct{})
 	var firstErr error
 	go func() {
-		_, firstErr = h.app.RunTask(ctx, time.Time{})
+		_, firstErr = h.app.RunTask(ctx)
 		close(done)
 	}()
 
@@ -2351,7 +2503,7 @@ func TestRunConcurrentSecondTaskRejected(t *testing.T) {
 	}
 
 	// 第二个 RunTask：锁被持有 → 非阻塞拒绝（不等待第一个完成）。
-	_, err := h.app.RunTask(ctx, time.Time{})
+	_, err := h.app.RunTask(ctx)
 	if err == nil {
 		t.Fatal("运行中应拒绝第二个 Task")
 	}
@@ -2385,7 +2537,7 @@ func TestRunConcurrentSecondTaskRejected(t *testing.T) {
 	}
 
 	// 第三个调用：锁已释放但终态已形成 → 终态规则拒绝。
-	_, err = h.app.RunTask(ctx, time.Time{})
+	_, err = h.app.RunTask(ctx)
 	if !errors.Is(err, ErrTerminalSuccess) {
 		t.Errorf("首个 Task 完成后的调用应落入终态规则（ErrTerminalSuccess），实际: %v", err)
 	}

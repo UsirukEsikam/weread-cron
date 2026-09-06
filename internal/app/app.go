@@ -121,9 +121,9 @@ func notifyChannels(hc *http.Client, cfg *config.Config) []notify.Notifier {
 }
 
 // RunTask 完整执行一次 Task（终态规则门控 + 并发守卫 → Login Session 建立/恢复 →
-// weread 客户端 → 编排）。finalFailureAfter 是暂时性失败的收敛截止时刻（ticket 12；
-// 语义与 scheduler.TaskRunner 一致）：daemon 自动执行注入，手动 run 传零值
-// （不收敛：用户在场，失败由 CLI 呈现，与窗口语义无关）。
+// weread 客户端 → 编排）。手动 run 与 daemon 自动执行使用同一 finalization 语义
+// （ticket 24：一切最终结果都先持久化对应终态、持久化成功后发送对应通知；暂时性
+// 失败无条件收敛为 failed 终态 + 失败通知）。
 // 登录失效重建（ticket 04）：客户端回调读取可变会话句柄 current，重建时由
 // session.Rebuild 替换为新会话（初始 Cookie 重建并覆盖持久化会话）。
 //
@@ -133,7 +133,7 @@ func notifyChannels(hc *http.Client, cfg *config.Config) []notify.Notifier {
 // 第二个 Task（多协程或跨进程 run/daemon）被拒绝返回 ErrTaskRunning——进程内
 // 守卫零 I/O 先行，跨进程守卫（/data 锁文件 + flock，非阻塞）随后；锁未获得方
 // 不等待、不中断运行中的 Task（运行中的 Task 未被中断）。
-func (a *App) RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Result, error) {
+func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 	// 并发守卫先于一切：运行中的 Task 不被第二个 Task 打断（TryLock 非阻塞拒绝）。
 	unguard, err := a.acquireTaskGuard()
 	if err != nil {
@@ -168,10 +168,8 @@ func (a *App) RunTask(ctx context.Context, finalFailureAfter time.Time) (task.Re
 		TargetMinMinutes: a.cfg.ReadMinutesMin,
 		TargetMaxMinutes: a.cfg.ReadMinutesMax,
 		TZ:               a.cfg.TZ,
-		// FinalFailureAfter：暂时性失败的收敛截止时刻（ticket 12；语义见
-		// scheduler.TaskRunner）。daemon 自动执行时注入（窗口结束 - 最短重排间隔）；
-		// 手动 run 为零值 = 不收敛（用户在场，失败由 CLI 呈现）。
-		FinalFailureAfter: finalFailureAfter,
+		// FinalFailureAfter 已移除（ticket 24）：暂时性失败无条件收敛，不再注入
+		// 窗口截止时刻；手动 run 与 daemon 自动执行同一 finalization。
 		RebuildLoginSession: func() error {
 			ns, err := session.Rebuild(a.deps.Sessions, a.cfg.Cookie)
 			if err != nil {

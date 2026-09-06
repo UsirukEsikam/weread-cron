@@ -211,7 +211,7 @@ func TestListBooksRejectedWhileTaskRunning(t *testing.T) {
 	done := make(chan struct{})
 	var taskErr error
 	go func() {
-		_, taskErr = h.app.RunTask(ctx, time.Time{})
+		_, taskErr = h.app.RunTask(ctx)
 		close(done)
 	}()
 	select {
