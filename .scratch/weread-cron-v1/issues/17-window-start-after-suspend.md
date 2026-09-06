@@ -5,7 +5,7 @@
 **Finding:** F7 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** bug
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** daemon 在启动 Task 前复查当前时间仍处于 Run Window 内；挂起导致越过窗口结束时不启动，改排次日。
 
@@ -24,11 +24,11 @@ daemon 在启动 Task 前复查当前时间仍处于 Run Window 内（或按"窗
 
 ## Acceptance criteria
 
-- [ ] 模拟挂起（时间跳变越过窗口结束）后 daemon 不启动 Task，改排次日
-- [ ] 窗口内正常启动（回归）
-- [ ] start==end 固定时刻语义保持
-- [ ] 睡眠期间形成终态 → 跳过自动执行的现有逻辑保持
-- [ ] 新增/更新调度测试覆盖挂起场景
+- [x] 模拟挂起（时间跳变越过窗口结束）后 daemon 不启动 Task，改排次日
+- [x] 窗口内正常启动（回归）
+- [x] start==end 固定时刻语义保持
+- [x] 睡眠期间形成终态 → 跳过自动执行的现有逻辑保持
+- [x] 新增/更新调度测试覆盖挂起场景
 
 ## Out of scope
 
@@ -37,7 +37,19 @@ daemon 在启动 Task 前复查当前时间仍处于 Run Window 内（或按"窗
 
 ## 验证记录
 
-Review 输入 F7 已对当前代码确认：
+## Answer
 
-- daemon 循环：schedule → 睡眠等待 → 终态复查 → 执行 Task；睡眠返回后无窗口时间复查。时间跳变时睡眠立即返回（目标时刻已过），随后照常启动 Task。
-- ADR-0001 / spec 决策 #8：窗口约束开始时间。
+实现「daemon 睡眠/挂起后启动 Task 前复查 Run Window，已过窗口结束不启动、改排次日」（F7）。
+
+1. **纯决策函数 `CanStartAt(now, planned, win)`**（`internal/scheduler/nextstart.go`，与 `NextStart` 同级）：以**计划启动日**（`planned` 所在日）的窗口为基准判定 now 是否仍是可启动时刻——未越过窗口结束（now ≤ 计划日 end）→ 可启动（含恰在结束点，与 NextStart 窗口内立即执行边界一致）；越过后仅当迟到 ≤ `startGrace`（5s，真实时钟睡眠过冲与复查前 I/O 的调度容差；start==end 固定时刻的常规唤醒即此情形，不得误判为挂起）→ 可启动；其余（挂起/恢复造成的时间跳变越过窗口结束）→ 不可启动。窗口只约束开始时刻（ADR-0001），`planned` 恒在窗口内（NextStart 保证），复查即排除"启动时刻越出窗口"。
+2. **daemon 循环复查**（`internal/scheduler/scheduler.go`）：睡眠返回、终态复查（现有跳过逻辑不变，保持在前）之后、执行 Task 之前增加窗口复查；不可启动时记日志 `已越过 Run Window 结束（睡眠期间时间跳变），跳过自动执行，排定次日` 并 `continue`——下一轮 `schedule()` 走 NextStart 的"窗口已过 → 明天窗口随机"（错过不补跑，ADR-0002）。ErrTaskRunning 重试路径与失败排次日路径不受影响（其后的 schedule() 本身已按现时窗口决策）。
+
+### 测试覆盖
+
+- `TestCanStartAt`（调度层单测，表驱动 9 子用例）：窗口内/恰在窗口结束点可启动；挂起跳变越过窗口结束不可启动；计划=窗口结束点的真实时钟过冲（2s，容差内）可启动、超容差不可启动；固定时刻准时/过冲 3s（容差内）可启动、超容差与挂起跳变不可启动。
+- `TestDaemonSkipsStartWhenWindowPassedAfterSuspend`（调度层 daemon 测试，验收 1）：窗口前启动（23:00，[23:30,23:59]）、睡眠期间时钟跳变至次日 00:05 → 不启动 Task（调用 0 次、无执行日志）、排定次日 2025-09-07。
+- `TestDaemonStartsAtFixedTimeWindow`（验收 3）：start==end 固定 02:00 窗口准点唤醒照常执行 Task、success 终态落盘、排定次日。
+- 回归保持：`TestDaemonExecutesTaskAndSchedulesNextDay`（应用 seam，验收 2）、`TestDaemonStartsImmediatelyInsideWindowAtStartup`、`TestDaemonRechecksTerminalBeforeStart`（验收 4，睡眠期间终态跳过不变）、ErrTaskRunning 并发拒绝/失败排次日/取消退出等全部通过。
+- 全部验证：`go test ./...`、`go vet ./...`、gofmt 通过。反向验证：临时移除窗口复查后 `TestDaemonSkipsStartWhenWindowPassedAfterSuspend` 如期失败（挂起越窗会照常启动），确认测试真实覆盖 F7。
+
+**Commit:** 58d3da6（fix）· 2b06640（docs）
