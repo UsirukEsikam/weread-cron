@@ -5,7 +5,7 @@
 **Finding:** F8 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** enhancement（lifecycle/shutdown 完善，非 correctness blocker，可作较低优先级）
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** Task 内 timed report 的间隔等待感知 ctx 取消，关停信号及时生效，与 daemon 的响应度对齐。
 
@@ -31,13 +31,13 @@ Reading Session 循环用 Clock.Sleep 等待下一个 report 时刻；生产实�
 
 ## Acceptance criteria
 
-- [ ] report 间隔等待期间 ctx 取消 → Task 在约定上界内退出（如 ≤2s 分片或等价上界）
-- [ ] 取消退出不写 success/failed Terminal State、不发最终 Task notification（取消不是业务最终失败）
-- [ ] 取消路径不累计 timed-report transport failures、不触发 finalizeTransient，当天不被错误标记为 failed
-- [ ] 取消退出后当天无终态：daemon 重启按"无 Terminal State"异常启动规则（窗口内立即执行）重新执行（回归与新增覆盖）
-- [ ] 正常 report 节奏与 rt 计算不回归（回归测试保持）
-- [ ] 取消不产生额外的 timed report
-- [ ] daemon 侧取消响应保持现有行为
+- [x] report 间隔等待期间 ctx 取消 → Task 在约定上界内退出（如 ≤2s 分片或等价上界）
+- [x] 取消退出不写 success/failed Terminal State、不发最终 Task notification（取消不是业务最终失败）
+- [x] 取消路径不累计 timed-report transport failures、不触发 finalizeTransient，当天不被错误标记为 failed
+- [x] 取消退出后当天无终态：daemon 重启按"无 Terminal State"异常启动规则（窗口内立即执行）重新执行（回归与新增覆盖）
+- [x] 正常 report 节奏与 rt 计算不回归（回归测试保持）
+- [x] 取消不产生额外的 timed report
+- [x] daemon 侧取消响应保持现有行为
 
 ## Out of scope
 
@@ -57,3 +57,25 @@ Review 输入 F8 已对当前代码确认：
 - #24 未改动 clock / task 的等待路径：`task.Run` 的 timed report 循环仍 `Clock.Sleep`（生产 time.Sleep）等待，全链路无 `ctx.Err()` 检查。
 - 取消的 ctx 使 report 请求以传输级错误失败并计入 consecutiveFailures；#24 起 finalizeTransient 无条件收敛（不再检查窗口截止时刻），达预算（3 次，最多约 90s）后写入 failed 终态、失败通知因 ctx 已取消而发送失败。单次阶段（renewal / 选书 / enter）的取消即立即收敛。
 - "取消 = 正常退出、不形成终态"在 #24 后不再是现状描述，已按本 brief 的语义决定改写 Current behavior / Desired behavior / Acceptance criteria / Out of scope。
+
+## Answer
+
+实现「取消感知的 report 间隔等待 + 取消生命周期」（F8）。
+
+1. **分片等待**（`internal/task/task.go`）：timed report 间隔等待从不可打断的 `Clock.Sleep` 改为 `waitUntil(ctx, clock, next)`——`reportWaitChunk = 2s` 分片、每片醒来检查 `ctx.Err()`（与 daemon `sleepUntil` 同一形态；Clock 抽象语义不变，分片由 Task 层承担）。取消响应延迟 ≤2s；正常 report 节奏与 rt（ADR-0004）不受影响。
+2. **取消识别先于统一 finalization**：`finalizeTransient` 入口检查 ctx 已取消 → `cancelledExit`（不写 failed 终态、不发通知，返回包装 `ctx.Err()` 的错误，`errors.Is(err, context.Canceled)` 判别贯通）——覆盖 renewal / Shelf 抓取 / Reader Context / enter / timed 预算 / 恢复链暂时性终止；不经 finalizeTransient 的失败（选书"无可用书"）在 `failBookSelection` 入口与探测循环做同样检查（取消时探测失败不是书不可用证据）。
+3. **循环内取消不累计失败预算**：循环顶部、间隔等待、Reader Context 刷新失败、timed report 传输级失败四处检查 ctx——取消的 HTTP 错误（context canceled）不进入 consecutiveFailures、不会达预算后经 finalizeTransient 收敛为 failed。
+4. **CLI 呈现**（`internal/cli/cli.go`）：`run` 收到 `context.Canceled` → stderr 说明"已取消，未形成终态（可重新运行）"、退出码 0（与 daemon"取消 = 正常退出"一致）；不再误报"Task 失败"（ExitConfig 1）。daemon 侧取消响应保持现有行为（`ctx.Err() != nil` → "daemon 退出"返回 nil）。
+
+### 测试覆盖
+
+- `TestRunCancelDuringReportWaitExitsWithoutTerminal`（验收 1/2/3/5）：pinClock 把节奏等待钉住，取消后在分片上界内退出（≤5s）、错误判别 context.Canceled、无终态、无通知、无额外 timed report。
+- `TestRunCancelBeforeStartExitsWithoutTerminal`（验收 3）：启动前已取消（renewal 以 ctx 错误失败）→ 不收敛为 failed 终态。
+- `TestRunCancelDuringTimedReportExitsWithoutTerminal`（验收 3）：timed report 在途取消——fake 服务端经 `r.Context().Done()` 判别客户端断开（timedAbortNotify），确认在途请求以传输级错误失败、不累计失败预算、不触发 finalizeTransient。
+- `TestRunCancelDuringBookSelectionExitsWithoutTerminal`（验收 2/3）：自动选书探测期间取消 → failBookSelection 不写 failed 终态（评审跟进：选书取消路径不经 finalizeTransient，需独立检查；反向验证——临时移除该检查后测试如期失败）。
+- `TestDaemonCancelDuringTaskRunExitsAndRestartReexecutes`（验收 4/6）：daemon 内真实 Task 于节奏等待中取消 → "daemon 退出"正常返回 nil、无终态；重启后无终态 + 窗口内 → 立即重新执行并形成 success 终态（通知恰 1 条、report 总数 4 = 取消前 enter + 重跑 enter+2×timed）。
+- `TestRunTaskCancelledExitsOK`（CLI seam）：`run` 取消 = 退出码 0 + "已取消"提示，不误报 Task 失败。
+- 回归保持：`TestRunHappyPath`（节奏/rt）、`TestRunTimedReportBudgetExhaustedConvergesToFailedTerminal`（预算收敛与取消明确区分）、`TestRunAbnormalIntervalRebuildsSession` / `TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext`（挂起跳变）、`TestDaemonStopsOnCancel` / `TestDaemonExecutesTaskAndSchedulesNextDay`（daemon 取消/闭环）等全部通过。
+- 全部验证：`go test ./...`、`go vet ./...`、gofmt（本票文件）通过；`internal/weread/protocol.go` 的 gofmt 差异为存量问题（改动前已存在，不在本票范围）。取消相关测试 `-count=5` 重复运行稳定。
+
+**Commits:** b4f44f3（fix）· 待提交（docs）
