@@ -5,7 +5,7 @@
 **Finding:** F4 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** bug
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** Reading Progress 构造区分"字段缺失"与"显式零值"，合法显式零值不被错误回退。
 
@@ -25,11 +25,11 @@
 
 ## Acceptance criteria
 
-- [ ] currentChapter 显式 chapterIdx=0 / chapterOffset=0（且与 progress.book 不同）时采用 currentChapter 值
-- [ ] currentChapter 缺失时仍回退 progress.book（回归）
-- [ ] 非零优先的现有用例保持通过
-- [ ] 章节 UID 缺失的错误判定保持
-- [ ] 数字与字符串两种 JSON 形式的零值均可正确解析
+- [x] currentChapter 显式 chapterIdx=0 / chapterOffset=0（且与 progress.book 不同）时采用 currentChapter 值
+- [x] currentChapter 缺失时仍回退 progress.book（回归）
+- [x] 非零优先的现有用例保持通过
+- [x] 章节 UID 缺失的错误判定保持
+- [x] 数字与字符串两种 JSON 形式的零值均可正确解析
 
 ## Out of scope
 
@@ -42,3 +42,23 @@ Review 输入 F4 已对当前代码确认：
 
 - 解析层数值类型仅存数值、无存在性标志；ReadingProgress 以 `== 0` 判定缺失并回退（chapterIdx / chapterOffset / chapterUid 同理）。
 - 现有测试覆盖非零优先、currentChapter 缺失回退、数字/字符串形式，未覆盖"currentChapter 显式零值且与回退值不同"的用例。
+
+## Answer
+
+实现「Reading Progress 区分字段缺失与显式零值」（F4；解析层 seam，ADR-0006 范围内纯逻辑）。
+
+1. **方案：数值类型携带存在性标志（ticket Key interfaces 的两个备选之一）**：`flexInt`/`flexUint64` 增加 `present bool`——字段缺失（或 JSON null）记为缺失，字段存在（含显式 0）记为存在，`Present()` 访问；`UnmarshalJSON` 中显式 0 与 `"0"` 均置 present=true，null 置 present=false。未采用指针形态——`Present()` 保持原访问风格，`ReadingProgress` 其余调用点（`Int()`/`Uint64()`）零改动，diff 最小。`flexUint64` 同样携带 presence（虽当前 chapterUid 仍以 `== 0` 判定）——Key interfaces 要求数值解析类型携带存在性，且"chapterUid=0 仍视为无位置"的例外本就留门（"除非确认章节 UID 可为 0"），两类型保持对称。
+2. **解析分辨率按字段拆分**：`chapterIdx`/`chapterOffset` 从 `== 0`（数值判定）改为存在性判定——字段存在时按字面采用 currentChapter 值（含显式 0），仅字段缺失时回退 progress.book；`chapterUid` 保持 `== 0` 视为无位置（显式 0 与缺失同样回退，两源皆无 → 报错），与 Key interfaces 的"chapterUid=0 仍视为无位置（现有错误判定不变）"一致。
+3. **按字段独立解析（顺带固定的行为）**：currentChapter 缺 chapterUid 但 chapterIdx/offset 显式 0 时，chapterUid 回退、零值字段仍按字面采用（每字段各自判定，不整体回退）。
+4. **JSON null = 缺失**：`null` 与字段缺失同语义（均回退），与旧行为（null → 0 → 回退）一致。
+5. **顺带修正**：本文件 `InitialState.Reader` 结构体 Psvts/Pclts/Token 三行沿用既有 gofmt 对齐偏差（HEAD 版本即已存在），已一并对齐使本文件 gofmt-clean；`protocol.go`/`report.go` 的既有 gofmt 偏差不在本票范围，未动。
+
+### 测试覆盖（应用 seam，ADR-0006）
+
+- `TestParseInitialStateExplicitZeroChapterFields`（新增，表驱动 3 子用例）：数字零值、字符串零值、uid 缺失时 idx/offset 显式零仍采用——均断言显式 `0` 不被 progress.book 回退值（7/9）覆盖。
+- `TestParseInitialStateChapterUIDZeroMeansNoPosition`（新增，表驱动 3 子用例）：cc 显式 chapterUid=0 回退 pb（0 仍视为无位置）、cc null 视为缺失回退 pb、两源皆显式 0 报错（错误语义保持）。
+- 回归保持：非零优先（`TestParseInitialStatePrecedence`）、currentChapter 缺失回退（`TestParseInitialStateProgressFieldFallback`）、数字/字符串形式（`TestParseInitialStateOffsetAsNumber`）、无章节位置报错（`TestParseInitialStateNoChapter`）、非法数字报错（`TestFlexIntsRejectGarbage`）。
+- 全部验证：`go test ./...` + `go vet ./...` 通过。
+
+**Commit:** cd5300b
+
