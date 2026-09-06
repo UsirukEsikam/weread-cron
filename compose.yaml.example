@@ -1,21 +1,5 @@
-# weread-cron 部署模板（ticket 20）：复制为 compose.yaml 后修改本地部署值。
-#
-# 使用：
-#   cp compose.yaml.example compose.yaml   # 本地部署文件（已被 .gitignore 忽略）
-#   cp .env.example .env                   # 至少填写 WEREAD_CRON_COOKIE
-#   docker compose up -d                   # （可先 docker compose config 校验）
-#
-#   - 镜像为本仓库发布的 GHCR 多架构清单（linux/amd64 + linux/arm64），Apple
-#     Silicon / x86_64 Linux 自动拉取对应架构；fork 后自行发布的场景见 README
-#     「镜像」章节；
-#   - /data 为 Docker named volume（weread-cron-data），存放 Login Session 与
-#     Terminal State（应用内部状态；丢失后需重新提供 WEREAD_CRON_COOKIE，见
-#     README「/data 卷要求」）；
-#   - 全部配置经环境变量（前缀 WEREAD_CRON_，ADR-0005），从 .env 读取。
-#
-# compose.yaml 是本地部署状态（含本地修改），不入 Git；模板更新后与新模板 diff
-# 合并即可。开发/定制部署可自行改挂本地目录（如 ./data:/data），data/ 同样不入
-# Git。
+# weread-cron 部署模板
+# 复制为 compose.yaml 后使用。
 
 services:
   weread-cron:
@@ -24,14 +8,11 @@ services:
     env_file:
       - .env
     environment:
-      # TZ 镜像内默认 Asia/Shanghai（二进制内嵌 tzdata）；此处展示 compose 级
-      # 覆盖入口（在 .env 里改 TZ 即可，例如 TZ=Asia/Shanghai）。
       TZ: ${TZ:-Asia/Shanghai}
     volumes:
       - weread-cron-data:/data
 
 volumes:
-  # named volume：卷名固定为 weread-cron-data（不随 compose 项目名变化），容器
-  # 重建不丢数据；重置见 README「/data 卷要求」。
   weread-cron-data:
+    # 固定数据卷名称，避免因目录变动导致新建卷而丢失数据
     name: weread-cron-data
