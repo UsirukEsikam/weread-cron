@@ -6,7 +6,7 @@
 **Category:** bug
 **Blocked by:** None
 **Related:** ticket 06（Reading Session 维护 / 异常间隔重建）、ADR-0004（大缺口不构成阅读时长）、ticket 27 / ticket 29（同源 findings/07，各自独立）
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Agent Brief
 
@@ -32,12 +32,12 @@
 - 循环相关注释需同步（现注释声称"重试延迟自然并入下一次 rt"，与超限时重建的规则须一致表述）。
 
 **Acceptance criteria:**
-- [ ] 恢复链内某次重试被接受且该笔 `rt` 超过异常阈值时，不累计该 `rt`，而是重建 Reading Session（新的 enter report），Task 继续。
-- [ ] 按 findings/07 H2 的确定性复现（恢复期间时间跳变）运行，程序永不发送/累计超限 `rt`（如 `rt=130`）；Target Duration 1 分钟的 Task 不得凭单笔超限上报提前完成。
-- [ ] 阈值内的重试延迟仍并入下一笔被接受的 `rt`（用户故事 #28 回归）。
-- [ ] 正常路径阻塞耗时（如慢速 Reader Context 抓取把上报推迟到阈值之外）服从同一连续性规则，不产生超限 `rt`。
-- [ ] 阈值边界行为与现有一致（恰等于阈值不触发重建；现有 `TestRunAbnormalIntervalRebuildsSession` 回归通过）。
-- [ ] `go test -count=1 -race ./...` 全部通过。
+- [x] 恢复链内某次重试被接受且该笔 `rt` 超过异常阈值时，不累计该 `rt`，而是重建 Reading Session（新的 enter report），Task 继续。
+- [x] 按 findings/07 H2 的确定性复现（恢复期间时间跳变）运行，程序永不发送/累计超限 `rt`（如 `rt=130`）；Target Duration 1 分钟的 Task 不得凭单笔超限上报提前完成。
+- [x] 阈值内的重试延迟仍并入下一笔被接受的 `rt`（用户故事 #28 回归）。
+- [x] 正常路径阻塞耗时（如慢速 Reader Context 抓取把上报推迟到阈值之外）服从同一连续性规则，不产生超限 `rt`。
+- [x] 阈值边界行为与现有一致（恰等于阈值不触发重建；现有 `TestRunAbnormalIntervalRebuildsSession` 回归通过）。
+- [x] `go test -count=1 -race ./...` 全部通过。
 
 **Out of scope:**
 - H1（恢复性 enter 重置失败预算）与 H4（终态持久化失败丢失错误身份）各自独立 ticket（27/29），不并入本票。
@@ -48,3 +48,21 @@
 ## 验证记录（triage）
 
 已对照 `internal/task/task.go` 确认：连续性检查仅位于循环顶部（约 L342–343）；`recoverSend` 重试步骤（约 L520–526）以 `o.Clock.Now()` 重算 `rt` 并在成功时返回 `(current, rt, t, nil)`，调用侧直接 `accumulated += rt`（约 L392–394），无阈值复查。附带边界确认：循环内 `now` 在阻塞式 Reader Fetch（约 L345–355 区域）之前取得。现有测试均以快速 fake server 运行，未覆盖"恢复期间时钟跳变 → 超限 rt 被接受"路径。
+
+## Answer
+
+全部验收通过。修复：`internal/task/task.go` timed report 循环把连续性判定移入 send 闭包——首次尝试与恢复链内每次重试（重试时刻重算 `rt`）共用同一规则：`rt` 超过异常阈值时返回内部哨兵 `errIntervalOverThreshold`、不发送该笔间隔（绝不落线），由调用方重建 Reading Session；时间基准（`now`）移至阻塞式 `Reader.Fetch` 之后（阻塞耗时服从同一连续性边界）。
+
+1. **AC1/AC2（恢复链内重试超限不落线）**：新增 `TestRunRecoveryRetryOverThresholdRebuildsNotOversizedRT`——`timedRejects=1` + 恢复链 refresh 挂起期间推进墙钟 130s（确定性复现 findings/07 H2 的"恢复期间时间跳变"）：重试时刻 rt=160 > 阈值 90s → 不发送、终止链 → 重建 enter（用刷新后的新 Context）→ Task 继续；线上序列无任何超限 `rt`、`Actual=1 分钟/Reports=2`（Target 1 分钟不凭单笔超限上报提前完成）。修复前：重试直接发送 rt=160、按累计 160s 完成。
+2. **AC3（阈值内重试延迟并入下一笔 rt）回归**：`TestRunRecoveryChainFirstRetrySucceeds` / `TestRunTimedReportTransientFailureContinuesSession`（rt=60 并入）等未改动且通过。
+3. **AC4（正常路径阻塞耗时）**：新增 `TestRunSlowReaderFetchBeyondThresholdRebuildsNotOversizedRT`——TTL 到期主动刷新（第 2 次 Reader 页抓取）挂起 120s → 该节奏点实际间隔 150s > 阈值 → 慢速抓取后直接重建 enter（不发送跨断口 timed；修复前以旧基准发送 rt=30、重建被推迟到下一节奏点）；20 分钟目标照常完成、缺口不计入。
+4. **AC5（阈值边界）**：`TestRunAbnormalIntervalRebuildsSession` / `TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext` 未改动且通过（`> 阈值` 才重建的既有整秒边界不变；判定比较形式与既有实现一致）。
+5. **AC6**：`go test -count=1 -race ./...` 全部通过。
+
+**附带的收敛补充**（code-review Spec 轴提示，避免本票引入回归）：恢复链内断链（重试步超限终止）以 `chainStop` 载体返回并计入连续失败预算——"拒绝 + 慢恢复把每轮重试都推过阈值"的循环在 `DefaultMaxConsecutiveReportFailures` 内收敛为 failed 终态 + 失败通知（预算只在被接受的 timed report 清零，ticket 27 语义；旧实现同场景由链 5 步耗尽收敛，修复后链在第 1 步即终止，收敛责任转移到预算）。新增 `TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal`：3 轮 = timed(拒) → refresh(慢 70s) → 断链 → 重建 enter，第 3 轮预算耗尽收敛，超限 `rt` 从未落线；无此约束时该循环无限重建（Task 锁被长期占用，同 H1 影响类）。首次尝试的连续性断链（非拒绝路径）不计入预算：其后必然接一笔 ≤ 阈值的上报或其它失败路径，天然有界（ticket 06/27 既有测试锚定该行为不变）。
+
+边界遵守：未动恢复链 5 步结构、重试语义（每步重算 rt）、内部默认值（节奏/阈值/预算数值，spec 决策 #13 / ADR-0005）、payload 协议字段与配置面（H1 已由 ticket 27 修复、H4 属 ticket 29，均未并入本票）。
+
+code-review（Standards + Spec 双轴）结论均为 OK with notes：Standards 轴 P2 为既有整秒边界在 (90s, 91s) 区间与 ADR 字面表述的差异（本票按"不改动边界"要求保留，注释按既有整秒边界措辞）；Spec 轴 P2 为上述收敛补充（已实现 + 组合测试）。
+
+**Commit:** 待提交

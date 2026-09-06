@@ -136,11 +136,27 @@ type fakeWeread struct {
 	// 的释放 channel（ticket 27）。
 	slowFailGate chan chan struct{}
 
+	// readerFetchGate 非 nil 时，每一笔 Reader 页请求在响应前经 gate 从测试取一个
+	// 释放 channel，等待其关闭后才响应（注入"慢速抓取"：抓取耗时推进墙钟，把恢复
+	// 链重试时刻推过异常间隔阈值；ticket 28 拒绝 + 慢恢复循环的收敛场景）。挂起
+	// 期间客户端断开（ctx 取消）经 r.Context().Done() 感知返回。测试每次经
+	// slowRefreshOnce 提供一个新释放 channel。
+	readerFetchGate chan chan struct{}
+
 	// blockReader 非 nil 时，下一笔 Reader 页请求到达后等待 channel 关闭才响应
 	// （blockReaderTriggered 为到达信号）；挂起期间客户端断开（ctx 取消）经
 	// r.Context().Done() 感知返回（ticket 18 选书取消测试用）。
 	blockReader          chan struct{}
 	blockReaderTriggered chan struct{}
+
+	// blockReaderAt > 0 时第 N 次 Reader 页请求到达后等待 blockReaderRelease 关闭
+	// 才响应（blockReaderTriggeredAt 为到达信号；一次性，仅阻塞第 N 次）。挂起期间
+	// 测试推进墙钟模拟阻塞耗时（ticket 28：慢速 Reader Context 抓取把上报推迟到
+	// 异常阈值之外 / 恢复链 refresh 挂起期间时钟跳变）。与 blockReader（阻塞全部
+	// 请求）区分。
+	blockReaderAt          int
+	blockReaderTriggeredAt chan struct{}
+	blockReaderRelease     chan struct{}
 
 	// shelfBooks 是 /web/shelf/sync 返回的书架条目（默认 nil = 空书架）。
 	shelfBooks []fakeShelfBook
@@ -299,12 +315,43 @@ func (f *fakeWeread) handleReaderPage(w http.ResponseWriter, r *http.Request) {
 	if f.readerFailFrom > 0 && n >= f.readerFailFrom {
 		fail = true
 	}
+	blockAt := f.blockReaderAt
+	triggeredAt := f.blockReaderTriggeredAt
+	release := f.blockReaderRelease
 	enc := f.lastReaderEncoded
 	perBookFail := f.readerFailByBook[enc]
 	perBookNoState := f.readerNoStateByBook[enc]
 	progressOverride, hasProgress := f.readerProgressByBook[enc]
 	titleOverride, hasTitle := f.readerTitleByBook[enc]
 	f.mu.Unlock()
+	if blockAt > 0 && n == blockAt {
+		// ticket 28：第 N 次 Reader 页抓取（如 TTL 到期主动刷新 / 恢复链 refresh）
+		// 挂起；测试在此期间推进墙钟模拟阻塞耗时，挂起期间客户端断开（ctx 取消）
+		// 经 r.Context().Done() 感知返回。
+		if triggeredAt != nil {
+			select {
+			case triggeredAt <- struct{}{}:
+			default:
+			}
+		}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}
+	if f.readerFetchGate != nil {
+		// ticket 28：每一笔 Reader 页抓取（含初始抓取与恢复链 refresh）都经 gate
+		// 从测试取释放 channel 并等待其关闭；挂起期间客户端断开（ctx 取消）经
+		// r.Context().Done() 感知返回。
+		select {
+		case release := <-f.readerFetchGate:
+			select {
+			case <-release:
+			case <-r.Context().Done():
+			}
+		case <-r.Context().Done():
+		}
+	}
 	if fail || perBookFail {
 		if f.readerRejectCookies {
 			http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "TRAPREADER", Path: "/"})
@@ -671,6 +718,46 @@ func (h *testHarness) slowFailOnce(d time.Duration) {
 	case h.weread.slowFailGate <- release:
 	case <-time.After(10 * time.Second):
 		h.t.Fatal("慢失败 timed report 未在 10s 内到达（Task 可能未按预期发送该笔上报）")
+	}
+	h.advance(d)
+	close(release)
+}
+
+// blockFetchAt 是慢速 Reader Context 抓取的确定性注入助手（ticket 28）：配置第 n
+// 次 Reader 页请求挂起，等待其到达（blockReaderTriggeredAt 信号）后推进 d 的墙钟、
+// 关闭释放 channel 使该次抓取完成——模拟阻塞式 Fetch 把实际发送时刻推迟到异常
+// 阈值之外（loop-top TTL 刷新 / 恢复链 refresh 挂起期间时钟跳变）。挂起期间客户端
+// 断开（ctx 取消）经 handler 感知返回。若该次请求未在超时内到达则失败。
+func (h *testHarness) blockFetchAt(n int, d time.Duration) {
+	h.t.Helper()
+	f := h.weread
+	f.mu.Lock()
+	f.blockReaderAt = n
+	f.blockReaderTriggeredAt = make(chan struct{}, 1)
+	f.blockReaderRelease = make(chan struct{})
+	release := f.blockReaderRelease
+	f.mu.Unlock()
+	select {
+	case <-f.blockReaderTriggeredAt:
+	case <-time.After(10 * time.Second):
+		h.t.Fatal("被挂起的 Reader 页请求未在 10s 内到达")
+	}
+	h.advance(d)
+	close(release)
+}
+
+// slowRefreshOnce 让下一笔 Reader 页抓取在响应前推进 d 的墙钟（ticket 28：慢速
+// refresh——把恢复链重试时刻推过异常阈值的循环注入）。向 readerFetchGate 发送一个
+// 释放 channel 并阻塞到该请求到达且被挂起（确定性同步：Fake 时钟的 Sleep 瞬时
+// 推进，只能由测试在请求在途时 Advance 模拟耗时）；随后推进时钟 d、关闭释放
+// channel 使该笔抓取完成。若请求未在超时内到达（如 Task 已收敛终止）则失败。
+func (h *testHarness) slowRefreshOnce(d time.Duration) {
+	h.t.Helper()
+	release := make(chan struct{})
+	select {
+	case h.weread.readerFetchGate <- release:
+	case <-time.After(10 * time.Second):
+		h.t.Fatal("被挂起的 Reader 页请求未在 10s 内到达（Task 可能已收敛终止）")
 	}
 	h.advance(d)
 	close(release)
@@ -1360,6 +1447,257 @@ func TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext(t *testing.T) {
 	}
 	if res.Actual != time.Minute || res.Reports != 2 {
 		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次（缺口不计入）", res.Actual, res.Reports)
+	}
+}
+
+// --- ticket 28（findings/07 H2）：恢复链重试 / 阻塞式工作的大间隔连续性复查 ---
+
+// TestRunRecoveryRetryOverThresholdRebuildsNotOversizedRT 断言 findings/07 H2 的
+// 确定性复现（ticket 28）：timed report 被拒后进入恢复链，恢复期间发生时间跳变
+// （时钟越过异常阈值）——恢复链内重试按重试时刻重算 rt，若已超异常阈值则不得把
+// 该间隔作为一笔大 rt 上报（绝不落线），而是终止链并按 ADR-0004 重建 Reading
+// Session（重新 enter；Task 继续、累计保留）。修复前：重试直接发送超限 rt（本例
+// 160）、被接受后按累计 160 秒完成（Target 1 分钟提前达标、缺口计作阅读时长）。
+func TestRunRecoveryRetryOverThresholdRebuildsNotOversizedRT(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejects = 1         // 仅首笔 timed 拒绝 → 进入恢复链
+		h.weread.rotateReaderState = true // 恢复链 refresh 后 Context 变化可判别
+	})
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var res task.Result
+	var runErr error
+	go func() {
+		res, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 等待恢复链的 refresh（第 2 次 Reader 页抓取）到达并被挂起；挂起期间推进墙钟
+	// 130s（恢复期间时间跳变：重试时刻距上次被接受上报的间隔 > 异常阈值 90s）。
+	h.blockFetchAt(2, 130*time.Second)
+
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("重建后 Task 应继续完成: %v", runErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Task 未在 30s 内完成")
+	}
+
+	// ---- 累计不包含超限间隔：只有被接受的 rt（30+30）入账，Target 1 分钟；
+	//      恢复期间的 130s 缺口绝不作为阅读时长。 ----
+	if res.Actual != time.Minute || res.Reports != 2 {
+		t.Errorf("Result = actual:%v reports:%d，期望 1 分钟/2 次（缺口不计入）", res.Actual, res.Reports)
+	}
+
+	// ---- 线上按序：renewal → refresh → enter → timed(拒) → refresh(挂起/跳变) →
+	//      enter(重建) → timed(rt=30) → timed(rt=30)；无任何超限 rt。 ----
+	h.assertRequestSequence("renewal", "refresh", "enter", "timed", "refresh", "enter", "timed", "timed")
+	reports := h.reportRecords()
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		if p["rt"] != "30" {
+			t.Errorf("timed[%d].rt = %s，期望 30（超限间隔绝不作为大 rt 上报）", i, p["rt"])
+		}
+	}
+	// 重建 enter 使用恢复链刷新后的新 Context（token-2/psvts-2）。
+	if ps := payloadFromWire(t, reports[2].Body)["ps"]; ps != "fake-psvts-2" {
+		t.Errorf("重建 enter.ps = %s，期望恢复链刷新后的新 Context（psvts-2）", ps)
+	}
+	// 重建后的 timed 使用同一新 Context（sg 按 token-2 重算）。
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		if i == 1 {
+			verifySG(t, p, "fake-reader-token-1")
+		} else {
+			verifySG(t, p, "fake-reader-token-2")
+		}
+	}
+
+	// ---- success 终态 + 成功通知（无失败通知）。 ----
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultSuccess {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 success", st, has, err)
+	}
+	if got := len(h.bark.snapshot()); got != 1 || h.bark.snapshot()[0].Body["title"] != "微信读书阅读任务完成" {
+		t.Errorf("应只有 1 条成功通知，实际 %d 条: %+v", got, h.bark.snapshot())
+	}
+}
+
+// TestRunSlowReaderFetchBeyondThresholdRebuildsNotOversizedRT 断言 findings/07 附带
+// 边界（ticket 28 AC4）：正常路径的时间基准在阻塞式 Reader Context 抓取（TTL 到期
+// 主动刷新）之后取得——慢速抓取把实际间隔推迟到异常阈值之外时，该笔 timed report
+// 不得发送（不产生跨断口的上报），而是直接重建 Reading Session（重新 enter；Task
+// 继续、累计保留）。修复前：now 在 Fetch 之前取得，慢速抓取后的上报仍以旧基准计算
+// rt=30 并发送（物理上跨 150s 断口），重建被推迟到下一节奏点。
+func TestRunSlowReaderFetchBeyondThresholdRebuildsNotOversizedRT(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.rotateReaderState = true
+		h.cfg.ReadMinutesMin = 20 // 跨越 TTL（900s）：第 30 笔 timed 前触发主动刷新
+		h.cfg.ReadMinutesMax = 20
+	})
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var res task.Result
+	var runErr error
+	go func() {
+		res, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 第 2 次 Reader 页抓取 = TTL（900s）到期的 loop-top 主动刷新：挂起它并推进墙钟
+	// 120s（阻塞耗时使该节奏点的实际间隔 = 30+120 = 150s > 阈值 90s）。
+	h.blockFetchAt(2, 120*time.Second)
+
+	select {
+	case <-done:
+		if runErr != nil {
+			t.Fatalf("重建后 Task 应继续完成: %v", runErr)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Task 未在 30s 内完成")
+	}
+
+	// ---- 慢速抓取越过阈值后必须直接重建 enter，不得先发一笔跨断口的 timed；
+	//      全部 timed 的 rt 均为 30（无超限、无跨断口失真上报）。 ----
+	kinds := h.requestKinds()
+	refreshSeen := 0
+	for i, k := range kinds {
+		if k != "refresh" {
+			continue
+		}
+		refreshSeen++
+		if refreshSeen == 2 && (i+1 >= len(kinds) || kinds[i+1] != "enter") {
+			t.Errorf("慢速 Fetch 越过阈值后应直接重建 enter（不发送跨断口 timed）；序列=%v", kinds)
+		}
+	}
+	reports := h.reportRecords()
+	timedCount, enterCount, lastEnter := 0, 0, -1
+	for i, rec := range reports {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			enterCount++
+			lastEnter = i
+			continue
+		}
+		timedCount++
+		if p["rt"] != "30" {
+			t.Errorf("timed[%d].rt = %s，期望 30（阻塞耗时不得成为超限/失真 rt）", i, p["rt"])
+		}
+	}
+	if enterCount != 2 {
+		t.Errorf("enter 数 = %d，期望 2（初始 + 慢速 Fetch 越过阈值后的重建）", enterCount)
+	}
+	// 重建 enter 使用慢速抓取后（越过 TTL）重抓的新 Context（psvts-2）。
+	if lastEnter < 0 || payloadFromWire(t, reports[lastEnter].Body)["ps"] != "fake-psvts-2" {
+		t.Errorf("重建 enter.ps = %s，期望慢速抓取后的新 Context（psvts-2）", payloadFromWire(t, reports[lastEnter].Body)["ps"])
+	}
+
+	// ---- 累计只含被接受的 rt：20 分钟目标（40 × 30s）照常完成，缺口不计入。 ----
+	if res.Actual != 20*time.Minute || res.Reports != 40 {
+		t.Errorf("Result = actual:%v reports:%d，期望 20 分钟/40 次（缺口不计入）", res.Actual, res.Reports)
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultSuccess {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 success", st, has, err)
+	}
+}
+
+// TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal 断言拒绝 + 慢恢复
+// 循环的有界收敛（ticket 28 与 spec 决策 #7/#9/#12）：服务器持续拒绝 timed、且每
+// 轮恢复链的 refresh 都慢到把重试时刻推过异常阈值——恢复链在重试步因连续性断链
+// 提前终止（超限 rt 不落线）、重建 enter 被接受后 Task 继续；若无预算约束该循环
+// 将无限重建（旧实现中同场景由链在 5 步内耗尽收敛，修复后链在第 1 步即终止，收敛
+// 责任转移到连续失败预算）。预算只在"被接受的 timed report"清零（ticket 27），
+// 恢复链内断链计入预算后 Task 在 3 轮内收敛为 failed 终态 + 失败通知（含已尝试
+// 恢复动作）。
+func TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true                      // timed 一律拒绝；enter 接受
+		h.weread.readerFetchGate = make(chan chan struct{}) // 每笔 Reader 抓取响应前等待测试放行
+	})
+
+	ctx := context.Background()
+	done := make(chan struct{})
+	var runErr error
+	go func() {
+		_, runErr = h.app.RunTask(ctx)
+		close(done)
+	}()
+
+	// 每笔 Reader 页抓取都慢 70s（> 节奏 30s，把重试时刻推过阈值 90s）：初始抓取
+	// 不推进墙钟；随后每轮恢复链 refresh 推进 70s → 重试时刻 rt=100 > 90 → 连续性
+	// 断链 → 重建 enter。第 3 轮断链预算耗尽（cf=3）→ 收敛为 failed，不无限重建。
+	h.slowRefreshOnce(0) // 初始 Reader 页抓取
+	h.slowRefreshOnce(70 * time.Second)
+	h.slowRefreshOnce(70 * time.Second)
+	h.slowRefreshOnce(70 * time.Second)
+
+	select {
+	case <-done:
+		if runErr == nil {
+			t.Fatal("拒绝 + 慢恢复循环应在预算内收敛为失败")
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Task 未在 30s 内收敛（连续性断链可能无限重建，锁被长期占用）")
+	}
+	if errors.Is(runErr, report.ErrRejected) {
+		t.Errorf("连续性断链收敛不得归类为服务器拒绝: %v", runErr)
+	}
+	if !strings.Contains(runErr.Error(), "连续 3 次暂时性失败") {
+		t.Errorf("错误应说明连续失败预算；实际: %v", runErr)
+	}
+
+	// ---- 线上按序：三轮 = timed(拒) → refresh(慢) → [断链] → enter(重建)；第 3 轮
+	//      断链预算耗尽（不再重建）；Reader 页 4 次（初始 + 3 轮刷新）；超限 rt 从未
+	//      落线。 ----
+	h.assertRequestSequence(
+		"renewal", "refresh", "enter",
+		"timed", "refresh", "enter",
+		"timed", "refresh", "enter",
+		"timed", "refresh",
+	)
+	if n := h.weread.count("/web/reader/"); n != 4 {
+		t.Errorf("Reader 页抓取数 = %d，期望 4（初始 + 3 轮恢复链刷新）", n)
+	}
+	for i, rec := range h.reportRecords() {
+		p := payloadFromWire(t, rec.Body)
+		if _, isTimed := p["rt"]; !isTimed {
+			continue
+		}
+		if p["rt"] != "30" {
+			t.Errorf("timed[%d].rt = %s，期望 30（超限间隔绝不作为大 rt 上报）", i, p["rt"])
+		}
+	}
+
+	// ---- failed 终态 + 失败通知（含已尝试恢复动作）；Task 有界收敛。 ----
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has || st.LastTaskResult != terminal.ResultFailed {
+		t.Fatalf("终态 = %+v has=%v err=%v，期望 failed", st, has, err)
+	}
+	recs := h.bark.snapshot()
+	if len(recs) != 1 {
+		t.Fatalf("Bark 通知数 = %d，期望 1 条失败通知", len(recs))
+	}
+	msg, _ := json.Marshal(recs[0].Body)
+	for _, want := range []string{
+		"微信读书阅读任务失败",
+		"失败阶段：timed report",
+		"连续 3 次暂时性失败",
+		"已尝试恢复：刷新 Reader Context → 重试上报",
+	} {
+		if !strings.Contains(string(msg), want) {
+			t.Errorf("失败通知缺少 %q；body=%s", want, msg)
+		}
 	}
 }
 
