@@ -6,7 +6,7 @@
 **Category:** bug
 **Blocked by:** None
 **Related:** ticket 06（Reading Session 维护 / 异常间隔重建）、ticket 25（pclts 数字/字符串解析兼容，resolved）、ticket 27 / 28（异常间隔重建与恢复链路径的独立缺陷票，各自独立）、ticket 23（真实账号受控验证 / checklist 端到端长跑确认）
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Agent Brief
 
@@ -57,3 +57,19 @@
 ## 验证记录（triage）
 
 已对照 `internal/weread/protocol.go` 与 `internal/report/report.go` 确认现状：payload 构造层在两处 builder 中于 `Pclts` 为空或 `"0"` 时以报告构造时刻计算 `EncodeID(now)`；`Sender.Enter` / `Sender.Timed` 每笔上报各自构造 payload，无任何会话级 `pc` 状态；Task orchestrator 的 TTL 主动刷新仅更换 Reader Context、不携带会话级 `pc`。冗余检查：任何 ticket 均未实现会话内稳定 fallback `pc`，无 `.out-of-scope/` 拒收记录。行为证据（官方抓包与固定 `pc` 探针）见 checklist 2026-09-06 会话与 finding 08。
+## Answer
+
+全部验收通过。修复：`internal/weread/protocol.go` 新增 `ResolvePC`——在 Reading Session 建立时解析一次会话级 pc：`Pclts` 可用（非空、非 `"0"`，ticket 25 语义）时返回原值；为空或 `"0"` 时返回 fallback `e(会话建立时刻的秒级时间戳)`。pc 决策点从"每笔 payload 构造"上移到"会话建立"：`EnterReportPayload` / `TimedReportPayload` 与 `report.Sender.Enter` / `Sender.Timed` 改为显式接收 pc 参数（构造层不再内部回退）；`internal/task/task.go` 的 `sendEnter`（初始 enter 与异常间隔重建共用同一入口）在会话建立时解析一次 pc 并经 `sendResult` 携带，timed 循环以 `sessionPC` 复用，重建分支重新解析。
+
+1. **AC1（可用 pclts 路径不变）**：`ResolvePC` 对可用 pclts 返回 Reader Context 原值；ticket 25 的 `TestParseInitialStatePcltsFlexibility`（数字 0 / 非零数字 / 字符串 / 已编码串 / null / 缺失 / 非法类型）与 `TestResolvePC`、协议层测试全部保持原断言语义并通过。
+2. **AC2（fallback 会话建立时生成一次）**：新增 `TestResolvePC`（空/`"0"` → `e(建立时刻)`；不同建立时刻产生不同值）；协议层 `TestPayloadPositionRules` / `TestPcltsZeroFallback` 适配新签名后断言值不变。
+3. **AC3（TTL 主动刷新不改变 pc）**：新增 `TestRunFallbackPCStableWithinSession`——fake Reader 页携带数字 `pclts` 0（复用 ticket 25 数字解析路径），20 分钟 Task 跨 TTL 刷新（第 30 笔 timed 起 Context 切换为 psvts-2），41 笔报告 pc 全部相同且 = `e(会话建立时刻)`，构造时刻（ct）各异；现有 `TestRunContextTTLExpiryRefreshesWithoutEnter` 补充可用 pclts 路径断言：rotate 换页（新 pclts/psvts）后 pc 仍为会话建立时的值（ps 仍逐笔跟随新 Context）。
+4. **AC4（恢复链 refresh 不改变 pc）**：新增 `TestRunRecoveryRefreshKeepsFallbackPC`——首笔 timed 被拒 → 恢复链 refresh（token-2/psvts-2）→ 重试接受；4 笔报告 pc 全部相同且 = `e(会话建立时刻)`。
+5. **AC5（重建生成新 fallback pc）**：新增 `TestRunAbnormalIntervalRebuildsNewFallbackPC`——挂起 + 跳变 120s 重建场景：会话 1 的 enter/timed 携带 `e(t=0)`，重建 enter 与后续 timed 携带 `e(t=150)`，不复用前值。
+6. **AC6（回归锚点）**：`TestRunAbnormalIntervalRebuildsSession`、TTL 主动刷新断言、ticket 25 兼容/fallback 断言在新适配后全部通过。
+7. **AC7（无其它协议行为变化）**：未动 `rt` 语义（ADR-0004）、`-2012` recovery、TTL 时机与内部默认数值；payload 其它字段（ps 仍逐笔跟随当前 Context、ct 仍为报告构造时刻）不变。
+8. **AC8**：`go test -count=1 -race ./...` 全部通过。
+
+**范围注记（code-review Spec 轴 P2）**：可用 pclts 场景同样按"会话建立时解析一次并携带"实现——TTL/恢复链 refresh 换页带来的新 pclts 不改变会话 pc（票面 Key interfaces 允许的"由调用方在会话建立时解析一次并在会话内携带"选项；与官方客户端页面会话内 pc 稳定一致）。该语义已由 `TestRunContextTTLExpiryRefreshesWithoutEnter` 的 pc 稳定性断言显式锚定，`ResolvePC` 文档注明。
+
+**Commit:** bb11959
