@@ -76,6 +76,8 @@ func helperProcessMain() int {
 	switch os.Getenv("WR_TEST_MODE") {
 	case "run":
 		_, err = a.RunTask(ctx)
+	case "manual-run":
+		_, err = a.RunManualTask(ctx, ManualRunOptions{Minutes: 1})
 	case "books":
 		_, err = a.ListBooks(ctx)
 	default:
@@ -165,8 +167,10 @@ type hanger struct {
 
 func newHanger(h *testHarness, triggers int) *hanger {
 	blockTimed := make(chan struct{})
+	h.weread.mu.Lock()
 	h.weread.blockTimed = blockTimed
 	h.weread.blockTimedTriggered = make(chan struct{}, triggers)
+	h.weread.mu.Unlock()
 	c := &hanger{}
 	c.releaseFn = func() { close(blockTimed) }
 	return c
@@ -266,7 +270,9 @@ func TestCrossProcessCrashReleasesLock(t *testing.T) {
 	}
 	// 释放 fake 服务端挂起的 handler；后续请求不再挂起。
 	hang.release()
+	h.weread.mu.Lock()
 	h.weread.blockTimed = nil
+	h.weread.mu.Unlock()
 
 	// 锁已自动释放：父进程完整执行 Task（无终态 → 不落入终态门控）。
 	before := len(h.weread.snapshot())
@@ -332,3 +338,22 @@ func TestCrossProcessDifferentDataDirsIndependent(t *testing.T) {
 		}
 	}
 }
+
+// TestCrossProcessManualRunRejectedWhenTaskRunning 断言已有 Task 运行时，
+// 另一个独立 OS 进程调用的 manual run 被跨进程守卫（flock）拒绝（退出码 3）。
+func TestCrossProcessManualRunRejectedWhenTaskRunning(t *testing.T) {
+	h := setup(t, nil)
+	hang := newHanger(h, 1)
+	t.Cleanup(hang.release)
+
+	ch1 := spawnChild(t, "run", h.app.deps.WereadBaseURL, h.cfg.DataDir)
+	waitTimedBlocked(t, h, 1)
+
+	// 第二个独立进程：manual run 同样被跨进程锁拒绝（ExitRunRejected = 3）。
+	ch2 := spawnChild(t, "manual-run", h.app.deps.WereadBaseURL, h.cfg.DataDir)
+	waitChild(t, ch2, 3)
+
+	hang.release()
+	waitChild(t, ch1, 0)
+}
+

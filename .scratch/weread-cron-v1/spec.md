@@ -51,9 +51,9 @@ Status: ready-for-agent
 37. 作为部署者，我希望通知渠道按配置独立启用（Bark / 企业微信 / 两者 / 都无），以便按需接入。
 38. 作为部署者，我希望通知发送失败不影响 Task 结果与终态，以便通知渠道故障不破坏阅读任务。
 39. 作为部署者，我希望终态先落盘再发通知，以便通知期间重启不会导致当天重复执行。
-40. 作为部署者，我希望 Task success 终态下 `weread-cron run` 拒绝重复执行（V1 无 force），以便不会意外双跑。
-41. 作为部署者，我希望 Task failed 终态下可以用 `weread-cron run` 手动重试并更新当天结果为 success，以便人工修复后当天不空过。
-42. 作为部署者，我希望当天无终态时 `weread-cron run` 立即执行完整 Task（不受窗口限制、正常随机时长），以便随时手动触发。
+40. 作为部署者，我希望通过 `weread-cron run --minutes <N> [--book <bookId>]` 显式指定单次阅读目标时长（及可选书籍）按需发起 Task，以便灵活安排即时阅读需求。
+41. 作为部署者，我希望 `weread-cron run` 不受当天是否已有 success/failed 终态阻拦立即启动，并在执行失败时遵循防降级规则保留当天的已有 success 终态，以便按需阅读失败不破坏已完成的每日阅读记录。
+42. 作为部署者，我希望 `weread-cron run` 缺少或传入非正整数 `--minutes` 时以用法错误快速报错退出，以便避免意外使用未预期的时长启动任务。
 43. 作为部署者，我希望已有 Task 运行时第二个 Task（自动或手动）被拒绝，以便不会并发上报。
 44. 作为部署者，我希望 `weread-cron books` 输出书架 bookId 与 title，以便选择 `WEREAD_CRON_BOOKS` 和验证 Cookie/书架访问。
 45. 作为部署者，我希望 `weread-cron books` 使用与 daemon 相同的 Login Session 恢复机制并可正常 renewal/持久化，以便查询结果真实可靠。
@@ -63,7 +63,7 @@ Status: ready-for-agent
 
 ## Implementation Decisions
 
-1. **二进制与子命令**：`weread-cron`（无子命令 = daemon）、`weread-cron run`、`weread-cron books`；`--help` 与未知子命令/flag 以非零退出码报错。二进制名同 ADR-0005。
+1. **二进制与子命令**：`weread-cron`（无子命令 = daemon）、`weread-cron run --minutes <N> [--book <bookId>]`、`weread-cron books`；`--help` 与未知子命令/flag 以非零退出码报错。二进制名同 ADR-0005。
 2. **用户可见配置（全部环境变量，前缀 `WEREAD_CRON_`）**：`WEREAD_CRON_COOKIE`（初始 Cookie header 字符串）、`WEREAD_CRON_BOOKS`（逗号分隔 bookId，可选）、`WEREAD_CRON_RUN_WINDOW_START`/`_END`（HH:MM）、`WEREAD_CRON_READ_MINUTES_MIN`/`_MAX`、`WEREAD_CRON_BARK_URL`、`WEREAD_CRON_WECOM_WEBHOOK_URL`（均可选，按配置启用）、`WEREAD_CRON_DATA_DIR`（默认 `/data`）、`TZ`（默认 `Asia/Shanghai`）。校验失败即启动失败：窗口 `start>end` 且不相等非法（`start==end` = 固定时刻）、`min>max` 非法、首次启动无 Cookie 快速失败。内部参数一律不暴露（ADR-0005）。
 3. **模块职责（按职责划分，不指定文件路径）**：config（解析+校验）；session（Cookie Jar 管理、序列化/恢复、原子持久化）；weread protocol（`_e` 编码、`sg`/`s`/appId 生成、payload 构造）；reader context（抓取 `__INITIAL_STATE__`、TTL 缓存、强制刷新）；report（enter/timed 发送与成功判定）；task orchestrator（Task 编排、恢复链、异常间隔重建 Reading Session）；scheduler（`nextStart` 决策、daemon 循环、终态门控）；notify（Bark、企业微信机器人，渠道独立）。
 4. **依赖注入与应用边界（ADR-0006）**：clock、RNG、HTTP client/base URL、session store、notifier 均经构造器注入；生产 `main` 组装真实实现。clock/RNG 是领域真实依赖（随机化是产品特性），不是 test hook。
@@ -81,7 +81,7 @@ Status: ready-for-agent
 9. **持久化（/data）**：Login Session 序列化（Cookie 属性完整保存）+ Terminal State `{last_task_date, last_task_result}`；均原子写（临时文件 + rename）；终态成功落盘后才发送最终 success/failure 通知（落盘失败 → 不发通知、Task 返回持久化错误）。Task 日期在 Task 启动时确定（开始日），success 与全部失败结果的终态与通知使用同一日期；Task 越过午夜不转移日期归属。
 10. **通知内容**：成功 = 完成、计划时长、实际累计时长（本地汇总 `rt`）、report 次数、书名；失败 = 失败阶段、主要错误、已尝试恢复（refresh/renewal）；登录失效 = 明确提示更新初始 Cookie 的固定文案。通知发送失败不影响 Task 结果；渠道互不影响。
 11. **并发**：同一 deployment（同一 /data）内单 Task 互斥：daemon 与 run/books 跨进程互斥（/data 锁文件 + flock，锁随持有进程退出/崩溃自动释放，ADR-0008），进程内守卫零 I/O 先行；已有 Task 运行时第二个 Task（自动或手动）被拒绝（非阻塞、不中断运行中的 Task）。不同 deployment/多实例防重不在 V1 范围。
-12. **CLI 行为**：`run` 不受 Run Window 限制、复用正常 Task 逻辑与终态规则（无终态 → 执行并形成终态；failed → 可重试更新为 success；success → 拒绝，无 force），且与自动 Task 使用相同 finalization 语义（最终失败同样形成 failed 终态 + 失败通知）；`books` 只读查询（可 renewal 并持久化 Login Session，不碰终态、不产生 Task、不通知）。
+12. **CLI 行为**：`run` 显式指定参数（必需 `--minutes > 0`，可选 `--book`，ADR-0009）；不受 Run Window 限制，不受当天已有 Terminal State（success/failed/无）门控阻拦，立即按需启动；已有 Task 运行时受并发守卫拒绝（ExitRunRejected）。执行成功记录或保留 success 终态并通知；执行失败时触发防降级规则（当天已有 success 则保留 success 终态，否则记录 failed），同时如实发出失败通知并退出；`books` 只读查询（可 renewal 并持久化 Login Session，不碰终态、不产生 Task、不通知）。（ADR-0009 部分取代 ADR-0002）
 13. **内部默认值清单（不暴露配置）**：report 节奏 ~30s、异常间隔阈值（~90s）、重试次数、renewal 节流、Reader Context TTL 默认、UA、HTTP 超时、日志级别、通知重试。
 
 ## Testing Decisions

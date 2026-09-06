@@ -89,12 +89,20 @@ func TestUsageErrors(t *testing.T) {
 		{"--help", []string{"--help"}, "用法"},
 		{"-h", []string{"-h"}, "用法"},
 		{"run --help", []string{"run", "--help"}, "用法"},
+		{"run -h", []string{"run", "-h"}, "用法"},
 		{"books --help", []string{"books", "-h"}, "用法"},
 		{"未知子命令", []string{"frobnicate"}, "未知子命令"},
 		{"未知 flag", []string{"--verbose"}, "未知 flag"},
-		{"run 多余参数", []string{"run", "extra"}, "不接受额外参数"},
+		{"run 缺少 --minutes", []string{"run"}, "minutes"},
+		{"run --minutes 缺少值", []string{"run", "--minutes"}, "minutes"},
+		{"run --minutes 0", []string{"run", "--minutes", "0"}, "minutes"},
+		{"run --minutes -5", []string{"run", "--minutes", "-5"}, "minutes"},
+		{"run --minutes abc", []string{"run", "--minutes", "abc"}, "minutes"},
+		{"run --book 缺少值", []string{"run", "--minutes", "20", "--book"}, "book"},
+		{"run --book 为空", []string{"run", "--minutes", "20", "--book", ""}, "book"},
+		{"run 多余参数", []string{"run", "--minutes", "20", "extra"}, "不接受额外参数"},
 		{"books 多余参数", []string{"books", "x", "y"}, "不接受额外参数"},
-		{"run --force（无 force 选项）", []string{"run", "--force"}, "不接受额外参数"},
+		{"run --force（未知 flag）", []string{"run", "--force"}, "未知 flag"},
 	}
 
 	for _, tc := range cases {
@@ -236,7 +244,7 @@ func TestDaemonStartsWithPersistedLoginSessionAndNoCookie(t *testing.T) {
 func TestRunWithoutBooksNoLongerFailsFast(t *testing.T) {
 	env := testEnv(t, withCookie(t))
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "20"}, env, &stdout, &stderr,
 		func(cfg *config.Config, logger *slog.Logger) (App, error) {
 			return &fakeApp{res: task.Result{Date: "2025-09-06", BookID: "601111", BookTitle: "自动选书书", Planned: time.Minute, Actual: time.Minute, Reports: 2}}, nil
 		})
@@ -333,9 +341,10 @@ func TestBooksRejectedWhenTaskRunning(t *testing.T) {
 // fakeApp 是 run/books 子命令的可注入 App（进程内行为测试：退出码/stdout/stderr）。
 // calls 记录 RunTask 被调用次数（run 不受窗口限制的断言用）。
 type fakeApp struct {
-	res   task.Result
-	err   error
-	calls int
+	res        task.Result
+	err        error
+	calls      int
+	manualOpts app.ManualRunOptions
 
 	books    []weread.ShelfBook
 	booksErr error
@@ -343,6 +352,12 @@ type fakeApp struct {
 
 func (f *fakeApp) RunTask(ctx context.Context) (task.Result, error) {
 	f.calls++
+	return f.res, f.err
+}
+
+func (f *fakeApp) RunManualTask(ctx context.Context, opts app.ManualRunOptions) (task.Result, error) {
+	f.calls++
+	f.manualOpts = opts
 	return f.res, f.err
 }
 
@@ -356,28 +371,61 @@ func TestRunTaskSuccessPrintsSummary(t *testing.T) {
 		Date:      "2025-09-06",
 		BookID:    "695233",
 		BookTitle: "三体全集",
-		Planned:   time.Minute,
-		Actual:    90 * time.Second,
-		Reports:   3,
+		Planned:   20 * time.Minute,
+		Actual:    20 * time.Minute,
+		Reports:   40,
 	}
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
-		func(cfg *config.Config, logger *slog.Logger) (App, error) { return &fakeApp{res: res}, nil })
+	fa := &fakeApp{res: res}
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "20"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) { return fa, nil })
 	if code != ExitOK {
 		t.Errorf("退出码 = %d，期望 %d; stderr=%s", code, ExitOK, stderr.String())
 	}
+	if fa.manualOpts.Minutes != 20 {
+		t.Errorf("ManualRunOptions.Minutes = %d，期望 20", fa.manualOpts.Minutes)
+	}
+	if fa.manualOpts.BookID != "" {
+		t.Errorf("未指定 --book 时 ManualRunOptions.BookID 应为空，实际: %q", fa.manualOpts.BookID)
+	}
 	out := stdout.String()
-	for _, want := range []string{"Task 成功", "三体全集", "695233", "1 分钟", "1 分钟 30 秒", "上报次数: 3"} {
+	for _, want := range []string{"Task 成功", "三体全集", "695233", "20 分钟", "上报次数: 40"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("stdout 缺少 %q；实际:\n%s", want, out)
 		}
 	}
 }
 
+// TestRunTaskWithBookOption 断言 `--book <bookId>` 正确解析并传入 ManualRunOptions。
+func TestRunTaskWithBookOption(t *testing.T) {
+	env := testEnv(t, withCookie(t))
+	res := task.Result{
+		Date:      "2025-09-06",
+		BookID:    "12345",
+		BookTitle: "指定书籍",
+		Planned:   15 * time.Minute,
+		Actual:    15 * time.Minute,
+		Reports:   30,
+	}
+	var stdout, stderr syncBuffer
+	fa := &fakeApp{res: res}
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "15", "--book", "12345"}, env, &stdout, &stderr,
+		func(cfg *config.Config, logger *slog.Logger) (App, error) { return fa, nil })
+	if code != ExitOK {
+		t.Errorf("退出码 = %d，期望 %d; stderr=%s", code, ExitOK, stderr.String())
+	}
+	if fa.manualOpts.Minutes != 15 {
+		t.Errorf("ManualRunOptions.Minutes = %d，期望 15", fa.manualOpts.Minutes)
+	}
+	if fa.manualOpts.BookID != "12345" {
+		t.Errorf("ManualRunOptions.BookID = %q，期望 12345", fa.manualOpts.BookID)
+	}
+}
+
 func TestRunTaskFailureExitsNonZero(t *testing.T) {
 	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "20"}, env, &stdout, &stderr,
 		func(cfg *config.Config, logger *slog.Logger) (App, error) {
 			return &fakeApp{err: errors.New("timed report 失败")}, nil
 		})
@@ -398,7 +446,7 @@ func TestRunTaskFailureExitsNonZero(t *testing.T) {
 func TestRunTaskCancelledExitsOK(t *testing.T) {
 	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "20"}, env, &stdout, &stderr,
 		func(cfg *config.Config, logger *slog.Logger) (App, error) {
 			return &fakeApp{err: context.Canceled}, nil
 		})
@@ -416,30 +464,24 @@ func TestRunTaskCancelledExitsOK(t *testing.T) {
 	}
 }
 
-// TestRunRejectedWhenTodaySuccessTerminal：当天 success 终态 → run 拒绝
-// （issue 08 验收口径：stdout 说明原因 + 约定退出码 ExitRunRejected）。
-// 终态规则本身由应用 seam 覆盖；本层断言进程级呈现。
-func TestRunRejectedWhenTodaySuccessTerminal(t *testing.T) {
+// TestRunNotBlockedByTodaySuccessTerminal 断言 manual run 独立执行，不受当天已有的
+// success 终态门控阻拦（ticket 26；supersedes ADR-0002 manual run gate）。
+func TestRunNotBlockedByTodaySuccessTerminal(t *testing.T) {
 	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+	fa := &fakeApp{res: task.Result{Date: "2025-09-06", BookID: "695233", BookTitle: "三体全集", Planned: 15 * time.Minute, Actual: 15 * time.Minute, Reports: 30}}
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "15"}, env, &stdout, &stderr,
 		func(cfg *config.Config, logger *slog.Logger) (App, error) {
-			return &fakeApp{err: app.ErrTerminalSuccess}, nil
+			return fa, nil
 		})
-	if code != ExitRunRejected {
-		t.Errorf("退出码 = %d，期望 %d（约定拒绝退出码）", code, ExitRunRejected)
+	if code != ExitOK {
+		t.Errorf("退出码 = %d，期望 %d; stderr=%s", code, ExitOK, stderr.String())
 	}
-	if !strings.Contains(stdout.String(), "success 终态") {
-		t.Errorf("stdout 应说明拒绝原因（success 终态）；实际:\n%s", stdout.String())
+	if fa.calls != 1 {
+		t.Errorf("RunManualTask 调用次数 = %d，期望 1（不受当天已完成门控阻拦）", fa.calls)
 	}
-	if !strings.Contains(stdout.String(), "无 force") {
-		t.Errorf("stdout 应说明 V1 无 force；实际:\n%s", stdout.String())
-	}
-	if strings.Contains(stderr.String(), "Task 失败") {
-		t.Errorf("拒绝不是 Task 失败，stderr 不应误报；实际:\n%s", stderr.String())
-	}
-	if strings.Contains(stdout.String(), "Task 成功") {
-		t.Errorf("拒绝时不应输出成功摘要；实际:\n%s", stdout.String())
+	if !strings.Contains(stdout.String(), "Task 成功") {
+		t.Errorf("stdout 应输出成功摘要；实际:\n%s", stdout.String())
 	}
 }
 
@@ -448,7 +490,7 @@ func TestRunRejectedWhenTodaySuccessTerminal(t *testing.T) {
 func TestRunRejectedWhenTaskRunning(t *testing.T) {
 	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233")
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "20"}, env, &stdout, &stderr,
 		func(cfg *config.Config, logger *slog.Logger) (App, error) {
 			return &fakeApp{err: app.ErrTaskRunning}, nil
 		})
@@ -464,19 +506,19 @@ func TestRunRejectedWhenTaskRunning(t *testing.T) {
 }
 
 // TestRunIgnoresRunWindowAtCLI：run 路径不检查 Run Window——窗口已过（00:00–01:00）
-// 仍直接调用 RunTask 并成功退出（spec 决策 #12；窗口语义由应用 seam 全覆盖）。
+// 仍直接调用 RunManualTask 并成功退出（spec 决策 #12；窗口语义由应用 seam 全覆盖）。
 func TestRunIgnoresRunWindowAtCLI(t *testing.T) {
 	env := testEnv(t, withCookie(t), config.EnvBooks+"=695233",
 		config.EnvWindowStart+"=00:00", config.EnvWindowEnd+"=01:00")
-	fa := &fakeApp{res: task.Result{Date: "2025-09-06", BookID: "695233", BookTitle: "三体全集", Planned: time.Minute, Actual: time.Minute, Reports: 2}}
+	fa := &fakeApp{res: task.Result{Date: "2025-09-06", BookID: "695233", BookTitle: "三体全集", Planned: 20 * time.Minute, Actual: 20 * time.Minute, Reports: 40}}
 	var stdout, stderr syncBuffer
-	code := runWithApp(context.Background(), []string{"run"}, env, &stdout, &stderr,
+	code := runWithApp(context.Background(), []string{"run", "--minutes", "20"}, env, &stdout, &stderr,
 		func(cfg *config.Config, logger *slog.Logger) (App, error) { return fa, nil })
 	if code != ExitOK {
 		t.Errorf("窗口已过时 run 仍应执行，退出码 = %d；stderr=%s", code, stderr.String())
 	}
 	if fa.calls != 1 {
-		t.Errorf("RunTask 调用次数 = %d，期望 1（run 立即执行、不受窗口约束）", fa.calls)
+		t.Errorf("RunManualTask 调用次数 = %d，期望 1（run 立即执行、不受窗口约束）", fa.calls)
 	}
 	if !strings.Contains(stdout.String(), "Task 成功") {
 		t.Errorf("stdout 应输出成功摘要；实际:\n%s", stdout.String())

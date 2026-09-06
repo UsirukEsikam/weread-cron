@@ -25,6 +25,14 @@ import (
 	"weread-cron/internal/weread"
 )
 
+// ManualRunOptions 是手动 run 的参数（ticket 26）。
+type ManualRunOptions struct {
+	// Minutes 是显式指定的单次阅读目标时长（分钟，必需且 > 0）。
+	Minutes int
+	// BookID 是显式指定的书籍 ID（可选；为空时回退候选配置与自动选书）。
+	BookID string
+}
+
 // DefaultHTTPTimeout 是内部默认 HTTP 超时（spec 决策 #13）。
 const DefaultHTTPTimeout = 30 * time.Second
 
@@ -120,7 +128,24 @@ func notifyChannels(hc *http.Client, cfg *config.Config) []notify.Notifier {
 	return channels
 }
 
-// RunTask 完整执行一次 Task（终态规则门控 + 并发守卫 → Login Session 建立/恢复 →
+// RunManualTask 手动执行一次显式参数化的 Task（ticket 26）：
+//   - 显式指定阅读时长（opts.Minutes > 0）与可选书籍（opts.BookID）；
+//   - 立即执行，不受 Run Window 约束；
+//   - 不受当天 Terminal State（无论是 success、failed 还是无）门控阻拦；
+//   - 互斥守卫严格保留（同一 deployment 内已有 Task 运行则返回 ErrTaskRunning）；
+//   - 终态防降级规则生效（执行失败时若当天已有 success，保留 success 终态）；
+//   - 独立发送通知并向调用方保真返回结果。
+func (a *App) RunManualTask(ctx context.Context, opts ManualRunOptions) (task.Result, error) {
+	if opts.Minutes <= 0 {
+		return task.Result{}, errors.New("ManualRunOptions.Minutes 必须为正整数 (N > 0)")
+	}
+	return a.runTaskInternal(ctx, taskModifier{
+		skipTerminalGate: true,
+		manual:           opts,
+	})
+}
+
+// RunTask 完整执行一次自动 Task（终态规则门控 + 并发守卫 → Login Session 建立/恢复 →
 // weread 客户端 → 编排）。手动 run 与 daemon 自动执行使用同一 finalization 语义
 // （ticket 24：一切最终结果都先持久化对应终态、持久化成功后发送对应通知；暂时性
 // 失败无条件收敛为 failed 终态 + 失败通知）。
@@ -134,6 +159,17 @@ func notifyChannels(hc *http.Client, cfg *config.Config) []notify.Notifier {
 // 守卫零 I/O 先行，跨进程守卫（/data 锁文件 + flock，非阻塞）随后；锁未获得方
 // 不等待、不中断运行中的 Task（运行中的 Task 未被中断）。
 func (a *App) RunTask(ctx context.Context) (task.Result, error) {
+	return a.runTaskInternal(ctx, taskModifier{
+		skipTerminalGate: false,
+	})
+}
+
+type taskModifier struct {
+	skipTerminalGate bool
+	manual           ManualRunOptions
+}
+
+func (a *App) runTaskInternal(ctx context.Context, mod taskModifier) (task.Result, error) {
 	// 并发守卫先于一切：运行中的 Task 不被第二个 Task 打断（TryLock 非阻塞拒绝）。
 	unguard, err := a.acquireTaskGuard()
 	if err != nil {
@@ -141,10 +177,12 @@ func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 	}
 	defer unguard()
 
-	// 终态规则门控：success 终态是 run 的非法输入状态（V1 无 force）。
-	// 必须在锁内：避免两个并发 RunTask 同时通过门控后双双执行。
-	if err := a.checkTerminalGate(); err != nil {
-		return task.Result{}, err
+	if !mod.skipTerminalGate {
+		// 终态规则门控：success 终态是自动 Task 的非法输入状态（V1 无 force）。
+		// 必须在锁内：避免两个并发 RunTask 同时通过门控后双双执行。
+		if err := a.checkTerminalGate(); err != nil {
+			return task.Result{}, err
+		}
 	}
 
 	sess, err := session.New(a.deps.Sessions, a.cfg.Cookie)
@@ -168,6 +206,10 @@ func (a *App) RunTask(ctx context.Context) (task.Result, error) {
 		TargetMinMinutes: a.cfg.ReadMinutesMin,
 		TargetMaxMinutes: a.cfg.ReadMinutesMax,
 		TZ:               a.cfg.TZ,
+		Manual: task.ManualOptions{
+			Minutes: mod.manual.Minutes,
+			BookID:  mod.manual.BookID,
+		},
 		// FinalFailureAfter 已移除（ticket 24）：暂时性失败无条件收敛，不再注入
 		// 窗口截止时刻；手动 run 与 daemon 自动执行同一 finalization。
 		RebuildLoginSession: func() error {

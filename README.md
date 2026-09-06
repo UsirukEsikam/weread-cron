@@ -35,10 +35,14 @@ docker compose logs -f
 docker compose logs -f
 ```
 
-立即执行一次当天的阅读任务（无需等待时间窗口；如果当天已经成功阅读过，会直接跳过）：
+立即按需执行一次阅读任务（无需等待时间窗口，不受当天是否已成功完成限制；若执行失败，当天已有的成功记录不会被降级覆盖）：
 
 ```bash
-docker compose exec weread-cron /weread-cron run
+# 执行指定时长的阅读任务（例如 30 分钟，自动从书架或配置候选选书）：
+docker compose exec weread-cron /weread-cron run --minutes 30
+
+# 执行指定时长并指定书籍 ID（例如阅读书籍 695233）：
+docker compose exec weread-cron /weread-cron run --minutes 30 --book 695233
 ```
 
 查看书架上的图书列表（用于获取书籍 ID，挑选阅读书籍）：

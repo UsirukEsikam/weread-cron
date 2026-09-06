@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
 	"strings"
 
 	"weread-cron/internal/app"
@@ -54,6 +55,9 @@ type App interface {
 	// 结果先持久化对应终态、持久化成功后发送对应通知；暂时性失败同样收敛为 failed
 	// 终态 + 失败通知）。
 	RunTask(ctx context.Context) (task.Result, error)
+	// RunManualTask 显式参数化手动执行一次 Task（ticket 26：覆盖 Target Duration，
+	// 绕过当天终态门控，互斥守卫与终态防降级规则生效）。
+	RunManualTask(ctx context.Context, opts app.ManualRunOptions) (task.Result, error)
 	// ListBooks 列出当前 Shelf 的 bookId 与 title（纯查询：不产生 Task、
 	// 不读写终态、不通知；内部执行 renewal 并可持久化 Login Session）。
 	ListBooks(ctx context.Context) ([]weread.ShelfBook, error)
@@ -74,7 +78,7 @@ func Run(ctx context.Context, args []string, environ []string, stdout, stderr io
 
 // runWithApp 是 Run 的可注入版本（应用边界 seam：进程级行为在此层测试）。
 func runWithApp(ctx context.Context, args []string, environ []string, stdout, stderr io.Writer, makeApp appFactory) int {
-	cmd, code := parseArgs(args, stderr)
+	parsed, code := parseArgs(args, stderr)
 	if code != ExitOK {
 		return code
 	}
@@ -93,7 +97,7 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 
 	logger := slog.New(slog.NewTextHandler(stderr, nil))
 
-	switch cmd {
+	switch parsed.cmd {
 	case cmdDaemon:
 		a, err := makeApp(cfg, logger)
 		if err != nil {
@@ -111,15 +115,10 @@ func runWithApp(ctx context.Context, args []string, environ []string, stdout, st
 			fmt.Fprintf(stderr, "weread-cron: 装配失败: %v\n", err)
 			return ExitConfig
 		}
-		// Run Window 只约束自动调度（spec 决策 #12）；手动 run 与自动 Task 使用相同
-		// finalization（ticket 24）：暂时性失败同样收敛为 failed 终态 + 失败通知。
-		res, err := a.RunTask(ctx)
+		// ticket 26：手动 run 显式指定参数（时长/可选书籍），立即执行且不受 Run Window
+		// 约束；不受当天 Terminal State 门控阻拦；已有 Task 运行中时受并发守卫拒绝。
+		res, err := a.RunManualTask(ctx, parsed.runOpts)
 		switch {
-		case errors.Is(err, app.ErrTerminalSuccess):
-			// ticket 08：success 终态 → 拒绝。验收口径：原因输出到 stdout，
-			// 返回约定的非零退出码（脚本可据此区分"执行成功"与"今天已完成"）。
-			fmt.Fprintln(stdout, "weread-cron: 今天已完成阅读任务（success 终态），拒绝重复执行（V1 无 force）")
-			return ExitRunRejected
 		case errors.Is(err, app.ErrTaskRunning):
 			fmt.Fprintln(stderr, "weread-cron: 已有 Task 正在运行，拒绝并发启动")
 			return ExitRunRejected
@@ -196,14 +195,23 @@ const (
 	cmdBooks
 )
 
+type parsedArgs struct {
+	cmd     command
+	runOpts app.ManualRunOptions
+}
+
 const usageText = `weread-cron — 微信读书自动阅读服务
 
 用法:
-  weread-cron             运行 daemon（每日在 Run Window 内随机安排一次 Task）
-  weread-cron run         手动执行当天 Task
-  weread-cron books       列出书架 bookId 与 title
+  weread-cron                                        运行 daemon（每日在 Run Window 内随机安排一次 Task）
+  weread-cron run --minutes <N> [--book <bookId>]    手动执行一次 Task（N > 0）
+  weread-cron books                                  列出书架 bookId 与 title
 
-选项:
+run 命令选项:
+  --minutes <N>           阅读目标时长（分钟，必需正整数 N > 0）
+  --book <bookId>         指定阅读的书籍 ID（可选，默认自动选书）
+
+全局选项:
   --help, -h              显示本帮助
 
 配置全部通过环境变量提供（前缀 WEREAD_CRON_，见 ADR-0005）：
@@ -217,32 +225,35 @@ const usageText = `weread-cron — 微信读书自动阅读服务
 `
 
 // parseArgs 解析 args；解析失败时向 stderr 输出错误与用法并返回 ExitUsage。
-// 成功时返回 (command, ExitOK)；--help 按 spec 决策同样返回 ExitUsage。
-func parseArgs(args []string, stderr io.Writer) (command, int) {
+// 成功时返回 (parsedArgs, ExitOK)；--help 按 spec 决策同样返回 ExitUsage。
+func parseArgs(args []string, stderr io.Writer) (parsedArgs, int) {
 	printUsage := func() {
 		fmt.Fprint(stderr, usageText)
 	}
 	if len(args) == 0 {
-		return cmdDaemon, ExitOK
+		return parsedArgs{cmd: cmdDaemon}, ExitOK
 	}
 	switch args[0] {
 	case "--help", "-h":
 		printUsage()
-		return cmdDaemon, ExitUsage
-	case cmdRunName, cmdBooksName:
+		return parsedArgs{cmd: cmdDaemon}, ExitUsage
+	case cmdRunName:
+		opts, code := parseRunArgs(args[1:], stderr, printUsage)
+		if code != ExitOK {
+			return parsedArgs{}, code
+		}
+		return parsedArgs{cmd: cmdRun, runOpts: opts}, ExitOK
+	case cmdBooksName:
 		if len(args) > 1 {
 			if args[1] == "--help" || args[1] == "-h" {
 				printUsage()
-				return cmdDaemon, ExitUsage
+				return parsedArgs{}, ExitUsage
 			}
 			fmt.Fprintf(stderr, "weread-cron: %s 不接受额外参数: %q\n\n", args[0], strings.Join(args[1:], " "))
 			printUsage()
-			return cmdDaemon, ExitUsage
+			return parsedArgs{}, ExitUsage
 		}
-		if args[0] == cmdRunName {
-			return cmdRun, ExitOK
-		}
-		return cmdBooks, ExitOK
+		return parsedArgs{cmd: cmdBooks}, ExitOK
 	default:
 		if strings.HasPrefix(args[0], "-") {
 			fmt.Fprintf(stderr, "weread-cron: 未知 flag: %q\n\n", args[0])
@@ -250,8 +261,86 @@ func parseArgs(args []string, stderr io.Writer) (command, int) {
 			fmt.Fprintf(stderr, "weread-cron: 未知子命令: %q\n\n", args[0])
 		}
 		printUsage()
-		return cmdDaemon, ExitUsage
+		return parsedArgs{}, ExitUsage
 	}
+}
+
+// parseRunArgs 解析 `weread-cron run` 的参数（ticket 26）：
+//   - 必选 --minutes <N> (N > 0)
+//   - 可选 --book <bookId>
+//   - --help / -h 输出用法
+//   - 其余 flag / 多余参数返回 ExitUsage
+func parseRunArgs(args []string, stderr io.Writer, printUsage func()) (app.ManualRunOptions, int) {
+	var opts app.ManualRunOptions
+	hasMinutes := false
+
+	// 先归一化 `--flag=val` 格式为独立 token。
+	var tokens []string
+	for _, a := range args {
+		switch {
+		case strings.HasPrefix(a, "--minutes="):
+			tokens = append(tokens, "--minutes", strings.TrimPrefix(a, "--minutes="))
+		case strings.HasPrefix(a, "--book="):
+			tokens = append(tokens, "--book", strings.TrimPrefix(a, "--book="))
+		default:
+			tokens = append(tokens, a)
+		}
+	}
+
+	for i := 0; i < len(tokens); i++ {
+		arg := tokens[i]
+		switch {
+		case arg == "--help" || arg == "-h":
+			printUsage()
+			return opts, ExitUsage
+		case arg == "--minutes":
+			if i+1 >= len(tokens) {
+				fmt.Fprintf(stderr, "weread-cron: run 缺少 --minutes 参数值\n\n")
+				printUsage()
+				return opts, ExitUsage
+			}
+			i++
+			val := tokens[i]
+			m, err := strconv.Atoi(val)
+			if err != nil || m <= 0 {
+				fmt.Fprintf(stderr, "weread-cron: --minutes 必须为正整数 (N > 0): %q\n\n", val)
+				printUsage()
+				return opts, ExitUsage
+			}
+			opts.Minutes = m
+			hasMinutes = true
+		case arg == "--book":
+			if i+1 >= len(tokens) {
+				fmt.Fprintf(stderr, "weread-cron: run 缺少 --book 参数值\n\n")
+				printUsage()
+				return opts, ExitUsage
+			}
+			i++
+			val := strings.TrimSpace(tokens[i])
+			if val == "" {
+				fmt.Fprintf(stderr, "weread-cron: --book 不能为空\n\n")
+				printUsage()
+				return opts, ExitUsage
+			}
+			opts.BookID = val
+		case strings.HasPrefix(arg, "-"):
+			fmt.Fprintf(stderr, "weread-cron: run 未知 flag: %q\n\n", arg)
+			printUsage()
+			return opts, ExitUsage
+		default:
+			fmt.Fprintf(stderr, "weread-cron: run 不接受额外参数: %q\n\n", arg)
+			printUsage()
+			return opts, ExitUsage
+		}
+	}
+
+	if !hasMinutes {
+		fmt.Fprintf(stderr, "weread-cron: run 缺少必需参数 --minutes <N>\n\n")
+		printUsage()
+		return opts, ExitUsage
+	}
+
+	return opts, ExitOK
 }
 
 const (

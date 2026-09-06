@@ -384,13 +384,14 @@ func (f *fakeWeread) handleShelf(w http.ResponseWriter, r *http.Request) {
 func (f *fakeWeread) handleReport(w http.ResponseWriter, r *http.Request) {
 	f.record(r)
 	isTimed := strings.Contains(string(readAll(r)), `"rt":`)
-	if isTimed && f.blockTimed != nil {
-		f.mu.Lock()
-		ch := f.blockTimed
-		f.mu.Unlock()
-		if f.blockTimedTriggered != nil {
+	f.mu.Lock()
+	ch := f.blockTimed
+	trig := f.blockTimedTriggered
+	f.mu.Unlock()
+	if isTimed && ch != nil {
+		if trig != nil {
 			select {
-			case f.blockTimedTriggered <- struct{}{}:
+			case trig <- struct{}{}:
 			default:
 			}
 		}
@@ -681,6 +682,27 @@ func (h *testHarness) runTask(ctx context.Context) (task.Result, error) {
 		return o.res, o.err
 	case <-time.After(30 * time.Second):
 		h.t.Fatal("RunTask 超时")
+		return task.Result{}, nil
+	}
+}
+
+// runManualTask 执行手动 Task 并等待结果（带超时护栏）。
+func (h *testHarness) runManualTask(ctx context.Context, opts ManualRunOptions) (task.Result, error) {
+	h.t.Helper()
+	type outcome struct {
+		res task.Result
+		err error
+	}
+	ch := make(chan outcome, 1)
+	go func() {
+		res, err := h.app.RunManualTask(ctx, opts)
+		ch <- outcome{res, err}
+	}()
+	select {
+	case o := <-ch:
+		return o.res, o.err
+	case <-time.After(30 * time.Second):
+		h.t.Fatal("RunManualTask 超时")
 		return task.Result{}, nil
 	}
 }
@@ -2947,5 +2969,208 @@ func TestRunIgnoresRunWindow(t *testing.T) {
 	}
 	if h.weread.count("/web/book/read") != 3 {
 		t.Errorf("report 数 = %d，期望 3（任务完整执行）", h.weread.count("/web/book/read"))
+	}
+}
+
+// --- ticket 26：显式手动 run 语义、参数化与终态防降级 ---
+
+// TestRunManualTaskExactDuration 断言 ManualRunOptions.Minutes 精确覆盖 Target Duration，
+// 覆盖配置的 [ReadMinutesMin, ReadMinutesMax] 随机区间。
+func TestRunManualTaskExactDuration(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.ReadMinutesMin = 40
+		h.cfg.ReadMinutesMax = 70
+	})
+	res, err := h.runManualTask(context.Background(), ManualRunOptions{Minutes: 1})
+	if err != nil {
+		t.Fatalf("runManualTask 失败: %v", err)
+	}
+	if res.Planned != time.Minute {
+		t.Errorf("Planned = %v，期望 1 分钟（精确覆盖配置的 [40, 70] 区间）", res.Planned)
+	}
+}
+
+// TestRunManualTaskExplicitBookID 断言 ManualRunOptions.BookID 指定书籍，
+// 绕过候选配置（cfg.Books）与 Shelf 自动选书。
+func TestRunManualTaskExplicitBookID(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.Books = []string{"999999"} // 配置了其他候选书
+	})
+	res, err := h.runManualTask(context.Background(), ManualRunOptions{
+		Minutes: 1,
+		BookID:  testBookID, // 显式指定 testBookID (695233)
+	})
+	if err != nil {
+		t.Fatalf("runManualTask 失败: %v", err)
+	}
+	if res.BookID != testBookID {
+		t.Errorf("BookID = %s，期望显式指定的 %s", res.BookID, testBookID)
+	}
+}
+
+// TestRunManualTaskBookFallback 断言 ManualRunOptions 未指定 BookID 时，
+// 回退到现有的候选配置或 Shelf 自动选书。
+func TestRunManualTaskBookFallback(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.cfg.Books = []string{testBookID}
+	})
+	res, err := h.runManualTask(context.Background(), ManualRunOptions{
+		Minutes: 1,
+		BookID:  "", // 未指定
+	})
+	if err != nil {
+		t.Fatalf("runManualTask 失败: %v", err)
+	}
+	if res.BookID != testBookID {
+		t.Errorf("BookID = %s，期望回退配置的 %s", res.BookID, testBookID)
+	}
+}
+
+// TestRunManualTaskBypassesTodaySuccessTerminal 断言 manual run 独立于当天终态门控：
+// 当天已有 success 终态时，手动 run 依然启动并执行，不被 ErrTerminalSuccess 拒绝。
+func TestRunManualTaskBypassesTodaySuccessTerminal(t *testing.T) {
+	h := setup(t, nil)
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-06",
+		LastTaskResult: terminal.ResultSuccess,
+	})
+
+	res, err := h.runManualTask(context.Background(), ManualRunOptions{Minutes: 1})
+	if err != nil {
+		t.Fatalf("当天已有 success 终态时 manual run 应执行成功，实际报错: %v", err)
+	}
+	if res.Planned != time.Minute {
+		t.Errorf("Planned = %v，期望 1 分钟", res.Planned)
+	}
+	st, has, err := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("执行后终态 = %+v，期望保留 success", st)
+	}
+}
+
+// TestRunManualTaskPreservesTodaySuccessOnFailure 断言防降级规则（ticket 26）：
+// 当天已有 success 终态，随后执行的手动 Task 若失败，已持久化的 Terminal State
+// 保持 success（不降级为 failed），但失败通知仍然如实发送，且向调用方返回失败错误。
+func TestRunManualTaskPreservesTodaySuccessOnFailure(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true // 制造 timed report 拒绝导致 Task 失败
+	})
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-06",
+		LastTaskResult: terminal.ResultSuccess,
+	})
+
+	_, err := h.runManualTask(context.Background(), ManualRunOptions{Minutes: 1})
+	if err == nil {
+		t.Fatal("timed report 均被拒时 manual Task 应返回错误")
+	}
+
+	// 1. 持久化终态不降级：仍是 success。
+	st, has, terr := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if terr != nil || !has {
+		t.Fatalf("终态应存在: has=%v terr=%v", has, terr)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("防降级规则违背：终态被降级为 %q，期望保持 %q", st.LastTaskResult, terminal.ResultSuccess)
+	}
+
+	// 2. 失败通知仍然如实发送。
+	if got := len(h.bark.snapshot()); got != 1 {
+		t.Errorf("应发送 1 条失败通知，实际 %d", got)
+	}
+}
+
+// TestRunManualTaskWritesFailedWhenNoPriorSuccess 断言当天无 success 终态时
+// （当天无终态或已有 failed 终态），手动 Task 失败后持久化记录为 failed。
+func TestRunManualTaskWritesFailedWhenNoPriorSuccess(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.timedRejectAll = true
+	})
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-06",
+		LastTaskResult: terminal.ResultFailed,
+	})
+
+	_, err := h.runManualTask(context.Background(), ManualRunOptions{Minutes: 1})
+	if err == nil {
+		t.Fatal("timed report 均被拒时 manual Task 应返回错误")
+	}
+
+	st, has, terr := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if terr != nil || !has {
+		t.Fatalf("终态应存在: has=%v terr=%v", has, terr)
+	}
+	if st.LastTaskResult != terminal.ResultFailed {
+		t.Errorf("终态应记录为 failed，实际: %q", st.LastTaskResult)
+	}
+	if got := len(h.bark.snapshot()); got != 1 {
+		t.Errorf("应发送 1 条失败通知，实际 %d", got)
+	}
+}
+
+// TestRunManualTaskSuccessUpdatesFailedTerminal 断言当天已有 failed 终态时，
+// 手动 Task 成功后终态更新为 success，并发送成功通知。
+func TestRunManualTaskSuccessUpdatesFailedTerminal(t *testing.T) {
+	h := setup(t, nil)
+	seedTerminal(t, h.cfg.DataDir, terminal.State{
+		LastTaskDate:   "2025-09-06",
+		LastTaskResult: terminal.ResultFailed,
+	})
+
+	res, err := h.runManualTask(context.Background(), ManualRunOptions{Minutes: 1})
+	if err != nil {
+		t.Fatalf("manual run 应当成功: %v", err)
+	}
+	if res.Planned != time.Minute {
+		t.Errorf("Planned = %v，期望 1 分钟", res.Planned)
+	}
+
+	st, has, terr := terminal.NewFileStore(h.cfg.DataDir).Load()
+	if terr != nil || !has {
+		t.Fatalf("终态应存在: has=%v terr=%v", has, terr)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess {
+		t.Errorf("终态应更新为 success，实际: %q", st.LastTaskResult)
+	}
+	if got := len(h.bark.snapshot()); got != 1 {
+		t.Errorf("应发送 1 条成功通知，实际 %d", got)
+	}
+}
+
+// TestRunManualTaskRejectedWhenTaskRunning 断言已有 Task 运行时，
+// 第二个 Manual Task 被并发守卫拒绝（ErrTaskRunning）。
+func TestRunManualTaskRejectedWhenTaskRunning(t *testing.T) {
+	h := setup(t, func(h *testHarness) {
+		h.weread.blockTimed = make(chan struct{})
+		h.weread.blockTimedTriggered = make(chan struct{}, 1)
+	})
+	ctx := context.Background()
+
+	done := make(chan struct{})
+	var firstErr error
+	go func() {
+		defer close(done)
+		_, firstErr = h.runManualTask(ctx, ManualRunOptions{Minutes: 1})
+	}()
+
+	select {
+	case <-h.weread.blockTimedTriggered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("第一个 Task 未在 5s 内进入首笔 timed report")
+	}
+
+	// 第二个调用：立即被并发守卫拒绝。
+	_, err := h.app.RunManualTask(ctx, ManualRunOptions{Minutes: 1})
+	if !errors.Is(err, ErrTaskRunning) {
+		t.Errorf("错误应判别 ErrTaskRunning，实际: %v", err)
+	}
+
+	close(h.weread.blockTimed)
+	<-done
+	if firstErr != nil {
+		t.Fatalf("第一个 Task 不应受并发拒绝影响: %v", firstErr)
 	}
 }

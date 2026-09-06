@@ -5,11 +5,11 @@
 ## Language
 
 **Task**（任务）:
-一天的完整工作单元：正常自动执行在 Run Window 内随机启动，异常恢复时可按调度规则立即启动，也可由 `weread-cron run` 手动触发；选书、建立 Reading Session、周期上报直至达成 Target Duration 或最终失败。Task 启动后 Run Window 不再约束，可越过窗口结束点并跨午夜。Task 日期在启动时确定，success 与全部 failed 结果使用同一日期。每天持久化一份当前 Terminal State；自动 Task 形成终态后当天不再自动执行，failed 可由手动 `run` 重试。调度层不做 whole-Task 自动重排。
+一天的完整工作单元：正常自动执行在 Run Window 内随机启动，异常恢复时可按调度规则立即启动，也可由 `weread-cron run` 显式参数化手动触发（指定时长与可选书籍）；选书、建立 Reading Session、周期上报直至达成 Target Duration 或最终失败。Task 启动后 Run Window 不再约束，可越过窗口结束点并跨午夜。Task 日期在启动时确定，success 与全部 failed 结果使用同一日期。每天持久化一份当前 Terminal State；自动 Task 形成终态后当天不再自动执行。手动 Task 不受当天终态阻拦，且失败时遵循防降级规则保留当天的已有 success 终态。调度层不做 whole-Task 自动重排。
 _Avoid_: job、run、定时任务
 
 **Terminal State**（终态）:
-Task 结束时落盘的最小记录：`last_task_date + last_task_result`（`success` 或 `failed`）。success 与 failed 都阻止当天再次自动执行；failed 允许 `weread-cron run` 手动重试并更新为 success。
+Task 结束时落盘的最小记录：`last_task_date + last_task_result`（`success` 或 `failed`）。success 与 failed 都阻止当天再次自动执行；手动 `weread-cron run` 可按需显式触发执行，成功时记录或保留 success，失败时若当天已有 success 则保留 success（防降级规则）。
 
 **Reading Session**（阅读会话）:
 单本书从 enter report 到结束的连续上报周期。一个 Task 只有一个 Reading Session，只使用一本书。
@@ -34,7 +34,7 @@ _Avoid_: report（裸用）
 每日可随机启动 Task 的时间区间；只约束开始时间，不约束结束时间。
 
 **Target Duration**（目标时长）:
-每次 Task 开始时在配置的 [min, max] 区间内随机生成的当天阅读目标；只在任务开始时生成一次。
+每次 Task 开始时确定的当天阅读目标：自动 Task 在配置的 [min, max] 区间内随机生成一次；手动 Task 由 `--minutes` 显式精确指定。
 
 **Shelf**（书架）:
 当前账号的书籍集合；自动选书的来源。

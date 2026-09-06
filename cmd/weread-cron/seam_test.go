@@ -77,6 +77,12 @@ func TestSeamHelpAndUnknownCommand(t *testing.T) {
 	}{
 		{"--help 退出码 2 + 用法", []string{"--help"}, "用法"},
 		{"-h 退出码 2 + 用法", []string{"-h"}, "用法"},
+		{"run --help 退出码 2 + 用法", []string{"run", "--help"}, "--minutes <N>"},
+		{"run -h 退出码 2 + 用法", []string{"run", "-h"}, "--minutes <N>"},
+		{"run 缺参数退出码 2", []string{"run"}, "缺少必需参数 --minutes"},
+		{"run --minutes 0 退出码 2", []string{"run", "--minutes", "0"}, "必须为正整数"},
+		{"run --minutes -5 退出码 2", []string{"run", "--minutes", "-5"}, "必须为正整数"},
+		{"run --minutes abc 退出码 2", []string{"run", "--minutes", "abc"}, "必须为正整数"},
 		{"未知子命令退出码 2", []string{"frobnicate"}, "未知子命令"},
 		{"未知 flag 退出码 2", []string{"--bogus"}, "未知 flag"},
 	} {

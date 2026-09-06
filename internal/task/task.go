@@ -160,7 +160,19 @@ type Options struct {
 	// TZ 决定 Task 日期等时间语义。
 	TZ *time.Location
 
+	// Manual 是手动 Task 的指定参数（ticket 26；Minutes > 0 时精确覆盖时长）。
+	Manual ManualOptions
+
 	Logger *slog.Logger
+}
+
+// ManualOptions 是手动 Task 的指定参数（ticket 26）。
+type ManualOptions struct {
+	// Minutes > 0 时精确覆盖 Target Duration（手动 run --minutes N）。
+	Minutes int
+	// BookID 非空时精确指定阅读书籍（手动 run --book <bookId>），
+	// 绕过 Books 候选配置与自动选书。
+	BookID string
 }
 
 // Result 是任务结果（stdout 摘要与通知内容的数据源）。
@@ -217,16 +229,27 @@ func New(opts Options) *Runner {
 func (r *Runner) Run(ctx context.Context) (Result, error) {
 	o := r.opts
 
-	// 1. 选书：指定候选随机取一（用户故事 #18）；未指定 = 自动从 Shelf 选书（用户故事
-	//    #19–#23，ticket 09）——自动选书需要登录后访问 Shelf，故放在 renewal 之后。
-	autoSelect := len(o.Books) == 0
+	// 1. 选书：显式指定书籍（ticket 26：Manual.BookID 非空）；未显式指定时，候选配置随机取一
+	//    （用户故事 #18）；均未指定 = 自动从 Shelf 选书（用户故事 #19–#23，ticket 09）——
+	//    自动选书需要登录后访问 Shelf，故放在 renewal 之后。
 	var bookID string
-	if !autoSelect {
+	autoSelect := false
+	if o.Manual.BookID != "" {
+		bookID = o.Manual.BookID
+	} else if len(o.Books) > 0 {
 		bookID = o.Books[o.RNG.Intn(len(o.Books))]
+	} else {
+		autoSelect = true
 	}
 
-	// 2. Target Duration：每次 Task 只生成一次（用户故事 #16；seeded RNG 下确定性）。
-	target := time.Duration(o.TargetMinMinutes+o.RNG.Intn(o.TargetMaxMinutes-o.TargetMinMinutes+1)) * time.Minute
+	// 2. Target Duration：手动指定（ticket 26：Manual.Minutes > 0）使用精确时长；
+	//    否则每次 Task 在配置区间只生成一次（用户故事 #16；seeded RNG 下确定性）。
+	var target time.Duration
+	if o.Manual.Minutes > 0 {
+		target = time.Duration(o.Manual.Minutes) * time.Minute
+	} else {
+		target = time.Duration(o.TargetMinMinutes+o.RNG.Intn(o.TargetMaxMinutes-o.TargetMinMinutes+1)) * time.Minute
+	}
 
 	// 2.5 Task 所属日期（ticket 24）：在 Task 启动时确定一次（开始日的 TZ 日期，窗口
 	//     所属日）、对 success 与全部 failed 路径恒稳定。窗口末尾的 Task 可越过午夜
@@ -592,8 +615,23 @@ func (r *Runner) finalizeTransient(ctx context.Context, stage string, cause erro
 // 结果与终态（用户故事 #38），仅记日志。
 func (r *Runner) finalize(ctx context.Context, st terminal.State, notify func(context.Context) error) error {
 	o := r.opts
-	if err := o.Terminal.Save(st); err != nil {
-		return fmt.Errorf("写入 Terminal State 失败: %w", err)
+	shouldSave := true
+	// 防降级规则（ticket 26）：若失败 Task 的所属日期已有 success 终态，保留已有的 success
+	// 终态（不降级为 failed）。
+	if st.LastTaskResult == terminal.ResultFailed {
+		existing, has, err := o.Terminal.Load()
+		if err != nil {
+			return fmt.Errorf("读取 Terminal State 失败: %w", err)
+		}
+		if has && existing.LastTaskDate == st.LastTaskDate && existing.LastTaskResult == terminal.ResultSuccess {
+			shouldSave = false
+			o.Logger.Info("当天已有 success 终态，保留已持久化的 success 终态（防降级规则生效）", "date", st.LastTaskDate)
+		}
+	}
+	if shouldSave {
+		if err := o.Terminal.Save(st); err != nil {
+			return fmt.Errorf("写入 Terminal State 失败: %w", err)
+		}
 	}
 	if o.Notify == nil || notify == nil {
 		return nil
