@@ -62,6 +62,7 @@
 //   - 恢复链内 refresh（recoverSend step 0/3）：采用新 Context 后，链内重试即重建
 //     enter（不再复用调用方传入的发送闭包——timed 阶段的链内重试不再是 timed
 //     report；enter 无 rt，重试步不做超阈值判定）。
+//
 // re-enter 成功不得清零连续 timed-report failure budget（issue 27：只有被接受的
 // timed report 清零）且计入预算——服务器持续拒绝 timed（enter 被接受）时，拒绝 +
 // 重建循环必须收敛为 failed 终态（spec 决策 #7/#9/#12 有界收敛）。任何一笔 timed
@@ -132,8 +133,9 @@ var ErrTaskRunning = errors.New("已有 Task 正在运行，拒绝并发启动�
 
 // errIntervalOverThreshold 是一次上报尝试发现"距上次被接受上报的间隔已超过异常阈值"
 // 的内部哨兵错误（ADR-0004 连续性失效；ticket 28，findings/07 H2）：该间隔不得作为
-// 一笔 rt 上报（绝不落线），由调用方重建 Reading Session。首次尝试与恢复链内重试
-// （重算 rt 后）共用同一判定；仅在 timed 循环内被识别，不外露。
+// 一笔 rt 上报（绝不落线），由调用方重建 Reading Session。由 timed 发送闭包的首次
+// 尝试返回（issue 31：恢复链内重试即重建 enter，enter 无 rt、不再执行本判定）；仅在
+// timed 循环内被识别，不外露。
 var errIntervalOverThreshold = errors.New("间隔超过异常阈值，Reading Session 连续性失效")
 
 // 内部默认值（spec 决策 #13：不暴露为配置）。
@@ -348,14 +350,25 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 	// issue 30：会话级 pc 随 Reading Session 携带（TTL/恢复链刷新不改变，仅重建时更新）。
 	sessionPC := enterResult.pc
 
+	// adoptSession 采纳一次重建 enter 的结果为新会话状态（issue 31）：更新当前
+	// Context、rt 基准与会话级 pc（重建 = 新会话 = 新会话级 pc），并把下一节奏点
+	// 锚定到新 enter 被接受时刻（旧会话的长间隔不作为一笔大 rt 上报；ADR-0004）。
+	next := lastSent.Add(DefaultRhythm)
+	adoptSession := func(r sendResult) {
+		st, lastSent = r.st, r.at
+		sessionPC = r.pc
+		next = lastSent.Add(DefaultRhythm)
+	}
+
 	// 7. 周期 timed report；rt 按 ADR-0004；本地累计达标即停止（用户故事 #27/#28）。
 	//    被拒时按有界恢复链恢复（spec 决策 #7），恢复成功后 Task 继续。
 	//    ticket 12/24：单次传输级失败（非拒绝）不再终止 Task——跳过本节奏点、Reading
 	//    Session 继续，被跳过的间隔自然并入下一次被接受上报的 rt；连续失败达到
 	//    DefaultMaxConsecutiveReportFailures 预算才判定本 Task 最终失败（收敛为
-	//    failed 终态 + 失败通知）。ticket 28：恢复链内重试重算 rt 超阈值（连续性
-	//    断链、不发送）的终止同样计入该预算——拒绝 + 慢恢复的循环必有界收敛。
-	next := lastSent.Add(DefaultRhythm)
+	//    failed 终态 + 失败通知）。issue 31：恢复链内重试即重建 enter（见下 reEnter
+	//    分支；链内无超限判定），重建代价与重建次数经连续失败预算有界收敛——重建
+	//    enter 不清零预算（issue 27：只有被接受的 timed report 清零），恢复链重建
+	//    enter 计入预算，拒绝 + 慢恢复的循环必有界收敛。
 	var accumulated time.Duration
 	reports := 0
 	consecutiveFailures := 0
@@ -404,11 +417,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			if err != nil {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 			}
-			st, lastSent = enterResult.st, enterResult.at
-			// issue 30/31：重建 = 明确建立新的 Reading Session → 解析新的会话级 pc
-			// （fallback 场景不复用前一会话的值；可用 pclts 场景取新 Context 原值）。
-			sessionPC = enterResult.pc
-			next = lastSent.Add(DefaultRhythm)
+			adoptSession(enterResult)
 			continue
 		} else {
 			st = *fresh
@@ -447,11 +456,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 			if err != nil {
 				return Result{}, fmt.Errorf("重建 Reading Session 的 enter report 失败: %w", r.finalizeTransient(ctx, StageEnterReport, err, taskDate))
 			}
-			st, lastSent = enterResult.st, enterResult.at
-			// issue 30：重建 = 明确建立新的 Reading Session → 解析新的会话级 pc
-			// （fallback 场景不复用前一会话的值，值 = e(重建时刻)）。
-			sessionPC = enterResult.pc
-			next = lastSent.Add(DefaultRhythm)
+			adoptSession(enterResult)
 			continue
 		}
 		if err != nil {
@@ -496,9 +501,7 @@ func (r *Runner) Run(ctx context.Context) (Result, error) {
 				return Result{}, r.finalizeTransient(ctx, StageTimedReport, cause, taskDate)
 			}
 			o.Logger.Warn("timed report 被拒，恢复链重建 Reading Session 后继续（新会话；预算未清零）", "consecutive_failures", consecutiveFailures)
-			st, lastSent = res.st, res.at
-			sessionPC = res.pc
-			next = lastSent.Add(DefaultRhythm)
+			adoptSession(res)
 			continue
 		}
 		consecutiveFailures = 0
