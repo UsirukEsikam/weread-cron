@@ -1,7 +1,7 @@
-// Package scheduler 测试：nextStart 纯决策函数（ADR-0001/0002）——窗口只约束开始
-// 时间、终态门控、[now, 窗口结束] 重排、错过不补跑、start==end 固定时刻、跨午夜
-// 窗口为配置错误、TZ 决定日期边界。直接在调度层单元测试（spec Testing Decisions：
-// 纯逻辑不形成额外 seam）。
+// Package scheduler 测试：nextStart/CanStartAt 纯决策函数（ADR-0001/0002；ticket
+// 17）——窗口只约束开始时间、终态门控、窗口内立即执行、错过不补跑、start==end
+// 固定时刻、跨午夜窗口为配置错误、TZ 决定日期边界、启动前 Run Window 复查。
+// 直接在调度层单元测试（spec Testing Decisions：纯逻辑不形成额外 seam）。
 package scheduler
 
 import (
@@ -213,6 +213,96 @@ func TestNextStartDeterministicWithSeed(t *testing.T) {
 	}
 	if !a.Equal(b) {
 		t.Errorf("同种子结果不一致: %v vs %v", a, b)
+	}
+}
+
+// TestCanStartAt 验证启动前 Run Window 复查的纯决策（ticket 17；ADR-0001：窗口
+// 只约束 Task 开始时刻）：睡眠返回后当前时刻仍未越过"计划启动日"的窗口结束 →
+// 可启动（含恰在结束点）；已越过窗口结束但相对计划启动时刻的迟到在调度容差内
+// （真实时钟睡眠过冲，毫秒级）→ 可启动（start==end 固定时刻的常规唤醒即此情形，
+// 不得误判为挂起）；真实时间跳变（主机挂起/恢复）越过窗口结束 → 不可启动，
+// daemon 改排次日。
+func TestCanStartAt(t *testing.T) {
+	win1 := win(23*60+30, 23*60+59) // [23:30, 23:59]
+	fixed := win(120, 120)          // 固定 02:00
+	cases := []struct {
+		name    string
+		now     time.Time
+		planned time.Time
+		window  Window
+		want    bool
+	}{
+		{
+			name:    "窗口内正常唤醒：可启动",
+			now:     at(2025, 9, 6, 23, 45),
+			planned: at(2025, 9, 6, 23, 45),
+			window:  win1,
+			want:    true,
+		},
+		{
+			name:    "恰在窗口结束点：可启动",
+			now:     at(2025, 9, 6, 23, 59),
+			planned: at(2025, 9, 6, 23, 50),
+			window:  win1,
+			want:    true,
+		},
+		{
+			name:    "挂起跳变越过窗口结束：不可启动（改排次日）",
+			now:     at(2025, 9, 7, 0, 5),
+			planned: at(2025, 9, 6, 23, 45),
+			window:  win1,
+			want:    false,
+		},
+		{
+			name:    "计划=窗口结束点、真实时钟过冲迟到 2s（容差内）：可启动",
+			now:     at(2025, 9, 6, 23, 59).Add(2 * time.Second),
+			planned: at(2025, 9, 6, 23, 59),
+			window:  win1,
+			want:    true,
+		},
+		{
+			name:    "计划=窗口结束点、迟到超过容差：不可启动",
+			now:     at(2025, 9, 6, 23, 59).Add(startGrace + time.Second),
+			planned: at(2025, 9, 6, 23, 59),
+			window:  win1,
+			want:    false,
+		},
+		{
+			name:    "固定时刻：准时唤醒",
+			now:     at(2025, 9, 6, 2, 0),
+			planned: at(2025, 9, 6, 2, 0),
+			window:  fixed,
+			want:    true,
+		},
+		{
+			name:    "固定时刻：真实时钟过冲迟到 3s（容差内）",
+			now:     at(2025, 9, 6, 2, 0).Add(3 * time.Second),
+			planned: at(2025, 9, 6, 2, 0),
+			window:  fixed,
+			want:    true,
+		},
+		{
+			name:    "固定时刻：迟到超过容差",
+			now:     at(2025, 9, 6, 2, 0).Add(startGrace + time.Second),
+			planned: at(2025, 9, 6, 2, 0),
+			window:  fixed,
+			want:    false,
+		},
+		{
+			name:    "固定时刻：挂起跳变越过",
+			now:     at(2025, 9, 6, 3, 0),
+			planned: at(2025, 9, 6, 2, 0),
+			window:  fixed,
+			want:    false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := CanStartAt(tc.now, tc.planned, tc.window); got != tc.want {
+				t.Errorf("CanStartAt(now=%v, planned=%v, %s) = %v，期望 %v",
+					tc.now, tc.planned, tc.window, got, tc.want)
+			}
+		})
 	}
 }
 

@@ -135,6 +135,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			continue
 		}
 
+		// 启动前复查 Run Window（ticket 17）：睡眠期间主机挂起/恢复造成时间跳变时，
+		// 睡眠返回后的当前时刻可能已越过当天窗口结束——Run Window 只约束 Task 开始
+		// 时刻（ADR-0001），越出窗口的启动时刻不合规：跳过本次自动执行，由下一轮
+		// schedule 排定次日（错过不补跑，ADR-0002）。start==end 固定时刻的准时唤醒
+		// 由 CanStartAt 的调度容差覆盖，不受影响。
+		if !CanStartAt(d.clk.Now(), next, d.window()) {
+			d.log.Info("已越过 Run Window 结束（睡眠期间时间跳变），跳过自动执行，排定次日")
+			continue
+		}
+
 		d.log.Info("已到启动时刻，执行 Task",
 			"at", d.clk.Now().In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
 		if _, err := d.task.RunTask(ctx); err != nil {
@@ -186,7 +196,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 func (d *Daemon) nextDayStart() (time.Time, error) {
 	t := d.clk.Now().In(d.cfg.TZ)
 	tomorrow := time.Date(t.Year(), t.Month(), t.Day()+1, 0, 0, 0, 0, d.cfg.TZ)
-	next, err := NextStart(tomorrow, Window{Start: d.cfg.WindowStart, End: d.cfg.WindowEnd}, terminal.State{}, d.cfg.TZ, d.rng)
+	next, err := NextStart(tomorrow, d.window(), terminal.State{}, d.cfg.TZ, d.rng)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("计算次日启动时刻失败: %w", err)
 	}
@@ -201,7 +211,7 @@ func (d *Daemon) schedule() (time.Time, error) {
 	if err != nil {
 		return time.Time{}, fmt.Errorf("读取 Terminal State 失败: %w", err)
 	}
-	next, err := NextStart(now, Window{Start: d.cfg.WindowStart, End: d.cfg.WindowEnd}, st, d.cfg.TZ, d.rng)
+	next, err := NextStart(now, d.window(), st, d.cfg.TZ, d.rng)
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -210,6 +220,11 @@ func (d *Daemon) schedule() (time.Time, error) {
 	}
 	d.log.Info("已排定下次 Task 启动", "at", next.In(d.cfg.TZ).Format(terminal.DayLayout+" 15:04:05"))
 	return next, nil
+}
+
+// window 返回配置的 Run Window（Start==End = 固定时刻；合法性由 config 校验）。
+func (d *Daemon) window() Window {
+	return Window{Start: d.cfg.WindowStart, End: d.cfg.WindowEnd}
 }
 
 // terminalDone 报告今天（cfg.TZ）是否已形成终态（启动前再校验用）。

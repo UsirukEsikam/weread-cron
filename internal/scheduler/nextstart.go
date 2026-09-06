@@ -1,6 +1,7 @@
 // Package scheduler 是 daemon 的调度层：nextStart 纯决策函数（ADR-0001/0002 的
 // 调度语义）与 daemon 主循环（恢复 Login Session → 计算下次启动 → 睡眠到点 →
-// 启动前再校验当天终态 → 执行 Task → 排定次日，spec 决策 #8/#9）。
+// 启动前再校验当天终态与 Run Window → 执行 Task → 排定次日，spec 决策 #8/#9；
+// ticket 17：睡眠/挂起越过窗口结束则不启动，改排次日）。
 package scheduler
 
 import (
@@ -66,7 +67,7 @@ func NextStart(now time.Time, win Window, last terminal.State, tz *time.Location
 	}
 
 	start := day.Add(minutes(win.Start))
-	end := day.Add(minutes(win.End))
+	end := dayWindowEnd(day, win)
 	switch {
 	case now.Before(start):
 		// 窗口尚未开始：今天窗口内随机。
@@ -81,6 +82,42 @@ func NextStart(now time.Time, win Window, last terminal.State, tz *time.Location
 		return now, nil
 	}
 }
+
+// CanStartAt 报告 now 是否仍是可启动的 Task 启动时刻（daemon 睡眠返回后的 Run
+// Window 复查，ticket 17；ADR-0001：窗口只约束 Task 开始时刻）。
+//
+// 判定以"计划启动日"（planned 所在日）的窗口为基准：
+//   - now 未越过窗口结束（now ≤ 计划日 end）→ 可启动（含恰在结束点；与 NextStart
+//     的"窗口内立即执行"边界一致）；
+//   - now 已越过窗口结束，但相对 planned 的迟到 ≤ startGrace（睡眠准时返回、仅真实
+//     时钟过冲）→ 可启动（start==end 固定时刻的常规唤醒即此情形，不得误判为挂起）；
+//   - 其余 → 不可启动：真实时间跳变（主机挂起/恢复）已使启动时刻越出窗口，越出即
+//     "错过当天"，daemon 改排次日（错过不补跑，ADR-0002）。
+//
+// 前置条件：now ≥ planned（sleepUntil 只在其目标时刻到达或越过之后返回；调用点即
+// daemon 的睡眠返回处）。窗口配置已由 config 校验（Window.Valid），本函数不复检。
+func CanStartAt(now, planned time.Time, win Window) bool {
+	plannedDay := time.Date(planned.Year(), planned.Month(), planned.Day(), 0, 0, 0, 0, planned.Location())
+	end := dayWindowEnd(plannedDay, win)
+	if !now.After(end) {
+		return true
+	}
+	return now.Sub(planned) <= startGrace
+}
+
+// dayWindowEnd 返回 day（当天 00:00）的窗口结束时刻（与 minutes 同级窗口算术
+// 助手：NextStart 与 CanStartAt 共用同一"窗口结束"定义）。
+func dayWindowEnd(day time.Time, win Window) time.Time {
+	return day.Add(minutes(win.End))
+}
+
+// startGrace 是窗口复查对"准时唤醒的调度迟到"的容差（ticket 17）：真实时钟下
+// time.Sleep 过冲毫秒级，且复查前还有终态载入等 I/O，启动时刻可能比计划启动时刻
+// 晚一点；start==end 固定时刻窗口的计划启动时刻==窗口结束点，任何过冲都会被
+// "已越过窗口结束"判为不可启动而整天错过（真实时钟破坏 ADR-0001 语义）。容差把
+// 调度自身的迟到与"挂起/恢复造成的时间跳变"区分开：跳变以秒、分钟计，远大于
+// 该值。
+const startGrace = 5 * time.Second
 
 // randomInWindow 在 day（当天 00:00）的窗口 [Start, End] 内随机取一时刻（秒级）。
 func randomInWindow(day time.Time, win Window, rng *rand.Rand) time.Time {

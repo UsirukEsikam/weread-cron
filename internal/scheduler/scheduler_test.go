@@ -394,6 +394,86 @@ func TestDaemonStartsImmediatelyInsideWindowAtStartup(t *testing.T) {
 	}
 }
 
+// TestDaemonSkipsStartWhenWindowPassedAfterSuspend：睡眠期间主机挂起/恢复造成时间
+// 跳变越过窗口结束（ticket 17 验收 1）——daemon 在窗口前启动（23:00，窗口
+// [23:30, 23:59]），睡眠期间时钟跳变到次日 00:05；睡眠立即返回（目标时刻已过）→
+// 窗口复查判定已越过窗口结束 → 不启动 Task，改排次日。Capped 钉在次日窗口前
+// （23:20），取消时序确定。
+func TestDaemonSkipsStartWhenWindowPassedAfterSuspend(t *testing.T) {
+	cfg := daemonConfig(t, nil) // 窗口 [23:30, 23:59]
+	var clk *clock.Capped
+	jumped := false
+	// 时间推进到 23:20（必早于最早计划启动点 23:30，daemon 仍在睡眠中）时模拟
+	// 挂起：时钟跳变到次日 00:05（越过窗口结束）。只跳一次。
+	clk = clock.NewCapped(at(2025, 9, 6, 23, 0), at(2025, 9, 7, 23, 20),
+		func(now time.Time) {
+			if !jumped && !now.Before(at(2025, 9, 6, 23, 20)) && now.Before(at(2025, 9, 6, 23, 30)) {
+				jumped = true
+				clk.Fake.Advance(at(2025, 9, 7, 0, 5).Sub(now))
+			}
+		})
+	runner := &recordingRunner{term: terminal.NewFileStore(cfg.DataDir), tz: cfg.TZ, clk: clk}
+	var out syncBuffer
+	d := New(cfg, Deps{
+		Clock:  clk,
+		RNG:    rand.New(rand.NewSource(7)),
+		Task:   runner,
+		Logger: slog.New(slog.NewTextHandler(&out, nil)),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := startDaemon(t, d, ctx)
+
+	// 越过窗口结束 → 跳过自动执行，随后排定次日（含次日日期）。
+	waitFor(t, &out, "已越过 Run Window 结束")
+	waitFor(t, &out, "2025-09-07")
+	cancel()
+	if err := waitDone(); err != nil {
+		t.Errorf("取消后应返回 nil，got %v", err)
+	}
+	if n := runner.count(); n != 0 {
+		t.Errorf("越过窗口结束不得启动 Task，实际调用 %d 次", n)
+	}
+	if got := out.String(); strings.Contains(got, "已到启动时刻，执行 Task") {
+		t.Errorf("越过窗口结束不得执行 Task:\n%s", got)
+	}
+	if got := out.String(); !strings.Contains(got, "daemon 退出") {
+		t.Errorf("缺少退出日志:\n%s", got)
+	}
+}
+
+// TestDaemonStartsAtFixedTimeWindow：start==end 固定时刻窗口（ticket 17 验收 3）——
+// 窗口 [02:00, 02:00]：daemon 01:00 启动（窗口前）→ 计划启动时刻 02:00（== 窗口
+// 结束点）→ 准时唤醒后窗口复查放行（CanStartAt 的调度容差覆盖真实时钟过冲）→
+// 执行 Task，success 终态后排定次日。
+func TestDaemonStartsAtFixedTimeWindow(t *testing.T) {
+	cfg := daemonConfig(t, func(c *config.Config) {
+		c.WindowStart = 120
+		c.WindowEnd = 120 // 固定 02:00
+	})
+	d, out, runner := newDaemon(cfg, at(2025, 9, 6, 1, 0), at(2025, 9, 6, 3, 0), nil, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	waitDone := startDaemon(t, d, ctx)
+
+	waitFor(t, out, "已到启动时刻，执行 Task")
+	waitFor(t, out, "Task 完成，排定次日")
+	waitFor(t, out, "2025-09-07")
+	cancel()
+	if err := waitDone(); err != nil {
+		t.Errorf("取消后应返回 nil，got %v", err)
+	}
+	if n := runner.count(); n != 1 {
+		t.Errorf("固定时刻窗口应执行一次 Task，实际调用 %d 次", n)
+	}
+	// success 终态已落盘（Task 执行成功；daemon 不改写）。
+	st, has, err := terminal.NewFileStore(cfg.DataDir).Load()
+	if err != nil || !has {
+		t.Fatalf("终态应存在: has=%v err=%v", has, err)
+	}
+	if st.LastTaskResult != terminal.ResultSuccess || st.LastTaskDate != "2025-09-06" {
+		t.Errorf("终态 = %+v，期望 2025-09-06/success", st)
+	}
+}
+
 // TestDaemonSchedulesNextDayAfterFailedTerminal：Task 形成 failed 终态（恢复链耗尽）→
 // 当天不再自动重跑，排定次日（ADR-0002：success 与 failed 都阻止当天再次自动执行）。
 func TestDaemonSchedulesNextDayAfterFailedTerminal(t *testing.T) {
