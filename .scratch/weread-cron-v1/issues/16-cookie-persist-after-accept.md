@@ -5,7 +5,7 @@
 **Finding:** F6 · .scratch/weread-cron-v1/findings/01-implementation-review.md
 **Category:** bug
 **Blocked by:** None
-**Status:** ready-for-agent
+**Status:** resolved
 
 **What to build:** 公共 HTTP 响应路径先校验状态与业务成功、再并入并持久化响应 Set-Cookie；失败的 renewal 等响应不改写持久化 Login Session。
 
@@ -41,3 +41,28 @@
 Review 输入 F6 已对当前代码确认：
 
 - 公共 do() 路径顺序：读 body → 合并响应 Set-Cookie → 校验 HTTP 状态 → 返回；Renewal 在此基础上再解析 succ。失败响应（非 200 或 succ != 1）的 Set-Cookie 已被合并并持久化。
+
+## Answer
+
+实现「响应 Set-Cookie 在响应被接受后才并入并持久化」（F6）。
+
+1. **公共 HTTP 路径不再提前合并**：`Client.do()` 只返回 body 与响应 Set-Cookie（非 200 响应不返回其 Set-Cookie），合并动作从响应处理早期整体移除；新增公开 `Client.MergeResponseCookies` 作为显式"接受后合并"步骤（沿用原"并入响应 Cookie 失败"包装语义）。
+2. **各业务调用方在成功判定后触发合并**：
+   - renewal（`Client.Renewal`）：HTTP 200 + succ 确认后才合并；明确拒绝（succ!=1）与 succ 缺失（暂时性失败）均不合并、不改写持久化 Login Session；
+   - report（`report.Sender.Enter/Timed`）：`Client.Report` 返回响应 Set-Cookie，`IsAccepted`（succ==1 或 synckey 存在）通过后才合并——被拒响应不合并（`ErrRejected` 判别不受影响）；
+   - Reader（`readercontext.Provider.fetch`）：`Client.ReaderPage` 返回响应 Set-Cookie，`__INITIAL_STATE__` 解析成功后才合并；
+   - Shelf（`Client.Shelf`）：`ParseShelfResponse` 业务成功（errCode==0）后才合并。
+3. **会话层不变**：`session.MergeAndSaveCookies` 的并入 + 原子持久化语义保持；合并/持久化失败仍使操作失败（错误链保留历史前缀，如"renewal 请求失败: 并入响应 Cookie 失败…"），不静默吞错。
+
+### 测试覆盖
+
+- `TestRenewalMergesCookiesOnlyAfterAcceptance`（weread 单测，表驱动 5 子用例）：HTTP 500 / succ=0 / succ 缺失携带 Set-Cookie 均不触发合并回调；成功携带时合并回调 1 次且 Cookie 原样交付；成功无 Set-Cookie 时零调用。
+- `TestRenewalMergeFailurePreservesErrorSemantics`（weread 单测）：合并失败仍使 renewal 报错、包装"并入响应 Cookie 失败"、不归类为登录失效。
+- `TestRunRejectedRenewalDoesNotMergeResponseCookies` / `TestRunRenewalNoSuccFailureDoesNotMergeResponseCookies`（应用 seam）：失败 renewal 响应携带的 Set-Cookie 不进持久化会话文件（预置 OLDSTALE 不被覆盖）。
+- `TestRunRejectedReportDoesNotMergeResponseCookies`（应用 seam）：被拒 enter 响应携带的 Set-Cookie 不并入；renewal 新 Cookie 照常并入（回归）。
+- `TestRunReaderPageFailureDoesNotMergeResponseCookies`、`TestListBooksShelfRejectedDoesNotMergeResponseCookies`（应用 seam）：Reader/Shelf 失败响应的 Set-Cookie 不并入、成功路径照常（一致语义）。
+- 回归保持：`TestRunHappyPath`（renewal 成功 Cookie 并入并落盘）、`TestRunRestartRestoresRenewedSession`、`TestListBooksHappyPath`、session 包全部测试、登录失效重建/恢复链测试均通过。
+- 全部验证：`go test ./...`、`go vet ./...` 通过（`internal/weread/protocol.go` 的既有 gofmt 偏差不在本票范围）。
+- 反向验证：临时恢复旧行为（do() 内提前合并）后上述失败路径断言如期失败，确认测试真实覆盖 F6。
+
+**Commit:** 待提交（fix + docs 两条）

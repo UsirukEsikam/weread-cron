@@ -92,3 +92,60 @@ func TestRenewalMergeFailurePreservesErrorSemantics(t *testing.T) {
 		t.Errorf("合并失败不得归类为登录失效: %v", err)
 	}
 }
+
+// TestShelfMergesCookiesOnlyAfterBusinessAcceptance 断言 Shelf 的 Set-Cookie 只在
+// 业务接受（errCode==0）后并入（issue 16 一致语义）：errCode!=0 失败响应不触发合并；
+// 成功触发且 Cookie 原样交付；合并失败报错语义保持（"抓取 Shelf 失败: 并入响应
+// Cookie 失败"，与历史错误链一致）。
+func TestShelfMergesCookiesOnlyAfterBusinessAcceptance(t *testing.T) {
+	failMerge := errors.New("磁盘故障")
+	cases := []struct {
+		name      string
+		body      string
+		mergeErr  error
+		wantErr   bool
+		wantMerge int
+		wantBooks int
+	}{
+		{name: "errCode!=0 携带 Set-Cookie", body: `{"errCode":-2010,"errMsg":"用户不存在"}`, wantErr: true, wantMerge: 0},
+		{name: "成功携带 Set-Cookie", body: `{"books":[{"bookId":"601111","title":"书","finishReading":0}]}`, wantMerge: 1, wantBooks: 1},
+		{name: "成功但合并失败", body: `{"books":[]}`, mergeErr: failMerge, wantErr: true, wantMerge: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				http.SetCookie(w, &http.Cookie{Name: "wr_gid", Value: "ok123", Path: "/"})
+				w.Write([]byte(tc.body))
+			}))
+			defer srv.Close()
+
+			merged := 0
+			var got []*http.Cookie
+			c := NewClient(srv.URL, srv.Client(), DefaultUserAgent,
+				func() string { return "" },
+				func(cookies []*http.Cookie) error {
+					merged++
+					got = cookies
+					return tc.mergeErr
+				})
+			books, err := c.Shelf(context.Background())
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("Shelf() err = %v，wantErr = %v", err, tc.wantErr)
+			}
+			if tc.wantErr && tc.mergeErr != nil && !strings.Contains(err.Error(), "并入响应 Cookie 失败") {
+				t.Errorf("合并失败应包装「并入响应 Cookie 失败」，实际: %v", err)
+			}
+			if merged != tc.wantMerge {
+				t.Errorf("合并回调调用次数 = %d，期望 %d", merged, tc.wantMerge)
+			}
+			if tc.wantMerge == 1 && tc.mergeErr == nil {
+				if len(got) != 1 || got[0].Name != "wr_gid" || got[0].Value != "ok123" {
+					t.Errorf("合并的 Cookie = %+v，期望 wr_gid=ok123", got)
+				}
+			}
+			if !tc.wantErr && len(books) != tc.wantBooks {
+				t.Errorf("books = %+v，期望 %d 本", books, tc.wantBooks)
+			}
+		})
+	}
+}
