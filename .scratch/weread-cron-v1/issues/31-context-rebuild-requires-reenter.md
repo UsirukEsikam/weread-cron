@@ -6,7 +6,7 @@
 **Category:** bug
 **Blocked by:** None
 **Related:** ticket 06（Reading Session 维护 / TTL 主动刷新，resolved）、ticket 23（受控真实账号验证 / checklist）、ticket 27（恢复性 enter 不清零失败预算，resolved）、ticket 28（恢复链大间隔连续性，resolved）、ticket 30（fallback pc 会话内稳定，resolved）
-**Status:** ready-for-agent
+**Status:** resolved
 
 ## Agent Brief
 
@@ -60,3 +60,25 @@
 ## 验证记录（triage）
 
 已对照 `internal/task/task.go` 确认现状：TTL 主动刷新（timed 循环每笔前的 `Reader.Fetch`）与恢复链 refresh（`recoverSend` step 0/3）都只替换 Reader Context、不 re-enter；retry 步骤复用调用方传入的发送闭包（timed 循环里是 `Sender.Timed`）；唯一 re-enter 触发点是异常间隔重建分支。`TestRunContextTTLExpiryRefreshesWithoutEnter` / `TestRunContextTTLRefreshFailureContinuesWithExistingContext` 显式断言当前（与真实服务不兼容的）行为，属本票需更新对象。冗余检查：全仓无「Context 重建后 re-enter」的任何实现，亦无 `.out-of-scope/` 拒收记录；行为证据见 checklist 2026-09-06 会话与 findings/09。
+## Answer
+
+全部验收通过。修复（`internal/task/task.go`）：统一不变量——任何新的 Reader Context 一旦被成功采用，在使用该 Context 发送任何 timed report 之前必须先成功 enter。两条采用路径同规则：
+
+1. **TTL 到期主动刷新**：timed 循环每笔前的 `Reader.Fetch` 结果与当前会话 Context 不一致（`sameContext` 比较 psvts/pclts/token 全等）时，经 `sendEnter` 重建 Reading Session（新会话 = 新会话级 pc；issue 30 生命周期：fallback = e(重建时刻)、可用 pclts = 新 Context 原值）；rt 基准从新 enter 被接受时刻重置；本节奏点不发 timed、下一节奏点接续。TTL 刷新是正常轮换不是失败，不计入连续失败预算（与异常间隔重建同一姿态）。刷新自身失败（未产生新 Context）不触发重建，沿用现有 Context 继续。
+2. **恢复链内 refresh**：`recoverSend` 的链内重试（step 1/4）不再复用调用方传入的发送闭包——refresh 采用新 Context 后重试即重建 enter（新会话级 pc 从新 Context 重新解析；enter 无 rt，重试步不再做超阈值判定），链形统一为 refresh → enter → renewal → refresh → enter。enter 被接受 = 恢复成功（`reEnter=true`、rt=0），timed 循环据此更新 st/lastSent/sessionPC 而不累计 rt、不 increment reports。
+3. **预算语义（issue 27 保持 + 有界收敛）**：re-enter 成功不清零 consecutive timed-report failure budget（只有被接受的 timed report 清零）；恢复链以重建 enter 成功（reEnter）计入预算——服务器持续拒绝 timed（enter 被接受）时，拒绝 + 重建循环在 3 轮预算内收敛为 failed 终态 + 失败通知（含已尝试恢复动作）。
+
+逐条验收：
+
+1. **AC1（TTL 到期主动刷新先 enter）**：`TestRunContextTTLExpiryReentersBeforeTimedUseNewContext`（重写自 `...RefreshesWithoutEnter`）——20 分钟 Task 跨 TTL 边界：Reader 页恰抓取 2 次、enter 数 = 2（初始 + TTL 边界）、边界前 timed 用初始 Context（psvts-1）、边界后 timed 用新 Context（psvts-2）、全部 rt=30；`runTTLScenario` 公共骨架更新为 42 笔（2 enter + 40 timed）。新增 `TestRunTTLRebuildEnterRejectedRecoversWithFreshContext`：TTL 边界的重建 enter 被拒 → 恢复链 refresh → 重建 enter 接受 → 新会话以链内刷新后的最新 Context（psvts-3）继续（恢复链内重试即重建 enter，非 timed retry）。
+2. **AC2（恢复链 refresh 后先 enter）**：`TestRunRecoveryChainFirstRetrySucceeds`、`TestRunRecoveryChainViaRenewalSucceeds` 按新语义适配（fakeWeread 新增 `enterRejectAt`/`enterRejectFrom` 旋钮，仅控制链内重建 enter 的拒绝）——链内 refresh 后下一笔上报是 enter（非 timed retry），enter 被接受后才继续 timed。
+3. **AC3（新会话新 pc）**：`TestRunFallbackPCStablePerSessionRebuiltAtTTL`（重写）——fallback pc 会话内稳定、TTL 边界重建后 = e(重建时刻) 不复用前值；`TestRunRecoveryRefreshReentersWithNewFallbackPC`（重写）——恢复链 refresh + 重建 enter 后同样 = e(重建时刻)；可用 pclts 场景在 `TestRunContextTTLExpiryReentersBeforeTimedUseNewContext` 断言（fake-pclts-1 → fake-pclts-2，re-enter 后取新 Context 原值）。
+4. **AC4（re-enter 不清零预算）**：issue 27 回归 `TestRunSlowTimedFailuresWithRebuildConvergesToFailedTerminal`、`TestRunSlowFailuresThenRebuildThenAcceptedReportsSucceed` 未改动且通过；`TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal` 按新语义适配（每轮拒绝 → refresh → 重建 enter 计入预算，3 轮收敛为 failed，超限 rt 从未落线）。
+5. **AC5（rt 基准重置）**：TTL 边界与恢复链重建后全部 timed rt=30；`TestRunRecoveryRetryOverThresholdRebuildsNotOversizedRT` 未改动且通过（130s 慢恢复后重建，超限间隔绝不作为大 rt 上报；wire 序列与修复前重建一致）。
+6. **AC6（refresh 失败继续用现有 Context）**：`TestRunContextTTLRefreshFailureContinuesWithExistingContext` 保持原行为（失败周期照常发 timed、沿用 psvts-1），仅按 42 笔公共骨架与边界索引适配（重试成功后的重建 enter 在索引 31）。
+7. **AC7（回归锚点）**：issue 28 收敛（`TestRunRecoveryContinuityBreakSpiralConvergesToFailedTerminal` 适配）、异常间隔重建路径（`TestRunAbnormalIntervalRebuildsSession`、`TestRunAbnormalIntervalRebuildsNewFallbackPC`、`TestRunAbnormalIntervalBeyondTTLReentersWithFreshContext`、`TestRunSlowReaderFetchBeyondThresholdRebuildsNotOversizedRT` 全部未改动且通过——TTL 边界 re-enter 与异常间隔重建产生相同线上序列）、恢复链耗尽（`TestRunReportRejectedRecoveryChainExhausted` 等按"链内重试即重建 enter"适配，`enterRejectFrom` 注入链内 enter 拒绝）、ticket 29 身份保持（`TestRunRecoveryExhaustedPersistFailKeepsRejectedIdentity` / `TestRunLoginInvalidPersistFailKeepsInvalidIdentity` 按新链形适配）、登录失效链路径（T4 两测试按新链形适配）。
+8. **AC8**：`go test -count=1 -race ./...` 全部通过。
+
+**范围注记**：TTL 数值（DefaultContextTTL）、`-2012` recovery、renewal/Cookie 机制、rt 总体语义（ADR-0004）与内部节奏/阈值/预算默认数值未改；端到端成功长跑确认留给 ticket 23 / checklist（非本票关闭前置）。原 `...RefreshesWithoutEnter` 名称反映"刷新不重建"的旧语义，已随本票重命名；历史 ticket 06/30 的 Answer 引用旧测试名，属当时记录不改写。
+
+**Commit:** d72b4e6
